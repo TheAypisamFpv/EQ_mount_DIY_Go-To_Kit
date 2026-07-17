@@ -6,3 +6,7 @@ mcps
 test
 gui_config.json
 TODO.md
+iss_tle.txt
+*.bsp
+*.bsp.*
+sky_catalog.json

@@ -21,6 +21,8 @@ Run:
 """
 
 import customtkinter as ctk
+import tkinter as tk  # only for widgets customtkinter doesn't provide (Listbox, for sky search results)
+from tkinter import messagebox  # solar tracking safety confirmation - see _toggle_tracking
 import serial
 import serial.tools.list_ports
 import threading
@@ -30,16 +32,54 @@ import re
 import math
 import json
 import os
+import bisect
 from collections import deque
 from datetime import datetime, timezone
 from typing import Optional
+from sky_data import sky_catalog, iss_tracker, solar_system
 
 # ============================================================
 # CONFIG
 # ============================================================
 BAUD_RATE = 250000
-POLL_INTERVAL_MS = 50          # GUI poll rate for queue
-POSITION_BROADCAST_HZ = 5
+# GUI poll rate for the serial queue. Fast enough to comfortably keep up with the Arduino's 50Hz
+# (20ms) POS broadcast rate (POSITION_BROADCAST_HZ below) with headroom to spare, per request to
+# make the telescope position update as fast as possible - _poll_queue's drain loop is cheap when
+# the queue is empty, so polling faster than strictly needed doesn't cost much.
+POLL_INTERVAL_MS = 10
+# Caps how often a POS line triggers real Tkinter UI work (redraw/labels/error), independent of
+# how fast POS lines actually arrive from the Arduino (POSITION_BROADCAST_HZ below). Without
+# this, raising POSITION_BROADCAST_HZ well above this makes _poll_queue drain several queued POS
+# lines per tick and run the full UI-update battery for each one back to back, which is what
+# actually froze/lagged the GUI - not the firmware/motors. The underlying data (self.current_ra,
+# mount angles, speed history, etc.) is still updated on every POS line either way; only the
+# expensive widget/canvas calls are throttled.
+# (A version of this tied to the OS-reported screen refresh rate was tried and reverted - it made
+# things worse, not better - so this is a plain fixed constant instead.)
+# Matches POSITION_BROADCAST_HZ exactly - no point redrawing faster than fresh data actually
+# arrives (per request, this and POLL_INTERVAL_MS above are now the two things that determine how
+# fast the telescope marker updates, so both are set to the practical maximum).
+POS_UI_UPDATE_MIN_INTERVAL_S = 1.0 / 50.0
+# Arduino POS broadcast rate - fixed, not user-adjustable (used to be a configurable rate +
+# presets in the UI; removed since a too-high rate was part of the original vibration/jitter
+# investigation - see the 1.8.7-1.8.9 firmware changelog entries).
+# Temporarily raised 5 -> 100 Hz to test whether firmware 1.8.24 (StepGen interrupt-driven
+# stepping + finite fine-acceleration) is still affected by broadcast rate the way the old
+# AccelStepper-polled firmware was - see the 1.8.9 changelog entry for the original "100Hz slows
+# the axis down" finding this is re-testing.
+POSITION_BROADCAST_HZ = 50
+POS_UPDATE_RATE_MS = int(1000 / POSITION_BROADCAST_HZ)  # 20 ms
+
+# How often fresh ISS RA/DEC is sent to the Arduino (CMD,SET_TARGET) while the ISS is the
+# actively tracked target - see _iss_update_tick/_on_iss_position. Independent of the 5s interval
+# used when the ISS is merely displayed (not tracked).
+#
+# Smoothness no longer strictly depends on this being fast - firmware 1.8.29+ derives a tracking
+# rate from recent SET_TARGETs and extrapolates continuously between them on-board (the same role
+# SIDEREAL_RATE_DEG_S plays for Earth-rotation compensation) - but per explicit request this is
+# still kept at 50Hz (20ms) for the freshest possible resync against the ISS's real path, not just
+# relying on the extrapolation between updates.
+ISS_TRACKING_UPDATE_MS = 20
 
 # Anchored to this script's own directory, NOT the process's current working directory - a
 # bare relative "gui_config.json" depends on wherever the app happens to be launched from
@@ -84,12 +124,80 @@ CAMERA_FOV_DEG_PER_PIXEL = CAMERA_FOV_W_DEG / CAMERA_SENSOR_WIDTH_PX
 
 # Sky viz zoom
 VIZ_ZOOM_MIN = 1.0      # 1.0 = full sky (RA 0-360, DEC -90..+90)
-VIZ_ZOOM_MAX = 120.0    # ~3 deg RA / ~1.5 deg DEC visible span - eyepiece-FOV scale
+VIZ_ZOOM_MAX = 1000.0   # ~0.36 deg RA / ~0.18 deg DEC visible span. Planets are astronomically
+                        # tiny - even Jupiter (the biggest apparent disk of the lot) is only
+                        # ~30-50 arcsec, so 200x still only worked out to ~4-5px real radius,
+                        # barely above the fixed-marker floor and visually indistinguishable from
+                        # it. 1000x gives Jupiter/Venus/Mars/Saturn+rings a real radius in the
+                        # ~15-25px range - clearly bigger than the marker, not just technically so.
+                        # Uranus/Neptune stay essentially point-like even here, which is
+                        # astronomically accurate (real telescopes need real aperture/magnification
+                        # to resolve them too, not just "zoom").
 VIZ_ZOOM_STEP_BASE = 1.15   # zoom multiplier per "one full wheel notch" worth of scroll delta
 VIZ_GRID_TARGET_LINES = 9.0  # aim for roughly this many grid lines per axis at any zoom level
-VIZ_FOLLOW_TICK_MS = 400        # how often the follow-mode camera snaps to its target (see
-                                 # _apply_viz_follow_mode - no easing, so this can be coarse;
-                                 # telescope/target position barely moves between ticks anyway)
+
+# Star level-of-detail tiers (see _build_sky_catalog_state/_draw_sky_objects). At full-sky zoom
+# the visible magnitude limit is only ~3.2 (a couple hundred stars), but bisecting the single
+# full ~870000-star RA-sorted list still means touching nearly the WHOLE catalog every redraw
+# once the visible RA span approaches 360 (the bisect range covers everything) - measured at
+# ~110ms for just the magnitude-filter pass alone, more than 5x VIZ_FOLLOW_TICK_MS's own budget
+# and enough to stall the entire GUI (not just the viz) while in Follow mode. Pre-building
+# several smaller, magnitude-capped, RA-sorted subsets once at catalog-load time lets
+# _draw_sky_objects() bisect through whichever is the SMALLEST tier guaranteed to already
+# contain everything the current zoom level would show, instead of always the full list.
+# Deliberately concentrated below mag 11 - the AT-HYG reduced_m11 catalog (see sky_catalog.py)
+# is already ~99.8% mag<=11 stars, so tiers past that barely shrink anything; the real size
+# range worth tiering is 3.2 (low zoom) to ~11 (where the full catalog is basically reached).
+STAR_LOD_TIER_MAG_CUTOFFS = [3.2, 4.5, 6.5, 8.5, 11.0]
+VIZ_FOLLOW_TICK_MS = POS_UPDATE_RATE_MS  # how often the follow-mode camera snaps to its target
+                                 # AND the full grid/label/horizon rebuild (_redraw_viz()) runs
+                                 # while following - tied directly to POS_UPDATE_RATE_MS (the real
+                                 # position-update rate) per request, once 100ms was confirmed to
+                                 # perform fine: no point centering faster than fresh position
+                                 # data actually arrives, but also no reason to stay any coarser
+                                 # than that once the rebuild cost is confirmed to keep up.
+                                 #
+                                 # Panning the background instead of rebuilding it (canvas.move
+                                 # ("all", dx, dy) shifting existing items in place, tried at
+                                 # several different cadences) was abandoned for good after three
+                                 # separate failure modes, each only discovered by actually trying
+                                 # it: (1) panning on its own coarse timer while nothing else
+                                 # tracked what area it had actually drawn caused the view's
+                                 # reference frame to race ahead of the background it's drawn
+                                 # relative to - visible desync during fast slews; (2) calling the
+                                 # pan at high frequency (~20Hz) directly from the POS handler was
+                                 # itself too expensive for this canvas's item count and stalled
+                                 # the whole UI; (3) even called from its own dedicated fast timer
+                                 # (avoiding failure #2), it broke differently: the dark background
+                                 # rectangle (viz_bg, sized to exactly cover the canvas) is one of
+                                 # the items canvas.move("all", ...) shifts, so panning moves it
+                                 # away from actually covering the canvas - the raw, undrawn canvas
+                                 # showed through at whichever edge the view had panned towards,
+                                 # visible as the viz "going dark". None of these are a throttle
+                                 # value away from being fixed - a working version would need the
+                                 # background redrawn to always overfill the canvas (so a pan can
+                                 # never expose its edge) AND pre-rendered over a larger area than
+                                 # the visible viewport (so a pan never reveals genuinely
+                                 # undrawn sky either) AND a rebuild trigger based on actual
+                                 # accumulated pan distance, not just a timer - real work, not
+                                 # in scope for a follow-up throttle tweak. Back to a plain full
+                                 # rebuild every tick; this constant is the only real lever until
+                                 # that's built, or until _draw_viz_grid() itself is optimized to
+                                 # cost less per call (fewer items, cached surfaces, etc.).
+                                 #
+                                 # Pushing this lower has a floor: each follow_tick() only
+                                 # schedules its own next call via self.after(VIZ_FOLLOW_TICK_MS,
+                                 # ...) AFTER _redraw_viz() returns, so if a rebuild ever takes
+                                 # longer than this interval to run, calls don't overlap/race -
+                                 # but the achieved rate silently drops to however long rebuilds
+                                 # actually take, not this nominal value (this is exactly what was
+                                 # measured at a previous 60ms attempt: "~1fps, not 60fps" - that
+                                 # was with a much larger visible star count than typical follow-
+                                 # mode zoom levels tend to have, though, so it isn't a hard rule
+                                 # that this rate can't work; confirmed fine in practice at 100ms).
+                                 # If centering ever visibly lags position updates again, that's
+                                 # the sign this is back above the real per-rebuild cost floor for
+                                 # whatever's currently on screen (zoom level, star density, etc).
 
 # Tracking stability indicator. A raw "error < X" check is a poor stability signal on its own:
 # a large-but-shrinking error is actually fine (still converging), while a small-but-growing
@@ -101,7 +209,7 @@ VIZ_FOLLOW_TICK_MS = 400        # how often the follow-mode camera snaps to its 
 # the same value, so an error has to be under half a pixel to be guaranteed invisible; an error
 # of e.g. 0.9px is still well within "one pixel" but would visibly shift which pixel a point
 # source lands on.
-TRACKING_STABLE_ERR_DEG = CAMERA_FOV_DEG_PER_PIXEL / 2.0   # sub-pixel magnitude, both axes, for STABLE
+TRACKING_STABLE_ERR_DEG = CAMERA_FOV_DEG_PER_PIXEL #/ 2.0   # sub-pixel magnitude, both axes, for STABLE
 TRACKING_STABLE_DERIV_DEG_S = 0.0008    # error growth rate (deg/s) below which it's considered flat
 TRACKING_STABILITY_WINDOW_S = 2.0       # trend-averaging window - smooths per-update noise
 
@@ -249,13 +357,22 @@ class SerialHandler:
         With write_timeout=0 (non-blocking writes, needed so a stalled/unplugged port can't
         hang the GUI), pyserial's write() can return having written FEWER bytes than given
         instead of raising - the caller MUST check the return value, since previously that
-        was silently discarded and a partial write looked identical to a full success."""
+        was silently discarded and a partial write looked identical to a full success.
+
+        Deliberately does NOT call self.ser.flush() - unlike write(), flush() is NOT governed by
+        write_timeout and is documented to always block until the OS has finished physically
+        transmitting everything queued so far. At low broadcast rates the port is idle enough
+        that this returns instantly and the block goes unnoticed; at the higher POS broadcast
+        rates tested in this session (heavy simultaneous RX traffic), it can take real,
+        multi-second time to drain, and since this runs on the main thread (e.g. every Stop
+        Tracking / Delete-Suppr press), that stalls the entire Tkinter UI - a genuine freeze, not
+        just a stuck status label. Dropping it doesn't drop any bytes - the OS still transmits
+        everything written, this just stops the caller from waiting around for that to finish."""
         if not (self.ser and self.ser.is_open):
             return False
         payload = (cmd + "\n").encode('ascii')
         try:
             written = self.ser.write(payload)
-            self.ser.flush()  # make sure the command actually leaves the buffer (helps with delivery)
             if written != len(payload):
                 self.queue.put(f"ERROR:Send incomplete for '{cmd}' ({written}/{len(payload)} bytes) - port may be backed up")
                 return False
@@ -285,6 +402,18 @@ class SerialHandler:
         return self.send_command("CMD,START_TRACKING,SKIP_DEC_RESET")
 
     def send_stop(self) -> bool:
+        # A bare '!' byte is sent first, immediately, ahead of the normal text command - the
+        # firmware treats it as a dedicated panic-stop sentinel, checked before any line
+        # buffering/parsing (see readSerialCommands() in the .ino), so it can't be delayed by
+        # whatever's going on with the text-command protocol (observed: STOP sometimes taking
+        # several seconds to be acted on - see the 1.8.15 changelog entry). The full "CMD,STOP"
+        # text command still follows for logging/status-response consistency, but the '!' byte
+        # alone is what actually guarantees the stop happens promptly.
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.write(b'!')  # no flush() here either - see send_command()'s comment
+            except Exception:
+                pass
         return self.send_command("CMD,STOP")
 
     def send_sync(self, ra: float, dec: float):
@@ -295,6 +424,12 @@ class SerialHandler:
 
     def send_goto(self, ra: float, dec: float):
         self.send_command(f"CMD,GOTO,RA:{ra:.6f},DEC:{dec:.6f}")
+
+    def send_safe_target(self):
+        self.send_command("CMD,SAFE_TARGET")
+
+    def send_home_axes(self):
+        self.send_command("CMD,HOME_AXES")
 
     def send_pos_update_rate(self, ms: int):
         """Tell Arduino how often to broadcast POS updates (in milliseconds)."""
@@ -340,6 +475,16 @@ class EQMountApp(ctk.CTk):
         self.current_dec = 0.0
         self.target_ra = 0.0
         self.target_dec = 0.0
+        self.target_object_name = None  # e.g. "Vega", "M31" - see _select_sky_target/_update_target_name_label
+        # Exact text _select_sky_target last wrote into goto_ra/goto_dec, so _toggle_tracking can
+        # tell "user pressed Start Tracking on what was just selected" from "user edited the boxes
+        # since" by comparing strings directly - see _toggle_tracking's SIDEREAL branch. Comparing
+        # parsed floats against self.target_ra/dec instead doesn't work here: self.target_ra/dec
+        # aren't updated by _select_sky_target when tracking is already active (it must not
+        # interrupt a running session), so they can go stale relative to the boxes even though
+        # nothing was manually edited.
+        self._target_name_box_ra_str = None
+        self._target_name_box_dec_str = None
         self.err_ra = 0.0
         self.err_dec = 0.0
         self.mount_ra_angle = 0.0  # physical mount angle (deg)
@@ -348,6 +493,7 @@ class EQMountApp(ctk.CTk):
         self.speed_dec = 0.0
         self.ra_pos_history = deque()  # (angle, time) pairs - calc uses positions within last 250ms (or last one if older)
         self.dec_pos_history = deque()
+        self._last_pos_ui_update = 0.0  # see POS_UI_UPDATE_MIN_INTERVAL_S / the POS handler below
         self._err_ra_history = deque()  # (error_deg, time) pairs - used for tracking stability trend
         self._err_dec_history = deque()
         self.current_mode = "SIDEREAL"
@@ -367,6 +513,57 @@ class EQMountApp(ctk.CTk):
         self._viz_pan_last_xy = None
         self._viz_redraw_pending = False  # see _schedule_viz_redraw
         self._viz_view_mode = "FREE"  # FREE -> TELESCOPE -> TARGET -> FREE, see _cycle_viz_view_mode
+        # Camera FOV rectangle's display rotation (position angle, North-up=0, increasing
+        # towards East - same convention as _rotated_ellipse_points) - purely a GUI overlay
+        # setting to match however the camera is actually mounted on the telescope; the mount
+        # itself has no notion of camera rotation. See _adjust_camera_orientation.
+        self._camera_orientation_deg = 0.0
+
+        # Night-sky object catalog (stars + Messier DSOs) drawn on the viz - populated by
+        # _load_sky_catalog_async() below, once the UI (and self.status_text, which self._log()
+        # needs) actually exists. Just empty placeholders here.
+        self._sky_stars = []
+        self._sky_dso = []
+        self._star_by_hip = {}
+        self._const_line_segments = []
+        self._sky_stars_by_ra = []       # self._sky_stars sorted by RA - see _draw_sky_objects
+        self._sky_stars_ra_values = []   # parallel list of just the RA values, for bisect
+        self._star_tiers = []  # magnitude-capped RA-sorted subsets - see STAR_LOD_TIER_MAG_CUTOFFS
+        self._visible_object_hits = []  # see _draw_sky_objects / _on_viz_mouse_move
+        self._hovered_sky_object = None  # see _on_viz_mouse_move / _on_viz_double_click
+        self._sky_search_index = []  # see _build_sky_catalog_state / _update_sky_search_results
+        self._constellations_enabled = False  # toggled via the Constellations button
+
+        # Real-time ISS marker (see iss_tracker.py). Off by default - it needs internet (TLE
+        # fetch from CelesTrak) and the skyfield package, neither of which should be required
+        # just to run the rest of the app.
+        self._iss_enabled = False
+        self._iss_ra = None
+        self._iss_dec = None
+        self._iss_above_horizon = False
+        self._iss_update_after_id = None
+
+        # Real-time Sun/Moon/planets (see solar_system.py) - always shown, no toggle (unlike the
+        # ISS, which still needs a fresh internet TLE fetch every session and stays opt-in for
+        # that reason). The one-time ~17MB JPL DE421 ephemeris download here only ever happens
+        # once, cached locally afterward - same tradeoff already accepted for the sky catalog.
+        # Positions simply stay None (nothing drawn) until the first successful background fetch
+        # completes - see _solar_system_update_tick, kicked off automatically at startup.
+        self._sun_ra = None
+        self._sun_dec = None
+        self._sun_ang_diam_deg = None
+        self._moon_ra = None
+        self._moon_dec = None
+        self._moon_ang_diam_deg = None
+        self._moon_illum_fraction = None
+        self._moon_phase_deg = None
+        self._moon_waxing = None
+        self._planet_positions = {}  # name -> (ra_deg, dec_deg, ang_diam_deg, ring_ang_diam_deg, illum_fraction), see solar_system.get_planets_info
+        self._solar_system_update_after_id = None
+        # Set once if skyfield turns out not to be installed, so _solar_system_update_tick stops
+        # retrying forever instead of re-attempting (and re-logging) every 60s - there's no toggle
+        # button anymore to let the user turn this off manually the way the ISS one used to.
+        self._solar_system_skyfield_missing = False
 
         # START/STOP confirmation-retry state - see _request_tracking_action
         self._pending_action = None       # "START", "STOP", or None
@@ -377,8 +574,8 @@ class EQMountApp(ctk.CTk):
         # "IDLE" / "ALIGNING" / "TRACKING" - separate from self.tracking (which flips true as
         # soon as RA settles, partway through alignment) so the stability badge can tell
         # "still aligning" apart from "actually holding the target" - see _update_tracking_stability.
+        # Current stability badge color, mirrored onto the telescope FOV circlere - see _set_stability.
         self._align_phase = "IDLE"
-        # Current stability badge color, mirrored onto the telescope FOV circle - see _set_stability.
         self._stability_color = "#444455"
 
         # See _on_mode_changed: forces the next Start Tracking to skip the "target is close"
@@ -399,19 +596,44 @@ class EQMountApp(ctk.CTk):
         # so the input frames and mode are correctly set on startup.
         self._load_gui_config()
 
-        # Bright stars visible from northern hemisphere (approx J2000 RA/DEC in degrees)
+        # Bright stars visible from northern hemisphere (approx J2000 RA/DEC in degrees) - used
+        # as a fallback ONLY if the bundled catalog (self._star_by_hip, populated once
+        # _load_sky_catalog_async() finishes) isn't loaded yet when Sync is used. Otherwise
+        # _sync_position() resolves these by HIP number (see _cal_star_hip below) straight from
+        # the same catalog entry the star's own dot on the viz is drawn from - these hand-entered
+        # values were each off from the catalog's own by a couple arcseconds (a different amount
+        # per star, since they came from a separate source than the bundled catalog), enough to
+        # show as a visible misalignment between the synced target cross and the star at high
+        # zoom even though picking the same star via search (which reads the catalog directly)
+        # lined up correctly.
         self.cal_stars = {
             "Vega (alpha Lyrae)": (279.234, 38.784),
             "Arcturus (alpha Bootis)": (213.915, 19.182),
             "Altair (alpha Aquilae)": (297.696, 8.868),
             "Custom (use fields below)": None,
         }
+        # HIP (Hipparcos) catalog numbers for the same named stars above, so _sync_position() can
+        # look up their exact RA/DEC from self._star_by_hip (same source _draw_sky_objects draws
+        # from) instead of relying on the approximate hand-entered values in cal_stars.
+        self._cal_star_hip = {
+            "Vega (alpha Lyrae)": 91262,
+            "Arcturus (alpha Bootis)": 69673,
+            "Altair (alpha Aquilae)": 97649,
+        }
 
         self._build_ui()
+        # Starts disconnected - every Arduino-interacting control should start disabled rather
+        # than clickable-but-silently-no-op (see _set_arduino_controls_enabled).
+        self._set_arduino_controls_enabled(False)
+        # Needs self.status_text (created in _build_ui) for _log() to work - must come after it.
+        self._load_sky_catalog_async()
         self._poll_queue()
         self._start_time_sync_timer()
         self._start_ground_update_timer()
         self._start_viz_follow_timer()
+        # Sun/Moon/planets are always on (see the comment near their state above) - kicked off
+        # once here, same as the sky catalog/ground timer, rather than needing a toggle press.
+        self._solar_system_update_tick()
 
         # Live update of viz horizon when latitude input changes
         self.lat_var.trace_add("write", self._on_location_var_changed)
@@ -425,6 +647,18 @@ class EQMountApp(ctk.CTk):
         top = ctk.CTkFrame(self, corner_radius=8)
         top.pack(fill="x", padx=12, pady=(12, 6))
 
+        # Streamer mode - packed first with side="right" so it lands at the far right end of
+        # this same Connection row, rather than a separate row of its own. Hides the GPS
+        # location display (lat/lon/GPS entries + the "Loc: ..." summary label) without touching
+        # the underlying stored values, so it's safe to flip on/off mid-session without needing
+        # to re-enter or re-send the location.
+        self.streamer_mode_var = ctk.BooleanVar(value=False)
+        self.streamer_mode_switch = ctk.CTkSwitch(
+            top, text="Streamer Mode (hide GPS)", variable=self.streamer_mode_var,
+            command=self._on_streamer_mode_toggle
+        )
+        self.streamer_mode_switch.pack(side="right", padx=10)
+
         ctk.CTkLabel(top, text="Connection", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left", padx=10)
 
         self.port_combo = ctk.CTkComboBox(top, values=["Select port..."], width=280)
@@ -434,7 +668,7 @@ class EQMountApp(ctk.CTk):
         ctk.CTkButton(top, text="Refresh", width=80, command=self._refresh_ports).pack(side="left", padx=4)
         self.connect_btn = ctk.CTkButton(top, text="Connect", width=90, command=self._connect)
         self.connect_btn.pack(side="left", padx=4)
-        self.disconnect_btn = ctk.CTkButton(top, text="Disconnect", width=90, fg_color="#8B0000", command=self._disconnect)
+        self.disconnect_btn = ctk.CTkButton(top, text="Disconnect", width=90, fg_color="#8B0000", command=self._disconnect, state="disabled")
         self.disconnect_btn.pack(side="left", padx=4)
 
         self.conn_status = ctk.CTkLabel(top, text="● Disconnected", text_color="gray", font=ctk.CTkFont(size=13))
@@ -482,7 +716,7 @@ class EQMountApp(ctk.CTk):
             try:
                 g = self.gps_var.get().strip()
                 if g:
-                    self.location_label.configure(text=f"Loc: {g} (loaded)")
+                    self._set_location_label(f"Loc: {g} (loaded)")
             except Exception:
                 pass
 
@@ -531,13 +765,15 @@ class EQMountApp(ctk.CTk):
         # RA Offset control integrated in the same line. Inverted per request: LEFT decreases,
         # RIGHT increases.
         ctk.CTkLabel(ra_row, text="Offset:", font=ctk.CTkFont(size=12), text_color="#8888aa").pack(side="left")
-        ctk.CTkButton(ra_row, text="◀", width=20, height=20, font=ctk.CTkFont(size=10, weight="bold"),
-                      command=lambda: self._adjust_offset(-1, 0)).pack(side="left", padx=(2, 0))
+        self.ra_offset_left_btn = ctk.CTkButton(ra_row, text="◀", width=20, height=20, font=ctk.CTkFont(size=10, weight="bold"),
+                      command=lambda: self._adjust_offset(-1, 0))
+        self.ra_offset_left_btn.pack(side="left", padx=(2, 0))
         self.ra_offset_var = ctk.DoubleVar(value=0.0)
         self.ra_offset_entry = ctk.CTkEntry(ra_row, textvariable=self.ra_offset_var, width=50, font=ctk.CTkFont(size=11))
         self.ra_offset_entry.pack(side="left", padx=(4, 0))
-        ctk.CTkButton(ra_row, text="▶", width=20, height=20, font=ctk.CTkFont(size=10, weight="bold"),
-                      command=lambda: self._adjust_offset(1, 0)).pack(side="left", padx=(2, 4))
+        self.ra_offset_right_btn = ctk.CTkButton(ra_row, text="▶", width=20, height=20, font=ctk.CTkFont(size=10, weight="bold"),
+                      command=lambda: self._adjust_offset(1, 0))
+        self.ra_offset_right_btn.pack(side="left", padx=(2, 4))
 
         # DEC row with integrated offset control
         dec_row = ctk.CTkFrame(pos_frame)
@@ -561,13 +797,15 @@ class EQMountApp(ctk.CTk):
         # instead of left/right, in the same left-then-right button order.
         # Inverted per request: UP decreases, DOWN increases.
         ctk.CTkLabel(dec_row, text="Offset:", font=ctk.CTkFont(size=12), text_color="#8888aa").pack(side="left")
-        ctk.CTkButton(dec_row, text="▲", width=20, height=20, font=ctk.CTkFont(size=10, weight="bold"),
-                      command=lambda: self._adjust_offset(0, 1)).pack(side="left", padx=(2, 0))
+        self.dec_offset_up_btn = ctk.CTkButton(dec_row, text="▲", width=20, height=20, font=ctk.CTkFont(size=10, weight="bold"),
+                      command=lambda: self._adjust_offset(0, 1))
+        self.dec_offset_up_btn.pack(side="left", padx=(2, 0))
         self.dec_offset_var = ctk.DoubleVar(value=0.0)
         self.dec_offset_entry = ctk.CTkEntry(dec_row, textvariable=self.dec_offset_var, width=50, font=ctk.CTkFont(size=11))
         self.dec_offset_entry.pack(side="left", padx=(4, 0))
-        ctk.CTkButton(dec_row, text="▼", width=20, height=20, font=ctk.CTkFont(size=10, weight="bold"),
-                      command=lambda: self._adjust_offset(0, -1)).pack(side="left", padx=(2, 4))
+        self.dec_offset_down_btn = ctk.CTkButton(dec_row, text="▼", width=20, height=20, font=ctk.CTkFont(size=10, weight="bold"),
+                      command=lambda: self._adjust_offset(0, -1))
+        self.dec_offset_down_btn.pack(side="left", padx=(2, 4))
 
         # Live alignment/tracking error - updated together with position anytime (via POS)
         self.live_error_label = ctk.CTkLabel(
@@ -593,6 +831,20 @@ class EQMountApp(ctk.CTk):
             height=30
         )
         self.stability_label.pack(pady=(2, 6))
+
+        # Current target's object name (Vega, M31, ...) when the target was selected from the
+        # sky search or by clicking/double-clicking a catalog object - see _select_sky_target and
+        # target_object_name. Blank (no badge) for an arbitrary sky point (manual RA/DEC entry or
+        # double-click on empty sky), since there's no name to show there. Same size as the
+        # stability badge above so it's equally prominent, but no fg_color fill - it's informational,
+        # not a status indicator like STABLE/SETTLING/DRIFTING.
+        self.target_name_label = ctk.CTkLabel(
+            pos_frame,
+            text="",
+            font=ctk.CTkFont(size=17, weight="bold"),
+            text_color="#ffdd66"
+        )
+        self.target_name_label.pack(pady=(0, 6))
 
         # Spell out the actual numeric criteria behind the badge (built from the same
         # constants _update_tracking_stability uses, so it can't drift out of sync with them).
@@ -626,6 +878,67 @@ class EQMountApp(ctk.CTk):
                                           font=ctk.CTkFont(size=11), command=self._cycle_viz_view_mode)
         self.viz_mode_btn.pack(side="left")
 
+        self.iss_toggle_btn = ctk.CTkButton(viz_toolbar, text="ISS: OFF", height=22, width=90,
+                                            font=ctk.CTkFont(size=11), fg_color="#444444",
+                                            command=self._toggle_iss_tracking)
+        self.iss_toggle_btn.pack(side="left", padx=(6, 0))
+
+        self.const_toggle_btn = ctk.CTkButton(viz_toolbar, text="Constellations: OFF", height=22, width=140,
+                                              font=ctk.CTkFont(size=11), fg_color="#444444",
+                                              command=self._toggle_constellations)
+        self.const_toggle_btn.pack(side="left", padx=(6, 0))
+
+        # Camera FOV rotation - purely a display setting to match the camera rectangle/top
+        # marker overlay (see _camera_rect_points/_camera_top_marker_points) to however the
+        # camera is actually mounted on the telescope; doesn't send anything to the Arduino.
+        ctk.CTkLabel(viz_toolbar, text="Cam Rot:", font=ctk.CTkFont(size=11)).pack(side="left", padx=(10, 0))
+        self.cam_rot_left_btn = ctk.CTkButton(viz_toolbar, text="◄", width=20, height=22,
+                                              font=ctk.CTkFont(size=10, weight="bold"),
+                                              command=lambda: self._adjust_camera_orientation(-15.0))
+        self.cam_rot_left_btn.pack(side="left", padx=(4, 0))
+        # Directly editable, same pattern as ra_offset_entry/dec_offset_entry - typing a value and
+        # pressing Enter (or clicking away) sets the rotation absolutely, same as the ◄/► buttons
+        # do relatively (see _adjust_camera_orientation/_on_cam_rot_entry_commit).
+        self.cam_rot_var = ctk.DoubleVar(value=0.0)
+        self.cam_rot_entry = ctk.CTkEntry(viz_toolbar, textvariable=self.cam_rot_var, width=45, font=ctk.CTkFont(size=11))
+        self.cam_rot_entry.pack(side="left", padx=(4, 0))
+        self.cam_rot_entry.bind("<Return>", self._on_cam_rot_entry_commit)
+        self.cam_rot_entry.bind("<FocusOut>", self._on_cam_rot_entry_commit)
+        ctk.CTkLabel(viz_toolbar, text="°", font=ctk.CTkFont(size=11), text_color="#8888aa").pack(side="left", padx=(2, 0))
+        self.cam_rot_right_btn = ctk.CTkButton(viz_toolbar, text="►", width=20, height=22,
+                                               font=ctk.CTkFont(size=10, weight="bold"),
+                                               command=lambda: self._adjust_camera_orientation(15.0))
+        self.cam_rot_right_btn.pack(side="left", padx=(4, 0))
+
+        # Sky object search - name/Messier-id substring search over the bundled catalog (plus
+        # Sun/Moon/ISS by name), live-filtered as you type. Selecting a result (double-click or
+        # Enter) uses the exact same targeting logic as double-clicking the viz itself (see
+        # _select_sky_target) - fills the target fields always, and also GoTos there + starts
+        # sidereal tracking if nothing is tracking yet.
+        search_frame = ctk.CTkFrame(left, fg_color="transparent")
+        search_frame.pack(fill="x", padx=4, pady=(4, 0))
+        ctk.CTkLabel(search_frame, text="Find:", font=ctk.CTkFont(size=11)).pack(side="left")
+        self.sky_search_var = ctk.StringVar()
+        self.sky_search_entry = ctk.CTkEntry(search_frame, textvariable=self.sky_search_var,
+                                             placeholder_text="star or Messier object name...",
+                                             font=ctk.CTkFont(size=11))
+        self.sky_search_entry.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        self.sky_search_entry.bind("<Down>", self._focus_sky_search_results)
+        self.sky_search_entry.bind("<Return>", self._select_first_sky_search_result)
+
+        self.sky_search_results = tk.Listbox(left, height=5, bg="#1a1a22", fg="#dddddd",
+                                             selectbackground="#2a5a8a", borderwidth=0,
+                                             highlightthickness=1, highlightbackground="#333",
+                                             font=("Consolas", 10))
+        self.sky_search_results.bind("<Double-Button-1>", self._on_sky_search_result_chosen)
+        self.sky_search_results.bind("<Return>", self._on_sky_search_result_chosen)
+        # Not packed here - _update_sky_search_results shows/hides it based on whether there
+        # are any results, so it doesn't permanently reserve space when the search box is empty.
+        self._sky_search_matches = []
+        # Added last, after every widget _update_sky_search_results touches already exists -
+        # avoids any dependency on exactly when customtkinter might fire a variable write.
+        self.sky_search_var.trace_add("write", lambda *_: self._update_sky_search_results())
+
         # Visualization canvas - fully dynamic width + height
         self.viz_canvas = ctk.CTkCanvas(left, bg="#0a0a0f", highlightthickness=1, highlightbackground="#333")
         self.viz_canvas.pack(pady=(4, 0), fill="both", expand=True)
@@ -640,8 +953,13 @@ class EQMountApp(ctk.CTk):
         # Click-drag to pan once zoomed in.
         self.viz_canvas.bind("<ButtonPress-1>", self._on_viz_pan_start)
         self.viz_canvas.bind("<B1-Motion>", self._on_viz_pan_drag)
-        # Double-click to reset to the full-sky view.
-        self.viz_canvas.bind("<Double-Button-1>", self._on_viz_reset_view)
+        # Middle-click to reset to the full-sky view (moved off double-click, which now sets
+        # a GoTo target/starts tracking at the clicked coordinates - see _on_viz_double_click).
+        self.viz_canvas.bind("<Button-2>", self._on_viz_reset_view)
+        # Double-click: set the clicked RA/DEC as the target. If not currently tracking, this
+        # also GoTos there and starts sidereal tracking; if tracking is already active, it only
+        # fills the target fields (no slew/mode change) so it can't interrupt an active session.
+        self.viz_canvas.bind("<Double-Button-1>", self._on_viz_double_click)
         # Live RA/DEC readout under the pointer.
         self.viz_canvas.bind("<Motion>", self._on_viz_mouse_move)
         self.viz_canvas.bind("<Leave>", self._on_viz_mouse_leave)
@@ -657,6 +975,8 @@ class EQMountApp(ctk.CTk):
         # Keyboard shortcuts
         self.bind("<Delete>", self._stop_tracking_key)
         self.bind("<KP_Delete>", self._stop_tracking_key)  # numpad delete / suppr
+        self.bind("<Return>", self._start_tracking_key)
+        self.bind("<KP_Enter>", self._start_tracking_key)  # numpad enter
 
         # Mode indicator
         self.mode_label = ctk.CTkLabel(left, text="MODE: SIDEREAL   |   TRACKING: OFF", font=ctk.CTkFont(size=13))
@@ -674,10 +994,12 @@ class EQMountApp(ctk.CTk):
 
         ctk.CTkLabel(mode_frame, text="Tracking Mode:", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=8, pady=(2,0))
         self.mode_var = ctk.StringVar(value="SIDEREAL")
+        self.mode_radio_buttons = []
         for m in ["SIDEREAL", "SOLAR", "LUNAR"]:
             rb = ctk.CTkRadioButton(mode_frame, text=m, variable=self.mode_var, value=m,
                                     command=self._on_mode_changed)
             rb.pack(anchor="w", padx=16, pady=2)
+            self.mode_radio_buttons.append(rb)
 
         # Single toggle button for start/stop
         btn_frame = ctk.CTkFrame(right)
@@ -691,6 +1013,32 @@ class EQMountApp(ctk.CTk):
             command=self._toggle_tracking
         )
         self.tracking_btn.pack(fill="x", pady=4)
+
+        # One-shot safety move: sky DEC to SAFE_TARGET_DEC_DEG (0 deg, the celestial equator -
+        # see that constant in the .ino), RA untouched, no tracking started afterward (see
+        # CMD,SAFE_TARGET in the .ino - converted to a mount angle via calibration, same as GOTO's
+        # DEC math, so it always means the same physical altitude regardless of mount
+        # orientation). Always just this one button press, no target coordinates to pick.
+        self.safe_target_btn = ctk.CTkButton(
+            btn_frame,
+            text="Safe Target (DEC to 0°)",
+            height=28,
+            fg_color="#555522",
+            command=self._safe_target
+        )
+        self.safe_target_btn.pack(fill="x", pady=(0, 4))
+
+        # Pure mechanical "return home": slews BOTH axes directly to mount angle 0 (CMD,HOME_AXES
+        # in the .ino), bypassing sky-frame/calibration conversion entirely - unlike Safe Target
+        # above (sky DEC, RA untouched), this needs no calibration and touches both axes.
+        self.home_axes_btn = ctk.CTkButton(
+            btn_frame,
+            text="Home Axes (RA/DEC to 0°)",
+            height=28,
+            fg_color="#555522",
+            command=self._home_axes
+        )
+        self.home_axes_btn.pack(fill="x", pady=(0, 4))
 
         # Sync with star selector
         sync_frame = ctk.CTkFrame(right)
@@ -736,44 +1084,28 @@ class EQMountApp(ctk.CTk):
         self.goto_dec.insert(0, "38.78")
 
         # Add a quick time sync button
-        time_btn = ctk.CTkButton(right, text="Resync Arduino Time to Laptop", height=26,
+        self.time_btn = ctk.CTkButton(right, text="Resync Arduino Time to Laptop", height=26,
                                  command=lambda: self.serial.send_time_if_connected() if hasattr(self, 'serial') and self.serial else None)
-        time_btn.pack(fill="x", padx=12, pady=(2,6))
+        self.time_btn.pack(fill="x", padx=12, pady=(2,6))
 
-        # Position update rate control (how often Arduino sends POS updates)
+        # Position update rate - not user-adjustable from the GUI (the GUI always requests
+        # POS_UPDATE_RATE_MS on connect - see _apply_initial_rate), but the label below shows
+        # whatever the Arduino actually confirms applying (see the UPDATE_RATE,MS: handler in
+        # _parse_arduino_line), not just the requested constant. Used to be a configurable rate +
+        # presets; removed per request so there's one fixed, known-good rate instead of a tunable
+        # that could be set to something that causes problems (a very high rate was part of the
+        # original vibration/jitter investigation - see the 1.8.7-1.8.9 changelog entries).
         rate_frame = ctk.CTkFrame(right)
         rate_frame.pack(fill="x", padx=12, pady=4)
-
-        ctk.CTkLabel(rate_frame, text="Arduino POS Update Rate", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=8, pady=(2,0))
-
-        rate_row = ctk.CTkFrame(rate_frame)
-        rate_row.pack(fill="x", padx=8, pady=2)
-
-        self.pos_rate_var = ctk.StringVar(value="20")  # 50 Hz default
-        self.pos_rate_entry = ctk.CTkEntry(rate_row, textvariable=self.pos_rate_var, width=70)
-        self.pos_rate_entry.pack(side="left")
-
-        ctk.CTkLabel(rate_row, text="ms", width=25).pack(side="left")
-
-        self.set_rate_btn = ctk.CTkButton(rate_row, text="Set", width=50, height=26,
-                                          command=self._set_pos_update_rate)
-        self.set_rate_btn.pack(side="left", padx=6)
-
-        # Presets - 50Hz default
-        self.rate_preset = ctk.CTkOptionMenu(
-            rate_frame,
-            values=["10 ms (100 Hz)", "20 ms (50 Hz)", "50 ms (20 Hz)", "100 ms (10 Hz)", "200 ms (5 Hz)"],
-            command=self._apply_rate_preset,
-            width=160
-        )
-        self.rate_preset.set("20 ms (50 Hz)")  # default
-        self.rate_preset.pack(padx=8, pady=(0,4))
-
-        ctk.CTkLabel(rate_frame, text="(changes how often Arduino sends current position + error)", 
-                     font=ctk.CTkFont(size=9), text_color="#555577").pack(anchor="w", padx=8)
-
-        self.current_rate_label = ctk.CTkLabel(rate_frame, text="Current: 20 ms (50 Hz)", font=ctk.CTkFont(size=10), text_color="#8888aa")
-        self.current_rate_label.pack(anchor="w", padx=8, pady=(0,2))
+        # Text is provisional (what the GUI is ABOUT to request) until the Arduino actually
+        # confirms it via STATUS:UPDATE_RATE,MS: - see that handler in _parse_arduino_line, which
+        # rewrites this label's text to the real confirmed value. Previously this was a static
+        # string baked in at UI-build time, so it silently went stale/wrong whenever
+        # POS_UPDATE_RATE_MS was changed, or never reflected what the Arduino actually applied.
+        self.pos_rate_label = ctk.CTkLabel(
+            rate_frame, text=f"Arduino POS Update Rate: requesting {POS_UPDATE_RATE_MS} ms (~{POSITION_BROADCAST_HZ:.0f} Hz)…",
+            font=ctk.CTkFont(size=11), text_color="#8888aa")
+        self.pos_rate_label.pack(anchor="w", padx=8, pady=4)
 
         # Arduino heavy debug dump controls (for diagnosing sync / cal / drift bugs)
         debug_frame = ctk.CTkFrame(right)
@@ -819,7 +1151,7 @@ class EQMountApp(ctk.CTk):
         self._update_status_display("DISCONNECTED - Select COM port and click Connect", "#ffaa00")
         self._update_labels()   # initialize sky + mount displays + speeds
         # Initial label (will be updated properly when location is set)
-        self.location_label.configure(text=f"Loc: {self.lat_var.get()}N {self.lon_var.get()}E")
+        self._set_location_label(f"Loc: {self.lat_var.get()}N {self.lon_var.get()}E")
         # _update_slew_button removed (GoTo function removed)
 
         # Ensure viz is drawn with correct initial size (width + height)
@@ -893,13 +1225,21 @@ class EQMountApp(ctk.CTk):
             self._viz_center_dec = max(-90.0 + dec_span / 2.0, min(90.0 - dec_span / 2.0, self._viz_center_dec))
 
     def _viz_ra_to_x(self, ra, w, margin, ra_min, ra_span):
-        return margin + (w - 2 * margin) * ((ra - ra_min) / ra_span)
+        # Inverted (1.0 - fraction, not fraction) per request: RA=0 on the right, RA=360 on the
+        # left, matching what the camera/real sky actually shows (a mirrored view) instead of the
+        # increasing-rightward convention used before. Every star/DSO/marker/grid-line position
+        # goes through this one function, so this single flip propagates everywhere consistently -
+        # the only things that needed a SEPARATE, explicit fix were the few places with their own
+        # independent East/West direction assumption baked in (position-angle rotation math in
+        # _rotated_ellipse_points/_rotate_ne's callers, and the manual drag-pan/zoom-under-cursor
+        # RA math that duplicated this formula inline instead of calling it).
+        return margin + (w - 2 * margin) * (1.0 - (ra - ra_min) / ra_span)
 
     def _viz_dec_to_y(self, dec, h, margin, dec_min, dec_span):
         return margin + (h - 2 * margin) * (1.0 - (dec - dec_min) / dec_span)
 
     def _viz_x_to_ra(self, x, w, margin, ra_min, ra_span):
-        return ra_min + ra_span * ((x - margin) / (w - 2 * margin))
+        return ra_min + ra_span * (1.0 - (x - margin) / (w - 2 * margin))
 
     def _viz_y_to_dec(self, y, h, margin, dec_min, dec_span):
         return dec_min + dec_span * (1.0 - (y - margin) / (h - 2 * margin))
@@ -984,7 +1324,9 @@ class EQMountApp(ctk.CTk):
         # of the current view (0..1) so it can be re-centered after the zoom changes.
         frac_x = (event.x - margin) / max(1, (w - 2 * margin))
         frac_y = (event.y - margin) / max(1, (h - 2 * margin))
-        cursor_ra = ra_min + ra_span * frac_x
+        # Uses the shared helpers (not a duplicated inline formula) specifically so this can't
+        # drift out of sync with _viz_ra_to_x's mirrored RA convention again in the future.
+        cursor_ra = self._viz_x_to_ra(event.x, w, margin, ra_min, ra_span)
         cursor_dec = dec_min + dec_span * (1.0 - frac_y)
 
         steps = event.delta / 120.0
@@ -995,8 +1337,10 @@ class EQMountApp(ctk.CTk):
         self._viz_zoom = new_zoom
 
         # Re-center so the point under the cursor stays under the cursor.
+        # (frac_x - 0.5), not (0.5 - frac_x): re-derived for _viz_ra_to_x's mirrored RA
+        # convention (RA increasing leftward) - see cursor_ra's comment above.
         new_ra_span, new_dec_span = self._get_viz_view_span()
-        self._viz_center_ra = cursor_ra + new_ra_span * (0.5 - frac_x)
+        self._viz_center_ra = cursor_ra + new_ra_span * (frac_x - 0.5)
         self._viz_center_dec = cursor_dec + new_dec_span * (0.5 - (1.0 - frac_y))
         self._clamp_viz_center()
         self._schedule_viz_redraw()
@@ -1021,7 +1365,10 @@ class EQMountApp(ctk.CTk):
         ra_span, dec_span = self._get_viz_view_span()
         last_x, last_y = self._viz_pan_last_xy
         dx, dy = event.x - last_x, event.y - last_y
-        self._viz_center_ra -= dx * ra_span / max(1, (w - 2 * margin))
+        # + dx, not -: RA now increases leftward on screen (see _viz_ra_to_x's mirrored
+        # convention), so dragging right (dx>0) must INCREASE center_ra to keep the content
+        # following the cursor the same intuitive way it did before the flip.
+        self._viz_center_ra += dx * ra_span / max(1, (w - 2 * margin))
         self._viz_center_dec += dy * dec_span / max(1, (h - 2 * margin))
         self._clamp_viz_center()
         self._viz_pan_last_xy = (event.x, event.y)
@@ -1091,8 +1438,22 @@ class EQMountApp(ctk.CTk):
             x0, y0 = horizon_points[0]
             x360, y360 = horizon_points[-1]
 
-        # Polygon for ground: start at left horizon edge, follow curve, to right horizon edge, then bottom
-        poly = [(x0, y0)] + horizon_points + [(x360, y360), (x360, h - margin), (x0, h - margin)]
+        # Which side of the horizon curve is actually ground depends on the observer's latitude
+        # sign, not just "below" in the fixed sense of "toward lower DEC" - closing the polygon
+        # toward dec_min unconditionally was wrong for negative latitudes (e.g. at the south
+        # pole, DEC>0 is permanently below the horizon and DEC<0 is the visible sky - the
+        # opposite of the north pole, even though the horizon curve itself is flat at DEC=0 in
+        # both cases). The observer's zenith (always visible sky, by definition, at DEC=lat) is
+        # the one point we know for certain is NOT ground, so compare it against the horizon
+        # curve's own DEC at the observer's meridian (hour angle 0) to find which side it falls
+        # on, instead of assuming based on the sign of latitude alone.
+        horizon_dec_at_meridian = _horizon_dec_for_ra(lst)
+        ground_toward_dec_min = lat >= horizon_dec_at_meridian
+        ground_edge_y = (h - margin) if ground_toward_dec_min else margin
+
+        # Polygon for ground: start at left horizon edge, follow curve, to right horizon edge,
+        # then to whichever canvas edge (bottom or top) is actually the ground side.
+        poly = [(x0, y0)] + horizon_points + [(x360, y360), (x360, ground_edge_y), (x0, ground_edge_y)]
         flat_poly = [coord for pt in poly for coord in pt]
         # Plain solid fill, not stipple="gray25" - Tk's canvas stipple fill is rasterized
         # pixel-by-pixel with no hardware acceleration, and is a well-known slow path for any
@@ -1106,6 +1467,255 @@ class EQMountApp(ctk.CTk):
         if len(flat_line) >= 4:
             c.create_line(flat_line, fill="#555577", width=1, tags="horizon")
 
+    def _bearing_to_sun(self, obj_ra, obj_dec):
+        """Direction from (obj_ra, obj_dec) toward the Sun, in the same North-through-East
+        position-angle convention _rotated_ellipse_points/_draw_illuminated_disc use - shared by
+        the Moon and planet phase rendering. Computed from real RA/DEC (not screen pixel
+        positions, which break down right at the RA 0/360 seam - exactly where the Moon or an
+        inferior planet tends to be closest to the Sun, i.e. right when getting this direction
+        correct matters most for how thin/oriented the crescent looks). Falls back to an
+        arbitrary bearing if the Sun's position isn't known yet (shouldn't normally happen once
+        the solar-system update loop has run at least once)."""
+        if self._sun_ra is None:
+            return 90.0
+        delta_ra = ((self._sun_ra - obj_ra + 180.0) % 360.0) - 180.0
+        delta_dec = self._sun_dec - obj_dec
+        return math.degrees(math.atan2(delta_ra, delta_dec)) % 360.0
+
+    def _draw_illuminated_disc(self, c, x, y, r, bearing_deg, illum_fraction,
+                                lit_color, dark_color, outline_color):
+        """Phase rendering using the standard 'half-disc + terminator ellipse' technique common
+        in moon-phase widgets - an ellipse of half-width r*|1-2*illum_fraction| exactly traces a
+        sphere's terminator projected orthographically, so overlaying it in the dark or lit color
+        (depending which side of the phase cycle we're on) carves out precisely the right
+        crescent/gibbous shape at any phase, including illum_fraction=0/1 (full-width ellipse ->
+        all dark/all lit) and illum_fraction=0.5 (zero-width ellipse -> exactly half-lit).
+        illum_fraction alone (with bearing_deg for left/right orientation) is enough - a waxing
+        and waning crescent/gibbous at the same illuminated fraction have the same |1-2*illum|
+        (cosine is symmetric around the "full" point), so no separate waxing/age-angle input is
+        needed the way the Moon's own phase_deg tracks (that's a superset of what shape-wise
+        rendering actually needs).
+
+        The lit side faces bearing_deg, following the same North-through-East position-angle
+        convention DSO ellipse rotation uses (see _rotated_ellipse_points) - both the lit
+        half-disc (via the arc's start angle, a pure rotation for a true circle) and the
+        terminator ellipse (built directly from that bearing's basis vectors, rather than
+        assuming a horizontal axis) are rotated to match. Used for the Moon (see _draw_moon_disc)
+        and, since the same math applies to any illuminated sphere, planets too - Mercury/Venus
+        show real, sometimes dramatic phases as inferior planets, Mars a slight gibbous, and the
+        outer planets an imperceptible one (illum_fraction comes out ~1.0 for those - no special-
+        casing which planets bother to show a visible phase)."""
+        c.create_oval(x - r, y - r, x + r, y + r, fill=dark_color, outline="", tags="sky_obj")
+
+        # tkinter's create_arc start angle is a pure rotation for a true (unstretched) circle,
+        # so centering the lit half-disc on the sun's bearing is just start = bearing (not
+        # -bearing - see the East-is-now-leftward comment below; East used to map to arc-angle 0
+        # (screen right), so start=-bearing put the lit center at arc-angle 90-bearing, but East
+        # now maps to arc-angle 180 (screen left), so the lit center needs to be at 90+bearing
+        # instead, i.e. start=bearing since the lit center sits at start+90 for a 180deg extent).
+        c.create_arc(x - r, y - r, x + r, y + r, start=bearing_deg, extent=180,
+                    style="chord", fill=lit_color, outline="", tags="sky_obj")
+
+        cos_phase = 1.0 - 2.0 * illum_fraction
+        half_w = r * abs(cos_phase)
+        terminator_color = lit_color if illum_fraction > 0.5 else dark_color
+        bearing_rad = math.radians(bearing_deg)
+        sin_b, cos_b = math.sin(bearing_rad), math.cos(bearing_rad)
+        pts = []
+        for i in range(24):
+            t = 2 * math.pi * i / 24
+            ct, st = math.cos(t), math.sin(t)
+            # Extent half_w along the bearing direction (shrinks/grows with phase), extent r
+            # along the perpendicular (the terminator's long axis, fixed at full radius). Minus,
+            # not plus, on the x term - East is now leftward on screen (see _viz_ra_to_x), same
+            # fix as _rotated_ellipse_points/_camera_rect_points; the y/North term is unaffected.
+            pts.append(x - half_w * ct * sin_b - r * st * cos_b)
+            pts.append(y - half_w * ct * cos_b + r * st * sin_b)
+        c.create_polygon(pts, fill=terminator_color, outline="", tags="sky_obj")
+        c.create_oval(x - r, y - r, x + r, y + r, outline=outline_color, width=1, fill="", tags="sky_obj")
+
+    def _draw_moon_disc(self, c, x, y, r, bearing_deg):
+        """Moon-specific wrapper around _draw_illuminated_disc - see that function's docstring
+        for the shared rendering technique."""
+        self._draw_illuminated_disc(c, x, y, r, bearing_deg, self._moon_illum_fraction,
+                                     "#e8e8e0", "#1a1a22", "#888888")
+
+    @staticmethod
+    def _darken_hex_color(hex_color, factor=0.28):
+        """hex_color scaled toward black, keeping factor (0-1) of its original brightness - used
+        to derive a planet's unlit-side color from its own real lit-side color, so the dark side
+        of its phase disc reads as a shaded version of that same body instead of an unrelated
+        flat gray (which is what the Moon uses, since 'moon gray' is already a fairly neutral,
+        recognizable color on its own - planets read better shaded from their own real hue)."""
+        hex_color = hex_color.lstrip('#')
+        r, g, b = (int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+        return f"#{int(r*factor):02x}{int(g*factor):02x}{int(b*factor):02x}"
+
+    def _dso_render_style(self, type_code):
+        """Rough shape/color per OpenNGC type code - not meant to be exhaustive, just
+        distinguishable at a glance: galaxies as ellipses, clusters as scattered rings,
+        planetary nebulae as small rings, everything else (nebulae, SNRs, etc.) as a cloud
+        ellipse. See https://github.com/mattiaverga/OpenNGC for the full type code list."""
+        t = type_code or ""
+        if t in ("OCl", "GCl"):
+            return "cluster", "#ffee88"
+        if t == "PN":
+            return "ring", "#dd88ff"
+        if t.startswith("G") and t not in ("GCl",):
+            return "ellipse", "#ffaa66"
+        return "ellipse", "#66ddcc"
+
+    def _star_mag_limit_for_zoom(self):
+        """More, fainter stars as you zoom in - 'the more you zoom, the more you see'. Log-scaled
+        against the zoom range so it ramps up gradually rather than jumping all at once."""
+        t = math.log10(max(self._viz_zoom, VIZ_ZOOM_MIN)) / math.log10(VIZ_ZOOM_MAX)
+        t = max(0.0, min(1.0, t))
+        return 3.2 + t * (sky_catalog.STAR_MAG_LIMIT - 3.2)
+
+    def _rotated_ellipse_points(self, cx, cy, half_major, half_minor, pos_ang_deg, n=28):
+        """Points (flattened x,y list) for an ellipse rotated by pos_ang_deg - standard
+        astronomical position angle convention: measured from North, increasing towards East.
+        In this canvas, North is 'up' (dec increases upward - see _viz_dec_to_y) and East is
+        'left' (ra increases leftward - see _viz_ra_to_x's mirrored convention), so an east
+        offset subtracts from x (cx - east, not cx + east) to keep the ellipse's orientation
+        correctly matched to the mirrored RA axis - it only otherwise takes care with the sign of
+        the y-term, since screen y grows downward while DEC/North grows upward."""
+        pa = math.radians(pos_ang_deg)
+        sin_pa, cos_pa = math.sin(pa), math.cos(pa)
+        pts = []
+        for i in range(n):
+            t = 2 * math.pi * i / n
+            ct, st = math.cos(t), math.sin(t)
+            east = half_major * ct * sin_pa + half_minor * st * cos_pa
+            north = half_major * ct * cos_pa - half_minor * st * sin_pa
+            pts.append(cx - east)  # East is now leftward on screen (see _viz_ra_to_x)
+            pts.append(cy - north)  # screen y grows downward, North grows upward
+        return pts
+
+    def _draw_sky_objects(self, c, w, h, margin, ra_min, ra_max, dec_min, dec_max):
+        """Draw catalog stars (colored by B-V, sized by brightness) and Messier DSOs (rough
+        shape by type, oriented by real position angle when known, from apparent size when
+        large enough to matter at the current zoom). Both are culled to the visible RA/DEC
+        window first - with ~870000 stars in the bundled catalog (see sky_catalog.py's AT-HYG
+        module docstring), iterating all of them unfiltered on every redraw would be the dominant
+        cost by a wide margin, the same class of problem the horizon curve sampling fix (see
+        _draw_horizon) already solved for a different piece of this canvas - see
+        STAR_LOD_TIER_MAG_CUTOFFS's comment for how the star loop specifically stays cheap even
+        at full-sky zoom despite the catalog's size.
+
+        Also records each drawn object's screen position/name/hit-radius in
+        self._visible_object_hits, so _on_viz_mouse_move can hit-test against just what's
+        currently on screen instead of the full star catalog on every mouse movement.
+        The ISS/Sun/Moon markers (drawn separately, see _draw_viz_grid) append to this same list."""
+        self._visible_object_hits = []
+        if not self._sky_stars and not self._sky_dso:
+            return
+        ra_span, dec_span = ra_max - ra_min, dec_max - dec_min
+        pixels_per_deg = (h - 2 * margin) / dec_span
+        mag_limit = self._star_mag_limit_for_zoom()
+
+        # Constellation lines (toggle, see _toggle_constellations) - drawn before the stars so
+        # the star dots render on top of the connecting lines rather than the lines covering
+        # them. Only ~700 segments total, so no need for the bounding-box culling the star loop
+        # below does for its ~62000 entries - just draw them all directly each redraw.
+        if self._constellations_enabled:
+            for hip_a, hip_b in self._const_line_segments:
+                star_a = self._star_by_hip.get(hip_a)
+                star_b = self._star_by_hip.get(hip_b)
+                if not star_a or not star_b:
+                    continue
+                ax = self._viz_ra_to_x(star_a["ra"], w, margin, ra_min, ra_span)
+                ay = self._viz_dec_to_y(star_a["dec"], h, margin, dec_min, dec_span)
+                bx = self._viz_ra_to_x(star_b["ra"], w, margin, ra_min, ra_span)
+                by = self._viz_dec_to_y(star_b["dec"], h, margin, dec_min, dec_span)
+                c.create_line(ax, ay, bx, by, fill="#4a5a7a", width=1, tags="sky_obj")
+
+        # Pick the smallest pre-built magnitude tier that's still guaranteed to contain every
+        # star the current zoom level could show (see STAR_LOD_TIER_MAG_CUTOFFS's comment) - at
+        # full-sky zoom this picks the ~200-star tier instead of bisecting/scanning the full
+        # ~870000-star list just to discard 99.9% of it on magnitude alone. Falls back to the
+        # full list (last tier, cutoff=inf) if star_tiers isn't built yet for some reason.
+        tier_stars_by_ra, tier_ra_values = self._sky_stars_by_ra, self._sky_stars_ra_values
+        for cutoff, tier_stars, tier_ra in self._star_tiers:
+            if cutoff >= mag_limit:
+                tier_stars_by_ra, tier_ra_values = tier_stars, tier_ra
+                break
+
+        # Bisect straight to the visible RA band within that tier (each tier is RA-sorted, same
+        # as the full list - see _build_sky_catalog_state) instead of scanning all of it. Dec
+        # still isn't sorted, so it's still checked per-item below, but for a zoomed-in view this
+        # already cuts the scanned set roughly to (RA span/360) of the tier.
+        ra_lo = bisect.bisect_left(tier_ra_values, ra_min)
+        ra_hi = bisect.bisect_right(tier_ra_values, ra_max)
+        for s in tier_stars_by_ra[ra_lo:ra_hi]:
+            if s["mag"] > mag_limit:
+                continue
+            ra, dec = s["ra"], s["dec"]
+            if not (dec_min <= dec <= dec_max):
+                continue
+            x = self._viz_ra_to_x(ra, w, margin, ra_min, ra_span)
+            y = self._viz_dec_to_y(dec, h, margin, dec_min, dec_span)
+            # Brighter (lower/more negative mag) -> bigger dot. Clamped to a small pixel range -
+            # this is a schematic reticle, not a realistic star field render.
+            radius = max(0.6, min(3.0, (mag_limit - s["mag"]) * 0.5 + 0.6))
+            c.create_oval(x - radius, y - radius, x + radius, y + radius,
+                          fill=s["color"], outline="", tags="sky_obj")
+            # Most of the AT-HYG catalog's ~870000 stars (see sky_catalog.py) have a blank
+            # "name" (no curated proper/Bayer/Flamsteed name - see _build_stars()) but DO have
+            # at least one alias (TYC/HD/HIP/Gliese - verified directly against the built
+            # catalog: every single blank-name star has one), so falling straight through to a
+            # generic "unnamed star" without checking aliases first showed that placeholder for
+            # the vast majority of stars instead of their real catalog designation.
+            hip = s.get("hip")
+            aliases = s.get("aliases") or []
+            name = s.get("name") or (f"HIP {hip}" if hip else None) or (aliases[0] if aliases else None) or "unnamed star"
+            self._visible_object_hits.append({
+                "x": x, "y": y, "ra": ra, "dec": dec, "radius": 12.0, "name": name,
+                "extra": f"mag {s['mag']:.1f}", "labeled": False,  # stars never have a permanent label
+            })
+
+        for d in self._sky_dso:
+            ra, dec = d["ra"], d["dec"]
+            if not (ra_min <= ra <= ra_max and dec_min <= dec <= dec_max):
+                continue
+            x = self._viz_ra_to_x(ra, w, margin, ra_min, ra_span)
+            y = self._viz_dec_to_y(dec, h, margin, dec_min, dec_span)
+            shape, color = self._dso_render_style(d["type"])
+            maj = d.get("size_maj_arcmin")
+            min_ax = d.get("size_min_arcmin") or maj
+            if maj:
+                half_w = max(3.0, (maj / 60.0 / 2.0) * pixels_per_deg)
+                half_h = max(3.0, ((min_ax or maj) / 60.0 / 2.0) * pixels_per_deg)
+            else:
+                half_w = half_h = 4.0
+            if shape == "cluster":
+                c.create_oval(x - half_w, y - half_h, x + half_w, y + half_h,
+                              outline=color, width=1, dash=(2, 2), fill="", tags="sky_obj")
+            elif shape == "ring":
+                c.create_oval(x - half_w, y - half_h, x + half_w, y + half_h,
+                              outline=color, width=1.5, fill="", tags="sky_obj")
+            else:
+                # Rotated by the object's real position angle instead of always axis-aligned,
+                # and a dashed perimeter only (no fill) rather than a solid/stippled ellipse -
+                # this is a schematic indicator of shape/orientation, not a realistic render.
+                pts = self._rotated_ellipse_points(x, y, half_w, half_h, d.get("pos_ang_deg") or 0.0)
+                c.create_polygon(pts, outline=color, width=1, fill="", dash=(3, 2), tags="sky_obj")
+            # Label only once objects are large enough on-screen to have room for text, and only
+            # a modest zoom in - otherwise a full-sky view would be solid text clutter (110
+            # Messier objects all fighting for the same small area).
+            already_labeled = half_w >= 8 and self._viz_zoom >= 3.0
+            if already_labeled:
+                label = d.get("name") or d["messier"]
+                c.create_text(x, y - half_h - 8, text=label, fill=color,
+                             font=("Consolas", 8), tags="sky_obj")
+
+            self._visible_object_hits.append({
+                "x": x, "y": y, "ra": ra, "dec": dec, "radius": max(12.0, half_w, half_h),
+                "name": d.get("name") or d["messier"],
+                "extra": f"{d['messier']} · {d['type']}",
+                "labeled": already_labeled,
+            })
+
     def _camera_fov_half_size(self, pixels_per_deg):
         """Half-width/half-height (px) of the camera's real angular FOV (CAMERA_FOV_W_DEG x
         CAMERA_FOV_H_DEG, measured empirically - see the constant's comment).
@@ -1117,6 +1727,39 @@ class EQMountApp(ctk.CTk):
         rectangle away from its true 3:2 shape into whatever the canvas's aspect ratio happened
         to be - which is why it could look like ~16:9 instead of 3:2."""
         return (CAMERA_FOV_W_DEG / 2.0) * pixels_per_deg, (CAMERA_FOV_H_DEG / 2.0) * pixels_per_deg
+
+    def _rotate_ne(self, u, v, pos_ang_deg):
+        """Rotates a local (u=along-frame-"top", v=along-frame-"right") offset into screen
+        (east, north) offsets, using the same position-angle convention as
+        _rotated_ellipse_points (measured from North, increasing towards East) - at
+        pos_ang_deg=0 the frame's "top" points North and "right" points East."""
+        pa = math.radians(pos_ang_deg)
+        sin_pa, cos_pa = math.sin(pa), math.cos(pa)
+        east = u * sin_pa + v * cos_pa
+        north = u * cos_pa - v * sin_pa
+        return east, north
+
+    def _camera_rect_points(self, cx, cy, half_w, half_h, pos_ang_deg):
+        """Flattened (x1,y1,x2,y2,...) corner list for the camera FOV rectangle, rotated by
+        pos_ang_deg (self._camera_orientation_deg - see _adjust_camera_orientation) about
+        (cx, cy). half_w/half_h are the rectangle's East-West/North-South extents at
+        pos_ang_deg=0 (top of frame = North, same as an unrotated camera)."""
+        pts = []
+        for u, v in ((half_h, -half_w), (half_h, half_w), (-half_h, half_w), (-half_h, -half_w)):
+            east, north = self._rotate_ne(u, v, pos_ang_deg)
+            pts.append(cx - east)  # East is now leftward on screen (see _viz_ra_to_x)
+            pts.append(cy - north)  # screen y grows downward, North grows upward
+        return pts
+
+    def _camera_top_marker_points(self, cx, cy, half_w, half_h, pos_ang_deg):
+        """Flattened corner list for a small filled triangle pointing outward from the midpoint
+        of the camera rectangle's current "top" edge (see _camera_rect_points) - marks which way
+        is "up" in the camera's own frame once pos_ang_deg != 0, i.e. the camera is mounted
+        rotated relative to the sky rather than assumed to always be North-up."""
+        tip_e, tip_n = self._rotate_ne(half_h + 10, 0, pos_ang_deg)
+        l_e, l_n = self._rotate_ne(half_h, -6, pos_ang_deg)
+        r_e, r_n = self._rotate_ne(half_h, 6, pos_ang_deg)
+        return [cx - tip_e, cy - tip_n, cx - l_e, cy - l_n, cx - r_e, cy - r_n]
 
     def _draw_viz_grid(self):
         """Draw a larger, clearer reticle / position visualization. Grid density adapts to
@@ -1168,6 +1811,106 @@ class EQMountApp(ctk.CTk):
             c.create_line(x, 8, x, h-8, fill=col, width=wd)
             r += ra_step
 
+        # Stars + Messier DSOs from the bundled catalog (see sky_catalog.py) - drawn on top of
+        # the grid but below the crosshairs/labels/camera overlay so those stay legible.
+        self._draw_sky_objects(c, w, h, margin, ra_min, ra_max, dec_min, dec_max)
+
+        # Real-time ISS marker (see iss_tracker.py / _iss_update_tick) - a distinct marker since
+        # it's a fast-moving, ephemeral position rather than a fixed catalog object. Drawn even
+        # when below the horizon (dimmer) since "the ISS is currently below your horizon" is
+        # itself useful information, not something to hide.
+        if self._iss_ra is not None and ra_min <= self._iss_ra <= ra_max and dec_min <= self._iss_dec <= dec_max:
+            ix = self._viz_ra_to_x(self._iss_ra, w, margin, ra_min, ra_span)
+            iy = self._viz_dec_to_y(self._iss_dec, h, margin, dec_min, dec_span)
+            iss_color = "#00ffaa" if self._iss_above_horizon else "#336655"
+            r = 4
+            c.create_line(ix - r, iy, ix + r, iy, fill=iss_color, width=1.5, tags="sky_obj")
+            c.create_line(ix, iy - r, ix, iy + r, fill=iss_color, width=1.5, tags="sky_obj")
+            c.create_oval(ix - r, iy - r, ix + r, iy + r, outline=iss_color, width=1.5, tags="sky_obj")
+            c.create_text(ix, iy - r - 8, text="ISS", fill=iss_color, font=("Consolas", 8, "bold"), tags="sky_obj")
+            self._visible_object_hits.append({
+                "x": ix, "y": iy, "ra": self._iss_ra, "dec": self._iss_dec, "radius": 12.0,
+                "name": "ISS", "extra": "above horizon" if self._iss_above_horizon else "below horizon",
+                "labeled": True,  # ISS always shows its "ISS" text label unconditionally above
+            })
+
+        # Real-time Sun/Moon (see solar_system.py / _solar_system_update_tick) - drawn at their
+        # real apparent angular size (both ~0.5deg, so this only actually shows to true scale once
+        # zoomed in a fair bit; a minimum pixel radius keeps them visible/clickable-looking at
+        # full-sky zoom too, same LOD idea as the DSO ellipses).
+        pixels_per_deg_sm = (h - 2 * margin) / dec_span
+        if self._sun_ra is not None and ra_min <= self._sun_ra <= ra_max and dec_min <= self._sun_dec <= dec_max:
+            sx = self._viz_ra_to_x(self._sun_ra, w, margin, ra_min, ra_span)
+            sy = self._viz_dec_to_y(self._sun_dec, h, margin, dec_min, dec_span)
+            sr = max(4.0, (self._sun_ang_diam_deg / 2.0) * pixels_per_deg_sm)
+            c.create_oval(sx - sr, sy - sr, sx + sr, sy + sr, fill="#ffcc33", outline="#aa7700",
+                         width=1, tags="sky_obj")
+            c.create_text(sx, sy - sr - 8, text="Sun", fill="#ffcc33", font=("Consolas", 8, "bold"), tags="sky_obj")
+            self._visible_object_hits.append({
+                "x": sx, "y": sy, "ra": self._sun_ra, "dec": self._sun_dec, "radius": max(12.0, sr),
+                "name": "Sun", "extra": f"diam {self._sun_ang_diam_deg*60:.1f}'",
+                "labeled": True,  # Sun always shows its "Sun" text label unconditionally above
+            })
+        if self._moon_ra is not None and ra_min <= self._moon_ra <= ra_max and dec_min <= self._moon_dec <= dec_max:
+            mx = self._viz_ra_to_x(self._moon_ra, w, margin, ra_min, ra_span)
+            my = self._viz_dec_to_y(self._moon_dec, h, margin, dec_min, dec_span)
+            mr = max(4.0, (self._moon_ang_diam_deg / 2.0) * pixels_per_deg_sm)
+            bearing_deg = self._bearing_to_sun(self._moon_ra, self._moon_dec)
+            self._draw_moon_disc(c, mx, my, mr, bearing_deg)
+            c.create_text(mx, my - mr - 8, text=f"Moon ({self._moon_illum_fraction*100:.0f}%)",
+                         fill="#cccccc", font=("Consolas", 8, "bold"), tags="sky_obj")
+            waxwane = "waxing" if self._moon_waxing else "waning"
+            self._visible_object_hits.append({
+                "x": mx, "y": my, "ra": self._moon_ra, "dec": self._moon_dec, "radius": max(12.0, mr),
+                "name": "Moon", "extra": f"{self._moon_illum_fraction*100:.0f}% illuminated, {waxwane}",
+                "labeled": True,  # Moon always shows its "Moon (xx%)" text label unconditionally above
+            })
+
+        # Real-time planets (Mercury-Neptune - see solar_system.py / _solar_system_update_tick).
+        # Drawn at real apparent angular size once zoomed in enough to matter, same LOD idea as
+        # the Sun/Moon above and the DSO ellipses: a small fixed-radius flat-color dot at low
+        # zoom (all of these are sub-arcminute at typical distances, far too small to resolve or
+        # usefully phase-render there), growing to true relative scale (and, past a further
+        # threshold, real illumination phase via _draw_illuminated_disc - see its docstring for
+        # why the same Moon-phase math applies directly) as the real size overtakes that minimum.
+        _planet_colors = {
+            "Mercury": "#aaaaaa", "Venus": "#e8dcb0", "Mars": "#cc6644",
+            "Jupiter": "#d8b088", "Saturn": "#e0d0a0", "Uranus": "#9fd8d8", "Neptune": "#6e8fd8",
+        }
+        _PLANET_MIN_RADIUS_PX = 3.5
+        _PLANET_PHASE_RADIUS_PX = 6.0  # below this, a phase-rendered disc is too small to read - flat dot instead
+        for pname, (pra, pdec, pang_diam, pring_ang_diam, pillum) in self._planet_positions.items():
+            if not (ra_min <= pra <= ra_max and dec_min <= pdec <= dec_max):
+                continue
+            px = self._viz_ra_to_x(pra, w, margin, ra_min, ra_span)
+            py = self._viz_dec_to_y(pdec, h, margin, dec_min, dec_span)
+            pcolor = _planet_colors.get(pname, "#cccccc")
+            pr = max(_PLANET_MIN_RADIUS_PX, (pang_diam / 2.0) * pixels_per_deg_sm)
+            # Saturn's rings, drawn behind the disk so the disk still reads as solid on top. Real
+            # angular EXTENT (see ring_angular_diameter_deg's comment in solar_system.py), but the
+            # TILT is a fixed illustrative flattening (not computed from Saturn's actual ring-
+            # plane opening angle, which varies over its ~29-year orbit) - good enough to read as
+            # "Saturn has rings" on this schematic reticle without modeling real ring geometry.
+            prr = 0.0
+            if pname == "Saturn" and pring_ang_diam:
+                prr = max(pr + 1.5, (pring_ang_diam / 2.0) * pixels_per_deg_sm)
+                c.create_oval(px - prr, py - prr * 0.45, px + prr, py + prr * 0.45,
+                             outline=pcolor, width=max(1.0, prr * 0.12), tags="sky_obj")
+            if pr >= _PLANET_PHASE_RADIUS_PX:
+                bearing_deg = self._bearing_to_sun(pra, pdec)
+                self._draw_illuminated_disc(c, px, py, pr, bearing_deg, pillum,
+                                            pcolor, self._darken_hex_color(pcolor), pcolor)
+            else:
+                c.create_oval(px - pr, py - pr, px + pr, py + pr, fill=pcolor, outline="#000000",
+                             width=0.5, tags="sky_obj")
+            c.create_text(px, py - pr - 8, text=pname, fill=pcolor, font=("Consolas", 8, "bold"),
+                         tags="sky_obj")
+            self._visible_object_hits.append({
+                "x": px, "y": py, "ra": pra, "dec": pdec, "radius": max(12.0, pr, prr),
+                "name": pname, "extra": f"planet, {pillum*100:.0f}% illuminated",
+                "labeled": True,  # planets always show their name label unconditionally above
+            })
+
         # Cross hairs (center 0/0), only drawn if within the visible window
         if dec_min <= 0.0 <= dec_max:
             cy0 = self._viz_dec_to_y(0.0, h, margin, dec_min, dec_span)
@@ -1176,13 +1919,41 @@ class EQMountApp(ctk.CTk):
             cx0 = self._viz_ra_to_x(180.0, w, margin, ra_min, ra_span)
             c.create_line(cx0, 8, cx0, h-8, fill="#555566", width=1)
 
+        # Cardinal direction reference lines (N/S/E/W). These mark RA, not a fixed sky location -
+        # they shift as sidereal time advances, same as the horizon curve. N and S are exactly
+        # the meridian and anti-meridian (RA = LST and RA = LST+180, i.e. hour angle 0 and 180) -
+        # every point along either of those RA lines is "currently due north/south" at whatever
+        # altitude that point's DEC puts it at, which is why a simplified vertical line (not just
+        # a single horizon point) is a meaningful reference here, not just a convenient shortcut.
+        # E and W are the RA where the celestial equator (dec=0) crosses the horizon (hour angle
+        # +-90 - a standard spherical astronomy result: the equator always crosses the horizon
+        # due east and due west, regardless of latitude) - only that single point on each line is
+        # exactly "at the horizon", but the line still usefully marks "the east/west region of
+        # sky" the same way the N/S lines mark the meridian.
+        lst = self._get_current_lst_deg()
+        cardinal_ra = {"S": lst % 360.0, "N": (lst + 180.0) % 360.0,
+                       "E": (lst + 90.0) % 360.0, "W": (lst - 90.0) % 360.0}
+        for label, cra in cardinal_ra.items():
+            if ra_min <= cra <= ra_max:
+                # NOTE: intentionally not named "cx" - that name belongs to the canvas-center
+                # variable (w // 2) used below for the DEC/RA-range labels, and since Python loop
+                # variables aren't scoped to the loop, reusing it here was overwriting that outer
+                # value with whichever cardinal line happened to be drawn last.
+                line_x = self._viz_ra_to_x(cra, w, margin, ra_min, ra_span)
+                c.create_line(line_x, 8, line_x, h-8, fill="#aa8844", width=1, dash=(5, 3))
+                c.create_text(line_x, 20, text=label, fill="#ddaa55", font=("Consolas", 10, "bold"))
+
         # Labels - show the actual visible bounds + zoom level (updates as you zoom/pan)
         c.create_text(18, 18, text=f"{dec_max:+.2f}°", fill="#8888aa", font=("Consolas", 10), anchor="w")
         c.create_text(18, h-16, text=f"{dec_min:+.2f}°", fill="#8888aa", font=("Consolas", 10), anchor="w")
-        c.create_text(w-16, cy - 12, text=f"RA {ra_min:.2f}° → {ra_max:.2f}°", fill="#8888aa", font=("Consolas", 10), anchor="e")
+        # ra_max first, then ra_min - RA now increases leftward on screen (see _viz_ra_to_x), so
+        # this reads in the same left-to-right order the values actually appear on screen, with
+        # the arrow pointing towards this label's own right-edge anchor (where ra_min sits).
+        c.create_text(w-16, cy - 12, text=f"RA {ra_max:.2f}° → {ra_min:.2f}°", fill="#8888aa", font=("Consolas", 10), anchor="e")
         c.create_text(cx, 18, text="DEC", fill="#aaaacc", font=("Consolas", 11))
-        zoom_hint = "scroll/pinch to zoom, drag to pan, double-click to reset" if self._viz_zoom <= VIZ_ZOOM_MIN + 1e-6 \
-            else f"zoom {self._viz_zoom:.1f}x - drag to pan, double-click to reset"
+        zoom_hint = "scroll/pinch to zoom, drag to pan, middle-click to reset, double-click to set target" \
+            if self._viz_zoom <= VIZ_ZOOM_MIN + 1e-6 \
+            else f"zoom {self._viz_zoom:.1f}x - drag to pan, middle-click to reset, double-click to set target"
         c.create_text(cx, h-16, text=zoom_hint, fill="#666688", font=("Consolas", 9))
 
         # Camera sensor framing: real measured camera FOV (see CAMERA_FOV_W_DEG). Uses a single
@@ -1192,9 +1963,16 @@ class EQMountApp(ctk.CTk):
         # only agree when the canvas is exactly 2:1, matching the 360:180 deg RA:DEC range).
         pixels_per_deg = (h - 2 * margin) / dec_span
         cam_half_w, cam_half_h = self._camera_fov_half_size(pixels_per_deg)
-        self.viz_camera_rect = c.create_rectangle(cx - cam_half_w, cy - cam_half_h,
-                                                   cx + cam_half_w, cy + cam_half_h,
-                                                   outline="#5599ff", width=1.5, dash=(4, 2))
+        rect_pts = self._camera_rect_points(cx, cy, cam_half_w, cam_half_h, self._camera_orientation_deg)
+        self.viz_camera_rect = c.create_polygon(rect_pts, outline="#5599ff", width=1.5,
+                                                 dash=(4, 2), fill="")
+
+        # Small filled triangle marking the "top" of the camera FOV rectangle - without it, a
+        # rotated (self._camera_orientation_deg != 0, see the toolbar's Cam rotation control)
+        # rectangle looks identical whichever way it's actually oriented, since a plain rectangle
+        # has no visible "up". Same color as the rectangle outline it belongs to.
+        marker_pts = self._camera_top_marker_points(cx, cy, cam_half_w, cam_half_h, self._camera_orientation_deg)
+        self.viz_camera_top_marker = c.create_polygon(marker_pts, fill="#5599ff", outline="")
 
         # Telescope full-FOV circle: circumscribes the camera rectangle exactly (radius =
         # rectangle's on-screen diagonal), so its corners always touch the circle regardless of
@@ -1206,9 +1984,30 @@ class EQMountApp(ctk.CTk):
                                      cx + fov_radius, cy + fov_radius,
                                      fill="", outline=self._stability_color, width=2)
 
-        # Target cross - positioned in _update_visualization
-        self.viz_target_h = c.create_line(0, 0, 0, 0, fill="#ffaa00", width=1.5)
-        self.viz_target_v = c.create_line(0, 0, 0, 0, fill="#ffaa00", width=1.5)
+        # Reference circle centered on the TELESCOPE's actual current position (self.current_ra/
+        # dec - positioned in _update_visualization, same as viz_dot/viz_camera_rect above, NOT
+        # this fixed canvas center) - shows at a glance how big an area currently counts as "on
+        # target": 110% of whichever is bigger, the target reticle itself (radius + gap + tick_len,
+        # matching viz_target_circle/tick_* just after this) or the targeted object's own real/
+        # hover size (see _visible_object_hits, same radius the white hover ring uses) - the 10%
+        # margin (see _update_visualization) keeps the reticle/object visibly inside this circle
+        # rather than exactly touching its edge. Same color as the FOV circle (viz_dot,
+        # self._stability_color - see _set_stability, which keeps both in sync), dashed ("not
+        # full") so it doesn't read as another real object marker or FOV boundary, just a
+        # reference guide.
+        self.viz_center_ref_circle = c.create_oval(0, 0, 0, 0, outline=self._stability_color,
+                                                   width=1, dash=(4, 3))
+
+        # Target reticle - a circle with an "inverted cross" (four short tick marks pointing
+        # OUTWARD from the circle, not through the center) instead of a plain crosshair, so the
+        # marker never covers whatever it's actually pointing at (a star dot, the ISS marker,
+        # etc.) - the circle's interior and the gap around it stay completely clear. Positioned
+        # in _update_visualization.
+        self.viz_target_circle = c.create_oval(0, 0, 0, 0, outline="#ffaa00", width=1.5, fill="")
+        self.viz_target_tick_n = c.create_line(0, 0, 0, 0, fill="#ffaa00", width=1.5)
+        self.viz_target_tick_s = c.create_line(0, 0, 0, 0, fill="#ffaa00", width=1.5)
+        self.viz_target_tick_e = c.create_line(0, 0, 0, 0, fill="#ffaa00", width=1.5)
+        self.viz_target_tick_w = c.create_line(0, 0, 0, 0, fill="#ffaa00", width=1.5)
 
     def _update_visualization(self):
         """Map current RA/DEC to canvas position, honoring the current zoom/pan view."""
@@ -1232,22 +2031,45 @@ class EQMountApp(ctk.CTk):
         cam_half_w, cam_half_h = self._camera_fov_half_size(pixels_per_deg)
 
         if hasattr(self, 'viz_camera_rect'):
-            c.coords(self.viz_camera_rect, x - cam_half_w, y - cam_half_h,
-                     x + cam_half_w, y + cam_half_h)
+            c.coords(self.viz_camera_rect,
+                     *self._camera_rect_points(x, y, cam_half_w, cam_half_h, self._camera_orientation_deg))
+
+        if hasattr(self, 'viz_camera_top_marker'):
+            c.coords(self.viz_camera_top_marker,
+                     *self._camera_top_marker_points(x, y, cam_half_w, cam_half_h, self._camera_orientation_deg))
 
         if hasattr(self, 'viz_dot'):
             fov_radius = max(5, math.hypot(cam_half_w, cam_half_h))
             c.coords(self.viz_dot, x - fov_radius, y - fov_radius,
                      x + fov_radius, y + fov_radius)
 
-        # Target cross position
+        # Center reference circle, at the telescope's actual current position (x, y above) - see
+        # the comment where it's created (_draw_viz_grid) for the sizing logic.
+        if hasattr(self, 'viz_center_ref_circle'):
+            center_ref_radius = 8 + 2 + 6  # target reticle's own radius + gap + tick_len below
+            if self.target_object_name:
+                for hit in self._visible_object_hits:
+                    if hit["name"] == self.target_object_name:
+                        center_ref_radius = max(center_ref_radius, hit["radius"])
+                        break
+            center_ref_radius *= 1.1  # 110% of the target size, not a tight 100% fit - see _draw_viz_grid's comment
+            c.coords(self.viz_center_ref_circle, x - center_ref_radius, y - center_ref_radius,
+                     x + center_ref_radius, y + center_ref_radius)
+
+        # Target reticle position - circle + outward-pointing ticks, see the comment where these
+        # are created (_draw_viz_grid) for why it's not a plain crosshair.
         tx = self._viz_ra_to_x(self.target_ra % 360.0, w, margin, ra_min, ra_span)
         ty = self._viz_dec_to_y(self.target_dec, h, margin, dec_min, dec_span)
 
-        cross_len = 11
-        if hasattr(self, 'viz_target_h') and hasattr(self, 'viz_target_v'):
-            c.coords(self.viz_target_h, tx - cross_len, ty, tx + cross_len, ty)
-            c.coords(self.viz_target_v, tx, ty - cross_len, tx, ty + cross_len)
+        radius = 8
+        gap = 2
+        tick_len = 6
+        if hasattr(self, 'viz_target_circle'):
+            c.coords(self.viz_target_circle, tx - radius, ty - radius, tx + radius, ty + radius)
+            c.coords(self.viz_target_tick_n, tx, ty - radius - gap, tx, ty - radius - gap - tick_len)
+            c.coords(self.viz_target_tick_s, tx, ty + radius + gap, tx, ty + radius + gap + tick_len)
+            c.coords(self.viz_target_tick_e, tx + radius + gap, ty, tx + radius + gap + tick_len, ty)
+            c.coords(self.viz_target_tick_w, tx - radius - gap, ty, tx - radius - gap - tick_len, ty)
 
     def _on_canvas_resize(self, event=None):
         """Redraw the visualization when the canvas size changes (both width and height)."""
@@ -1267,6 +2089,22 @@ class EQMountApp(ctk.CTk):
         if ports:
             self.port_combo.set(ports[0])
 
+    def _set_arduino_controls_enabled(self, enabled: bool):
+        """Enable/disable every control that actually sends something to the Arduino, so they're
+        only pressable while connected instead of being clickable but silently no-op-ing with a
+        'Not connected.' log line. Deliberately does NOT touch controls that are purely local/
+        GUI-side (viz zoom/pan/follow-mode/ISS/Sun-Moon/Constellations toggles, the sky object
+        search box, Connect/Disconnect/Refresh themselves) - those all work fine offline."""
+        state = "normal" if enabled else "disabled"
+        widgets = [
+            self.set_loc_btn, self.ra_offset_left_btn, self.ra_offset_right_btn,
+            self.dec_offset_up_btn, self.dec_offset_down_btn, self.tracking_btn,
+            self.safe_target_btn, self.home_axes_btn, self.sync_btn, self.time_btn,
+            self.debug_toggle_btn, self.debug_dump_btn,
+        ] + self.mode_radio_buttons
+        for w in widgets:
+            w.configure(state=state)
+
     def _connect(self):
         port = self.port_combo.get()
         if not port or "No ports" in port:
@@ -1277,6 +2115,7 @@ class EQMountApp(ctk.CTk):
         if success:
             self.connect_btn.configure(state="disabled")
             self.disconnect_btn.configure(state="normal")
+            self._set_arduino_controls_enabled(True)
             # Scheduled here (not inside SerialHandler.connect()) because .after() needs a Tk
             # event loop, which only this App instance has.
             if self._connection_timeout_id is not None:
@@ -1303,6 +2142,7 @@ class EQMountApp(ctk.CTk):
         self.serial.disconnect()
         self.connect_btn.configure(state="normal")
         self.disconnect_btn.configure(state="disabled")
+        self._set_arduino_controls_enabled(False)
         self.conn_status.configure(text="● Disconnected", text_color="gray")
 
     def _on_mode_changed(self):
@@ -1312,18 +2152,24 @@ class EQMountApp(ctk.CTk):
         # Force tracking to stop when switching modes (per requirement)
         self._force_stop_tracking()
 
-        # The Arduino doesn't recompute targetRA/DEC for the new mode until tracking actually
-        # (re)starts (see CMD,MODE handling - it only recomputes if trackingActive, which is
-        # false right after the stop above), so it keeps broadcasting the OLD mode's target in
-        # POS updates until then, and self.target_ra/dec mirrors that stale value. If Start
-        # Tracking were clicked right now, the "is the target close?" distance check would
-        # compare against that stale target and could wrongly pick the SKIP_DEC_RESET fast
-        # path for a mode we have no real target for yet. Force the next Start Tracking to do
-        # a full alignment regardless of that (unreliable, right after a mode change) distance.
+        # Force the next Start Tracking to do a full alignment regardless of the (unreliable,
+        # right after a mode change) target distance - see _toggle_tracking's SKIP_DEC_RESET check.
         self._force_full_align_next_start = True
 
+        # SOLAR/LUNAR no longer have their own on-board Arduino mode - the wire protocol only
+        # ever sees SIDEREAL now. The Arduino's own SolTrack/Meeus lunar-theory position
+        # computation was found to disagree with the GUI's own skyfield-based Sun/Moon position
+        # (used for the viz dot) by up to ~1.5deg, which showed up as "the target cross isn't on
+        # the Moon" and jumpy/unstable tracking once on-target. Sun/Moon are now driven exactly
+        # like the ISS already was: the GUI computes their real position via skyfield (same
+        # source the viz dot uses, so they can never disagree) and streams it via
+        # CMD,SET_TARGET,...,CONTINUATION:1 (see _on_solar_system_position), with the Arduino
+        # just extrapolating a rate between updates through SIDEREAL mode's existing mechanism -
+        # no separate on-board ephemeris involved at all. self.mode_var/current_mode still track
+        # the user's SIDEREAL/SOLAR/LUNAR selection locally for the UI (mode label, which body's
+        # position drives tracking) - only the wire-level CMD,MODE is now always SIDEREAL.
         if self.serial.ser and self.serial.ser.is_open:
-            self.serial.send_mode(mode)
+            self.serial.send_mode("SIDEREAL")
         self._update_mode_label()
         self._log(f"Mode changed to {mode} (tracking stopped)")
 
@@ -1334,22 +2180,69 @@ class EQMountApp(ctk.CTk):
 
         if not self.tracking:
             # Start
-            # For SIDEREAL: send the coordinates from the two input boxes as the target.
-            # This uses SET_TARGET + START_TRACKING so Arduino alignment uses *exactly* the
-            # same logic as solar/lunar (compute target, use cal to derive physical mount
-            # angles for the slew in the alignment sequence, then track at sidereal rate).
-            if self.mode_var.get() == "SIDEREAL":
+            mode = self.mode_var.get()
+
+            if mode == "SOLAR":
+                # Safety gate: this will point the telescope (and whatever's attached to it -
+                # eyepiece, camera sensor) directly at the Sun. Without a proper solar filter,
+                # that's permanent eye damage in seconds if viewed, or a destroyed sensor if
+                # imaged - require explicit confirmation EVERY time, not just once per session,
+                # since the filter is physical hardware that can be forgotten/left off/knocked
+                # loose between sessions in a way software has no way to detect.
+                if not messagebox.askyesno(
+                    "Solar Tracking Safety Check",
+                    "Solar tracking will point the telescope directly at the Sun.\n\n"
+                    "Confirm a proper solar filter is attached to the telescope/camera BEFORE "
+                    "proceeding - without one, this can cause permanent eye damage or destroy "
+                    "a camera sensor.\n\n"
+                    "Is the solar filter in place?",
+                    icon="warning",
+                ):
+                    self._log("Solar tracking start cancelled - solar filter not confirmed.")
+                    return
+
+            # The Arduino only ever tracks via SIDEREAL (SET_TARGET + continuous rate-corrected
+            # holding) now - SOLAR/LUNAR are GUI-side pseudo-modes on top of that (see
+            # _on_mode_changed). Whichever is selected, send an initial fresh target (no
+            # CONTINUATION - this is a brand new target, not a refresh of one already being
+            # tracked) before starting: SIDEREAL uses the input boxes; SOLAR/LUNAR use the
+            # Sun/Moon position already computed by _solar_system_update_tick (same value the viz
+            # dot is drawn from). _on_solar_system_position keeps this fresh with CONTINUATION:1
+            # updates every ~2s once tracking is actually running, same as the ISS.
+            if mode == "SIDEREAL":
                 try:
                     # Robust parse: extract first two numbers even if user pastes "26.01, -15.9" or junk
                     ra_str = self.goto_ra.get().strip()
                     dec_str = self.goto_dec.get().strip()
                     ra = float(re.findall(r"[-+]?\d*\.?\d+", ra_str)[0]) if re.findall(r"[-+]?\d*\.?\d+", ra_str) else float(ra_str)
                     dec = float(re.findall(r"[-+]?\d*\.?\d+", dec_str)[0]) if re.findall(r"[-+]?\d*\.?\d+", dec_str) else float(dec_str)
+                    # If the box TEXT still matches exactly what _select_sky_target last wrote
+                    # (see _target_name_box_ra_str/_dec_str), this Start Tracking press is on
+                    # whatever was just selected - keep the name. Deliberately a string compare,
+                    # not a float-tolerance one: self.target_ra/dec aren't updated by
+                    # _select_sky_target when tracking is already active (it must not interrupt a
+                    # running session), so they can be stale relative to the boxes even when
+                    # nothing was manually edited - comparing the actual displayed text sidesteps
+                    # that entirely, and any real edit changes the text too.
+                    if ra_str != self._target_name_box_ra_str or dec_str != self._target_name_box_dec_str:
+                        self.target_object_name = None
+                        self._update_target_name_label()
                     self.target_ra = ra
                     self.target_dec = dec
                     self.serial.send_command(f"CMD,SET_TARGET,RA:{ra:.6f},DEC:{dec:.6f}")
                 except Exception:
                     self._log("Invalid RA/DEC in target boxes for sidereal; using previous sync values.")
+            elif mode in ("SOLAR", "LUNAR"):
+                ra, dec = (self._sun_ra, self._sun_dec) if mode == "SOLAR" else (self._moon_ra, self._moon_dec)
+                if ra is not None and dec is not None:
+                    self.target_object_name = "Sun" if mode == "SOLAR" else "Moon"
+                    self._update_target_name_label()
+                    self.target_ra = ra
+                    self.target_dec = dec
+                    self.serial.send_command(f"CMD,SET_TARGET,RA:{ra:.6f},DEC:{dec:.6f}")
+                else:
+                    self._log(f"{mode.title()} position not available yet (still loading skyfield ephemeris?) - "
+                              f"using previous sync/target values.")
             if self._force_full_align_next_start:
                 # See _on_mode_changed: right after a mode switch the GUI's cached target is
                 # stale (Arduino hasn't recomputed it for the new mode yet, since that only
@@ -1378,6 +2271,31 @@ class EQMountApp(ctk.CTk):
 
         self._update_tracking_button()
 
+    def _safe_target(self):
+        """One-shot safety move: sky DEC to 0deg, the celestial equator (SAFE_TARGET_DEC_DEG in
+        the .ino, converted to a mount angle via calibration - see CMD,SAFE_TARGET's handler),
+        RA untouched. Stops any active tracking first, same as any other slew command."""
+        if not self.serial or not self.serial.ser or not self.serial.ser.is_open:
+            self._log("Not connected.")
+            return
+        self._force_stop_tracking()
+        self.serial.send_safe_target()
+        self.slewing = False
+        self._log("Safe Target sent: sky DEC -> 0°, RA unchanged, no tracking.")
+
+    def _home_axes(self):
+        """Pure mechanical "return home": slews BOTH RA and DEC directly to mount angle 0
+        (CMD,HOME_AXES in the .ino), bypassing sky-frame/calibration conversion entirely - needs
+        no calibration at all, unlike Safe Target. Stops any active tracking first, same as any
+        other slew command."""
+        if not self.serial or not self.serial.ser or not self.serial.ser.is_open:
+            self._log("Not connected.")
+            return
+        self._force_stop_tracking()
+        self.serial.send_home_axes()
+        self.slewing = False
+        self._log("Home Axes sent: RA/DEC -> mount angle 0°, no tracking.")
+
     def _stop_tracking_key(self, event=None):
         """Delete / Suppr key: emergency stop. Always attempts to send STOP if connected,
         regardless of what the GUI currently believes the tracking state is - an emergency
@@ -1389,11 +2307,52 @@ class EQMountApp(ctk.CTk):
         else:
             self._log("Not connected.")
 
+    def _start_tracking_key(self, event=None):
+        """Enter/Return key: start tracking, mirroring Delete/Suppr's global stop shortcut.
+        Unlike stopping (always safe to send redundantly, so it fires unconditionally
+        regardless of focus), starting can slew the telescope - this must NOT fire just
+        because the user pressed Enter to commit a value in an unrelated text field (RA/DEC
+        boxes, GPS lat/lon, offset increment, camera rotation, the sky search box/results
+        list, etc.), each of which already has its own Enter handling. Skips entirely
+        whenever focus is in an Entry or Listbox; otherwise starts tracking (does nothing if
+        already tracking - this is a start shortcut, not a toggle, matching how Suppr is
+        stop-only, not a toggle either)."""
+        widget = event.widget if event is not None else self.focus_get()
+        if isinstance(widget, (tk.Entry, tk.Listbox)):
+            return
+        if self.tracking:
+            return
+        self._toggle_tracking()
+
     def _update_tracking_button(self):
         if self.tracking:
             self.tracking_btn.configure(text="■ STOP TRACKING", fg_color="#8B0000")
         else:
             self.tracking_btn.configure(text="▶ Start Tracking", fg_color="#006400")
+
+    def _adjust_camera_orientation(self, delta_deg: float):
+        """Rotates the camera FOV rectangle/top-marker overlay by delta_deg, wrapped to
+        (-180, 180]. Purely a local GUI display setting - matches however the camera is actually
+        mounted on the telescope, sends nothing to the Arduino. Cheap: just repositions the
+        already-existing overlay items via _update_visualization(), no grid rebuild needed."""
+        self._set_camera_orientation(self._camera_orientation_deg + delta_deg)
+
+    def _on_cam_rot_entry_commit(self, event=None):
+        """Applies whatever's typed in cam_rot_entry directly (an absolute angle, unlike the
+        ◄/► buttons' relative delta) - fires on Enter or on the entry losing focus, same commit
+        pattern as everywhere else a value gets typed directly rather than via +/- buttons."""
+        try:
+            self._set_camera_orientation(float(self.cam_rot_var.get()))
+        except (ValueError, tk.TclError):
+            self._log("Invalid camera rotation value.")
+            self.cam_rot_var.set(round(self._camera_orientation_deg))
+
+    def _set_camera_orientation(self, angle_deg: float):
+        """Sets the camera FOV overlay's rotation absolutely, wrapped to (-180, 180], and
+        refreshes cam_rot_var/the overlay to match."""
+        self._camera_orientation_deg = (angle_deg + 180.0) % 360.0 - 180.0
+        self.cam_rot_var.set(round(self._camera_orientation_deg, 1))
+        self._update_visualization()
 
     def _adjust_offset(self, ra_dir: int, dec_dir: int):
         """Adjust offset by increment in specified direction (-1, 0, or 1) and send LIVE to Arduino"""
@@ -1452,8 +2411,16 @@ class EQMountApp(ctk.CTk):
         star_pos = self.cal_stars.get(star_name)
 
         if star_pos is not None:
-            # Use predefined bright star coordinates
+            # Use predefined bright star coordinates - prefer the exact value from the bundled
+            # catalog (same source the star's own dot on the viz is drawn from - see
+            # _star_by_hip) over cal_stars' approximate hand-entered fallback, so the synced
+            # target cross always lines up exactly with the star, not just approximately (see
+            # cal_stars/_cal_star_hip's comments for why these could differ).
             ra, dec = star_pos
+            hip = self._cal_star_hip.get(star_name)
+            catalog_star = self._star_by_hip.get(hip) if hip else None
+            if catalog_star is not None:
+                ra, dec = catalog_star["ra"], catalog_star["dec"]
             self.goto_ra.delete(0, "end")
             self.goto_ra.insert(0, f"{ra:.2f}")
             self.goto_dec.delete(0, "end")
@@ -1527,25 +2494,6 @@ class EQMountApp(ctk.CTk):
         # other stop/reset paths that reference slewing state.
         pass
 
-    def _set_pos_update_rate(self):
-        """Send new position broadcast rate to Arduino."""
-        if not hasattr(self, 'serial') or not self.serial or not self.serial.ser or not self.serial.ser.is_open:
-            self._log("Not connected.")
-            return
-        try:
-            ms = int(self.pos_rate_var.get())
-            if ms < 10:
-                ms = 10
-            elif ms > 5000:
-                ms = 5000
-            self.serial.send_pos_update_rate(ms)
-            self._log(f"Sent new POS update rate: {ms} ms")
-            # Optimistic update of display (will be confirmed by Arduino)
-            hz = int(1000 / ms) if ms > 0 else 0
-            self.current_rate_label.configure(text=f"Requested: {ms} ms ({hz} Hz)")
-        except ValueError:
-            self._log("Invalid number for update rate.")
-
     def _set_arduino_debug(self, enable: bool):
         """Enable/disable heavy variable debug dumps from Arduino (used internally)."""
         if not hasattr(self, 'serial') or not self.serial or not self.serial.ser or not self.serial.ser.is_open:
@@ -1615,9 +2563,9 @@ class EQMountApp(ctk.CTk):
 
             self.serial.send_command(f"CMD,SET_LOCATION,LAT:{lat:.6f},LON:{lon:.6f}")
             if self.gps_mode_var.get():
-                self.location_label.configure(text=f"Loc: {lat:.6f}, {lon:.6f} (sent)")
+                self._set_location_label(f"Loc: {lat:.6f}, {lon:.6f} (sent)")
             else:
-                self.location_label.configure(text=f"Loc: {lat:.3f}N {lon:.3f}E (sent)")
+                self._set_location_label(f"Loc: {lat:.3f}N {lon:.3f}E (sent)")
             self._log(f"Sent location LAT={lat} LON={lon}")
             self._redraw_viz()
         except ValueError as e:
@@ -1693,6 +2641,33 @@ class EQMountApp(ctk.CTk):
             self._log(f"Saved GPS config: {gps}")
         except Exception as e:
             self._log(f"Could not save gui_config.json: {e}")
+
+    def _on_streamer_mode_toggle(self):
+        """Mask/unmask the GPS location display. Only ever touches how things are DISPLAYED
+        (Entry 'show' character, the summary label's text) - lat_var/lon_var/gps_var themselves
+        are never cleared or altered, so turning this off just reveals the real values again,
+        and everything location-related (sync, Sun/Moon calc, etc.) keeps working normally the
+        whole time it's on."""
+        hide = self.streamer_mode_var.get()
+        mask_char = "•" if hide else ""
+        self.lat_entry.configure(show=mask_char)
+        self.lon_entry.configure(show=mask_char)
+        self.gps_entry.configure(show=mask_char)
+        if hide:
+            self._set_location_label("Loc: •••••• (hidden)")
+        else:
+            lat, lon = self._get_lat_lon_from_input()
+            self._set_location_label(f"Loc: {lat}, {lon}")
+
+    def _set_location_label(self, text: str):
+        """Every update to location_label should go through here, not call .configure()
+        directly - otherwise a refresh from some other code path (live GPS updates, EEPROM
+        confirmation, sending to Arduino, etc.) would silently leak the real coordinates back
+        onto the label even while Streamer Mode is hiding them."""
+        if self.streamer_mode_var.get():
+            self.location_label.configure(text="Loc: •••••• (hidden)")
+        else:
+            self.location_label.configure(text=text)
 
     def _on_gps_mode_toggle(self):
         if self.gps_mode_var.get():
@@ -1775,9 +2750,9 @@ class EQMountApp(ctk.CTk):
             # Update tracking and location label
             self._last_sent_location = location_key
             if self.gps_mode_var.get():
-                self.location_label.configure(text=f"Loc: {lat:.6f}, {lon:.6f} (live)")
+                self._set_location_label(f"Loc: {lat:.6f}, {lon:.6f} (live)")
             else:
-                self.location_label.configure(text=f"Loc: {lat:.3f}N {lon:.3f}E (live)")
+                self._set_location_label(f"Loc: {lat:.3f}N {lon:.3f}E (live)")
                 
         except ValueError as e:
             self._log(f"Invalid GPS value for live send: {e}")
@@ -1801,25 +2776,12 @@ class EQMountApp(ctk.CTk):
         
         self._location_redraw_id = self.after(200, save_and_redraw)
 
-    def _apply_rate_preset(self, choice: str):
-        """Parse preset like '200 ms (5Hz)' and apply it."""
-        try:
-            # Extract the number before " ms"
-            ms_str = choice.split()[0]
-            ms = int(ms_str)
-            self.pos_rate_var.set(str(ms))
-            self._set_pos_update_rate()
-        except Exception:
-            pass
-
     def _apply_initial_rate(self):
-        """Apply the rate currently shown in the GUI entry (used on connect)."""
+        """Force the fixed POS_UPDATE_RATE_MS rate on the Arduino (used on connect) - the rate is
+        no longer user-adjustable, so this always sends the same fixed value rather than
+        whatever was last shown in a (now-removed) rate entry field."""
         if hasattr(self, 'serial') and self.serial and self.serial.ser and self.serial.ser.is_open:
-            try:
-                ms = int(self.pos_rate_var.get())
-                self.serial.send_pos_update_rate(ms)
-            except:
-                pass
+            self.serial.send_pos_update_rate(POS_UPDATE_RATE_MS)
 
     # ---------------- QUEUE / MESSAGE HANDLING ----------------
     def _poll_queue(self):
@@ -1902,6 +2864,278 @@ class EQMountApp(ctk.CTk):
             return
         self._clamp_viz_center()
 
+    def _build_sky_catalog_state(self):
+        """Reads sky_catalog.json and builds every derived structure (HIP index, RA-sorted list
+        for bisecting, search index) as a plain dict, WITHOUT touching any self.* attribute -
+        safe to call from a background thread (see _load_sky_catalog_async). Returns None on
+        failure (missing/corrupt file) rather than raising, so the caller can just skip applying
+        anything and keep whatever was there before."""
+        try:
+            with open(sky_catalog.CATALOG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            sky_stars = data.get("stars", [])
+            sky_dso = data.get("dso", [])
+            const_line_segments = data.get("const_lines", [])
+            # Indexed by Hipparcos number - constellation line segments only give HIP numbers,
+            # so this is how their endpoints get resolved back to actual RA/DEC for drawing.
+            star_by_hip = {s["hip"]: s for s in sky_stars if "hip" in s}
+            # Sorted by RA once here (not per redraw) so _draw_sky_objects can bisect straight to
+            # the visible RA band instead of scanning all ~870000 stars every single redraw - see
+            # its docstring. Dec is still checked in the loop there (a 1-D RA sort can't also
+            # narrow Dec), but for a zoomed-in view this cuts the scanned set roughly in
+            # proportion to (visible RA span / 360), which is the common case.
+            sky_stars_by_ra = sorted(sky_stars, key=lambda s: s["ra"])
+            sky_stars_ra_values = [s["ra"] for s in sky_stars_by_ra]
+            # Magnitude-capped subsets of the same RA-sorted list (filtering an already-sorted
+            # list preserves order, no separate re-sort needed) - see STAR_LOD_TIER_MAG_CUTOFFS's
+            # comment. The full list itself is the implicit last tier (cutoff=inf) for the rare
+            # case a zoom level's mag_limit exceeds every configured cutoff.
+            star_tiers = []
+            for cutoff in STAR_LOD_TIER_MAG_CUTOFFS:
+                tier_stars = [s for s in sky_stars_by_ra if s["mag"] <= cutoff]
+                star_tiers.append((cutoff, tier_stars, [s["ra"] for s in tier_stars]))
+            star_tiers.append((float("inf"), sky_stars_by_ra, sky_stars_ra_values))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+        # Search index for the "Find:" box - only named stars (searching by a bare HIP/TYC number
+        # isn't useful for most people, and leaving out the ~750000 unnamed-but-still-drawn stars
+        # added by the AT-HYG deep catalog - see sky_catalog.py's module docstring - keeps this
+        # index exactly as small as it was on the old, much-smaller star catalog), all Messier
+        # DSOs (by both messier id and common name), plus Sun/Moon/ISS/planets as "live" entries
+        # whose ra/dec aren't fixed here - they're resolved from
+        # self._sun_ra/_moon_ra/_iss_ra/_planet_positions at selection time instead (see
+        # _choose_sky_search_entry), since baking in whatever position happened to be current
+        # when the catalog loaded would go stale within minutes for the ISS and hours for the rest.
+        #
+        # "search_blob" (what the substring match runs against) includes every alias sky_catalog.py
+        # built for this object - e.g. a star can be found by its constructed common name
+        # ("Tau Ceti"), its raw catalog designation ("52 Ceti"), or its HIP/HD/TYC number, even
+        # though only the primary "name" is what's actually displayed/shown as the result.
+        sky_search_index = []
+        for s in sky_stars:
+            if not s.get("name"):
+                continue
+            blob = " ".join([s["name"]] + s.get("aliases", [])).lower()
+            sky_search_index.append({
+                "name": s["name"], "ra": s["ra"], "dec": s["dec"], "live": None, "search_blob": blob,
+            })
+        for d in sky_dso:
+            display = f"{d['messier']} ({d['name']})" if d.get("name") else d["messier"]
+            blob = " ".join([display] + d.get("aliases", [])).lower()
+            sky_search_index.append({
+                "name": display, "ra": d["ra"], "dec": d["dec"], "live": None, "search_blob": blob,
+            })
+        for live_name in ("Sun", "Moon", "ISS", "Mercury", "Venus", "Mars", "Jupiter", "Saturn",
+                          "Uranus", "Neptune"):
+            sky_search_index.append({
+                "name": live_name, "ra": None, "dec": None, "live": live_name,
+                "search_blob": live_name.lower(),
+            })
+
+        return {
+            "sky_stars": sky_stars, "sky_dso": sky_dso, "const_line_segments": const_line_segments,
+            "star_by_hip": star_by_hip, "sky_stars_by_ra": sky_stars_by_ra,
+            "sky_stars_ra_values": sky_stars_ra_values, "sky_search_index": sky_search_index,
+            "star_tiers": star_tiers,
+        }
+
+    def _apply_sky_catalog_state(self, state):
+        """Assigns a _build_sky_catalog_state() result onto self.* and triggers a redraw - the
+        Tk-thread half of the split (see _load_sky_catalog_async for why this is split at all)."""
+        self._sky_stars = state["sky_stars"]
+        self._sky_dso = state["sky_dso"]
+        self._const_line_segments = state["const_line_segments"]
+        self._star_by_hip = state["star_by_hip"]
+        self._sky_stars_by_ra = state["sky_stars_by_ra"]
+        self._sky_stars_ra_values = state["sky_stars_ra_values"]
+        self._sky_search_index = state["sky_search_index"]
+        self._star_tiers = state["star_tiers"]
+        self._log(f"Sky catalog loaded: {len(self._sky_stars)} stars, {len(self._sky_dso)} Messier objects, "
+                  f"{len(self._const_line_segments)} constellation line segments.")
+        self._schedule_viz_redraw()
+
+    def _load_sky_catalog_async(self):
+        """Load whatever catalog is already on disk, then check/refresh it from the network -
+        both phases run in the same background thread, since the AT-HYG-based catalog (see
+        sky_catalog.py's module docstring) is now ~90MB of JSON: json.load() + building the HIP
+        index/RA-sorted list/search index/magnitude LOD tiers (see STAR_LOD_TIER_MAG_CUTOFFS)
+        measured at ~2s total on the initial disk load alone, which would freeze the GUI for a
+        very noticeable moment if done on the Tk thread the way this used to work when the
+        catalog was a much smaller file (a few MB). Thread only touches plain Python data (file
+        I/O, list building); the actual swap into self._sky_stars/_sky_dso and the redraw happen
+        back on the Tk thread via self.after(), since Tkinter isn't thread-safe (see
+        _build_sky_catalog_state/_apply_sky_catalog_state for the split)."""
+        def worker():
+            state = self._build_sky_catalog_state()
+            if state is not None:
+                self.after(0, lambda: self._apply_sky_catalog_state(state))
+            try:
+                updated = sky_catalog.ensure_catalog_current(sky_catalog.CATALOG_PATH)
+            except Exception as e:
+                # Python deletes the exception variable at the end of the except block, so it
+                # must be captured into a plain string now, not referenced from the deferred lambda.
+                msg = str(e)
+                self.after(0, lambda: self._log(f"Sky catalog update skipped (no internet?): {msg}"))
+                return
+            if updated:
+                state2 = self._build_sky_catalog_state()
+                if state2 is not None:
+                    self.after(0, lambda: self._apply_sky_catalog_state(state2))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _toggle_iss_tracking(self):
+        self._iss_enabled = not self._iss_enabled
+        if self._iss_enabled:
+            self.iss_toggle_btn.configure(text="ISS: ON", fg_color="#006400")
+            self._iss_update_tick()  # kick off immediately, then it reschedules itself
+        else:
+            self.iss_toggle_btn.configure(text="ISS: OFF", fg_color="#444444")
+            if self._iss_update_after_id is not None:
+                self.after_cancel(self._iss_update_after_id)
+                self._iss_update_after_id = None
+            self._iss_ra = None
+            self._iss_dec = None
+            self._schedule_viz_redraw()
+
+    def _iss_update_tick(self):
+        """Fetch/refresh the ISS TLE and compute its current topocentric RA/DEC in a background
+        thread (network + skyfield propagation, neither of which should block the GUI), then
+        hand the result back to the Tk thread. Reschedules itself every 5s while just displaying
+        the ISS marker - fast enough for the reticle, nowhere near fast enough to actually slew
+        the mount to follow it. While the ISS IS the active tracked target (see
+        target_object_name / _on_iss_position), reschedules at ISS_TRACKING_UPDATE_MS instead -
+        fast enough that the mount's existing near-instant tracking-correction path (see
+        Axis::update() in the firmware) can keep up with the ISS's real angular motion, not just
+        the on-screen marker."""
+        if not self._iss_enabled:
+            return
+        lat, lon = self._get_lat_lon_from_input()
+
+        def worker():
+            try:
+                iss_tracker.ensure_tle_current()
+                ra, dec, alt, az, above = iss_tracker.get_current_radec(lat, lon)
+            except ImportError:
+                self.after(0, lambda: self._log(
+                    "ISS tracking needs the 'skyfield' package - pip install skyfield"))
+                self.after(0, lambda: self._toggle_iss_tracking())
+                return
+            except Exception as e:
+                msg = str(e)
+                self.after(0, lambda: self._log(f"ISS position update failed: {msg}"))
+                return
+            self.after(0, lambda: self._on_iss_position(ra, dec, above))
+
+        threading.Thread(target=worker, daemon=True).start()
+        actively_tracking_iss = (self.target_object_name == "ISS" and self.tracking
+                                  and self.mode_var.get() == "SIDEREAL")
+        interval_ms = ISS_TRACKING_UPDATE_MS if actively_tracking_iss else 5000
+        self._iss_update_after_id = self.after(interval_ms, self._iss_update_tick)
+
+    def _on_iss_position(self, ra, dec, above_horizon):
+        self._iss_ra = ra
+        self._iss_dec = dec
+        self._iss_above_horizon = above_horizon
+        self._schedule_viz_redraw()
+
+        # If the ISS is the currently active tracked target, keep the Arduino's target fresh too -
+        # not just the on-screen marker. The firmware has no ISS-specific mode; this reuses
+        # SIDEREAL tracking's existing CMD,SET_TARGET + continuous correction machinery (the same
+        # thing search-selecting any star uses), just refreshed often enough (see
+        # ISS_TRACKING_UPDATE_MS) to keep up with the ISS's real orbital motion instead of only
+        # ever being sent once. CONTINUATION:1 explicitly tells the firmware this is the SAME
+        # tracked object being refreshed (see the CMD,SET_TARGET handler in the .ino) so it's safe
+        # to derive a tracking rate from consecutive updates - every other SET_TARGET sender
+        # (double-click, search, manual entry) omits this, since those are always a fresh target.
+        if (self.target_object_name == "ISS" and self.tracking
+                and self.mode_var.get() == "SIDEREAL"
+                and self.serial and self.serial.ser and self.serial.ser.is_open):
+            self.target_ra = ra
+            self.target_dec = dec
+            self.serial.send_command(f"CMD,SET_TARGET,RA:{ra:.6f},DEC:{dec:.6f},CONTINUATION:1")
+
+    def _toggle_constellations(self):
+        """Unlike ISS/Sun-Moon, this needs no network call or background thread - the
+        constellation line data is already part of the locally-loaded sky catalog (see
+        self._const_line_segments), so toggling this on/off is just a redraw."""
+        self._constellations_enabled = not self._constellations_enabled
+        if self._constellations_enabled:
+            self.const_toggle_btn.configure(text="Constellations: ON", fg_color="#006400")
+        else:
+            self.const_toggle_btn.configure(text="Constellations: OFF", fg_color="#444444")
+        self._schedule_viz_redraw()
+
+    def _solar_system_update_tick(self):
+        """Fetches/refreshes Sun, Moon, and the naked-eye planets (Mercury-Saturn) together in one
+        background call, since they all come from the same skyfield ephemeris (see
+        solar_system.py). Used to refresh every 60s on the assumption that they move slowly
+        enough across the sky that anything faster would just waste ephemeris lookups for no
+        visible change - true for the viz's own on-screen dot at typical zoom, but NOT true once
+        Lunar tracking is actually running: the Arduino recomputes the Moon's real position
+        continuously (every loop() tick, see solar_system.py's own header comment on why
+        Solar/Lunar modes don't have the discrete-jump problem ISON-style targets do), so the
+        physical telescope stays accurately on the Moon while this GUI-side dot could be up to a
+        full 60s stale - the Moon moves ~33"/min, so a 60s-stale dot could be visibly off from
+        where the telescope (correctly) actually is, misread as "the telescope isn't centered on
+        the Moon" when it's really just this reticle lagging. Refreshing every 2s instead bounds
+        that staleness to ~1", imperceptible at any real zoom, for a background-thread ephemeris
+        lookup that's cheap enough to not matter at 30x the old rate. Always on (see the comment
+        near the state this populates) - no toggle, so this reschedules itself forever once
+        kicked off at startup, same pattern as _iss_update_tick but without the enabled-flag check
+        (except the one-time "skyfield isn't installed" case, which stops rescheduling entirely
+        rather than retrying and re-logging forever)."""
+        if self._solar_system_skyfield_missing:
+            return
+        lat, lon = self._get_lat_lon_from_input()
+
+        def worker():
+            try:
+                sun_ra, sun_dec, sun_diam = solar_system.get_sun_info(lat, lon)
+                moon_ra, moon_dec, moon_diam, illum, phase, waxing = solar_system.get_moon_info(lat, lon)
+                planets = solar_system.get_planets_info(lat, lon)
+            except ImportError:
+                self.after(0, lambda: self._log(
+                    "Sun/Moon/planet display needs the 'skyfield' package - pip install skyfield"))
+                self.after(0, lambda: setattr(self, '_solar_system_skyfield_missing', True))
+                return
+            except Exception as e:
+                msg = str(e)
+                self.after(0, lambda: self._log(f"Sun/Moon/planet position update failed: {msg}"))
+                return
+            self.after(0, lambda: self._on_solar_system_position(
+                sun_ra, sun_dec, sun_diam, moon_ra, moon_dec, moon_diam, illum, phase, waxing, planets))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._solar_system_update_after_id = self.after(2000, self._solar_system_update_tick)
+
+    def _on_solar_system_position(self, sun_ra, sun_dec, sun_diam, moon_ra, moon_dec, moon_diam,
+                                   illum, phase, waxing, planets):
+        self._sun_ra, self._sun_dec, self._sun_ang_diam_deg = sun_ra, sun_dec, sun_diam
+        self._moon_ra, self._moon_dec, self._moon_ang_diam_deg = moon_ra, moon_dec, moon_diam
+        self._moon_illum_fraction, self._moon_phase_deg, self._moon_waxing = illum, phase, waxing
+        self._planet_positions = planets
+        self._schedule_viz_redraw()
+
+        # If SOLAR/LUNAR tracking is actually active, keep the Arduino's target fresh too - not
+        # just the on-screen dot. Same CONTINUATION:1 mechanism as _on_iss_position: the Arduino
+        # has no on-board Sun/Moon position mode anymore (see _on_mode_changed), it just derives
+        # a rate from consecutive SET_TARGETs and extrapolates - the Sun/Moon move ~1000x slower
+        # than the ISS, so this 2s cadence (vs ISS_TRACKING_UPDATE_MS) is easily fast enough for a
+        # smooth, accurate rate.
+        mode = self.mode_var.get()
+        target_ra, target_dec, expected_name = (
+            (sun_ra, sun_dec, "Sun") if mode == "SOLAR" else
+            (moon_ra, moon_dec, "Moon") if mode == "LUNAR" else
+            (None, None, None)
+        )
+        if (target_ra is not None and self.tracking and self.target_object_name == expected_name
+                and self.serial and self.serial.ser and self.serial.ser.is_open):
+            self.target_ra = target_ra
+            self.target_dec = target_dec
+            self.serial.send_command(f"CMD,SET_TARGET,RA:{target_ra:.6f},DEC:{target_dec:.6f},CONTINUATION:1")
+
     def _cycle_viz_view_mode(self):
         order = ["FREE", "TELESCOPE", "TARGET"]
         labels = {"FREE": "View: Free", "TELESCOPE": "View: Follow Telescope", "TARGET": "View: Follow Target"}
@@ -1910,7 +3144,26 @@ class EQMountApp(ctk.CTk):
         self._redraw_viz()
 
     def _on_viz_mouse_move(self, event):
-        """Show the RA/DEC under the cursor below the canvas (not drawn inside it)."""
+        """Show the RA/DEC under the cursor below the canvas (not drawn inside it), and hover-
+        highlight the nearest sky object of ANY kind - star, Messier DSO, ISS, Sun, or Moon -
+        showing its name (plus a short extra detail: magnitude for stars, type for DSOs, etc.).
+
+        The white ring always shows for whatever's hovered. The floating name text next to it is
+        skipped for objects that ALREADY have a permanent on-canvas label (Sun/Moon/ISS always
+        do; DSOs do once zoomed in enough - see the "labeled" flag set in
+        _draw_sky_objects/_draw_viz_grid) - only that redundant second copy of the name is
+        suppressed, not the hover indicator itself.
+
+        Hit-tests against self._visible_object_hits, built fresh each redraw by _draw_sky_objects
+        (stars/DSOs) and the ISS/Sun/Moon drawing code in _draw_viz_grid, rather than against the
+        full ~62000-star catalog - keeps this cheap even though it runs on every mouse-move.
+        Each entry carries its own hit radius AND that same radius is used to draw the hover
+        ring, so e.g. hovering a large DSO or the Sun/Moon draws a ring that actually
+        circumscribes the object instead of a fixed tiny circle sitting inside it.
+
+        Also remembers the hovered hit (self._hovered_sky_object) so a double-click while
+        hovering can target - see _on_viz_double_click - the object's own precise RA/DEC rather
+        than whatever the cursor pixel happens to correspond to."""
         c = self.viz_canvas
         w = max(200, c.winfo_width())
         h = max(150, c.winfo_height())
@@ -1920,9 +3173,189 @@ class EQMountApp(ctk.CTk):
         ra = self._viz_x_to_ra(event.x, w, margin, ra_min, ra_span) % 360.0
         dec = self._viz_y_to_dec(event.y, h, margin, dec_min, dec_span)
         dec = max(-90.0, min(90.0, dec))
-        self.viz_cursor_label.configure(text=f"Cursor: RA {ra:.4f}°  DEC {dec:+.4f}°")
+
+        hit = None
+        best_d2 = None
+        for obj in getattr(self, "_visible_object_hits", []):
+            d2 = (obj["x"] - event.x) ** 2 + (obj["y"] - event.y) ** 2
+            if d2 < obj["radius"] ** 2 and (best_d2 is None or d2 < best_d2):
+                best_d2 = d2
+                hit = obj
+
+        c.delete("hover")
+        self._hovered_sky_object = hit
+        if hit is None:
+            self.viz_cursor_label.configure(text=f"Cursor: RA {ra:.4f}°  DEC {dec:+.4f}°")
+            return
+
+        hx, hy, name, extra = hit["x"], hit["y"], hit["name"], hit["extra"]
+        self.viz_cursor_label.configure(
+            text=f"Cursor: RA {ra:.4f}°  DEC {dec:+.4f}°   |   {name}  ({extra})")
+
+        # The white ring always shows, regardless of "labeled" - it's the hover indicator, not
+        # a duplicate of anything. Only the floating name TEXT is skipped for objects that
+        # already have a permanent on-canvas label (Sun/Moon/ISS always do; DSOs do once zoomed
+        # in enough - see the "labeled" flag set in _draw_sky_objects/_draw_viz_grid), since
+        # THAT specifically would just be a redundant second copy of a name already shown there.
+        r = hit["radius"]
+        c.create_oval(hx - r, hy - r, hx + r, hy + r, outline="#ffffff", width=1, tags="hover")
+        if not hit.get("labeled"):
+            c.create_text(hx + r + 4, hy - r, text=name, fill="#ffffff", font=("Consolas", 9, "bold"),
+                          anchor="w", tags="hover")
+
+    def _on_viz_double_click(self, event):
+        """Double-click on the sky viz: same targeting behavior as picking a result from the
+        sky object search box - see _select_sky_target.
+
+        If an (unlabeled - see _on_viz_mouse_move) object is currently hovered, targets that
+        object's own precise catalog RA/DEC instead of wherever the cursor pixel happens to
+        land - a few pixels of hover tolerance can correspond to a meaningful chunk of a degree
+        at low zoom, so "I was hovering Vega and double-clicked" should hit Vega exactly, not
+        some nearby point that merely happened to be under the pointer."""
+        if self._hovered_sky_object is not None:
+            hit = self._hovered_sky_object
+            self._select_sky_target(hit["ra"], hit["dec"], f"Viz double-click on {hit['name']}",
+                                     target_name=hit["name"])
+            return
+
+        c = self.viz_canvas
+        w = max(200, c.winfo_width())
+        h = max(150, c.winfo_height())
+        margin = 12
+        ra_min, ra_max, dec_min, dec_max = self._get_viz_view_bounds()
+        ra_span, dec_span = ra_max - ra_min, dec_max - dec_min
+        ra = self._viz_x_to_ra(event.x, w, margin, ra_min, ra_span) % 360.0
+        dec = max(-90.0, min(90.0, self._viz_y_to_dec(event.y, h, margin, dec_min, dec_span)))
+        self._select_sky_target(ra, dec, f"Viz double-click at RA={ra:.4f} DEC={dec:.4f}")
+
+    def _select_sky_target(self, ra, dec, source_label, target_name=None):
+        """The clicked/selected RA/DEC always gets written into the target/calibrate fields. If
+        tracking is already active, that's ALL this does - it must not interrupt a running
+        session. If not tracking, it also GoTos there and starts sidereal tracking (sidereal
+        only - neither a double-click nor a search result is a good way to pick solar/lunar
+        targets, which follow a specific body rather than a fixed sky point - even when the
+        search result WAS the Sun or Moon, tracking it as a fixed sidereal point is still exactly
+        as valid as tracking any other star, just not moving with the body's own proper motion).
+
+        source_label is just for the log message, so double-click and search-selection produce
+        distinguishable log entries despite sharing this same logic. target_name is the object's
+        display name (e.g. "Vega", "M31") when this selection came from a named catalog object -
+        None for an arbitrary sky point (double-click on empty sky) - see target_object_name /
+        _update_target_name_label."""
+        self.target_object_name = target_name
+        self._update_target_name_label()
+        ra_str, dec_str = f"{ra:.4f}", f"{dec:.4f}"
+        self._target_name_box_ra_str = ra_str
+        self._target_name_box_dec_str = dec_str
+        self.goto_ra.delete(0, "end")
+        self.goto_ra.insert(0, ra_str)
+        self.goto_dec.delete(0, "end")
+        self.goto_dec.insert(0, dec_str)
+
+        if self.tracking:
+            self._log(f"{source_label}: placed in target fields (tracking already active - not slewing)")
+            return
+
+        if not (self.serial.ser and self.serial.ser.is_open):
+            self._log(f"{source_label}: RA/DEC placed in target fields (not connected, so not starting tracking).")
+            return
+
+        self.target_ra = ra
+        self.target_dec = dec
+        if self.mode_var.get() != "SIDEREAL":
+            self.mode_var.set("SIDEREAL")
+            self._on_mode_changed()
+        self._log(f"{source_label}: starting sidereal tracking there")
+        self._toggle_tracking()
+
+        # self.tracking is now True (set by _toggle_tracking above) - only past this point does
+        # _iss_update_tick/_on_iss_position's "actively tracking ISS" check see it that way, so
+        # the real-time refresh loop is kicked off here, not before.
+        if target_name == "ISS" and self.tracking:
+            if not self._iss_enabled:
+                self._iss_enabled = True
+                self.iss_toggle_btn.configure(text="ISS: ON", fg_color="#006400")
+            if self._iss_update_after_id is not None:
+                self.after_cancel(self._iss_update_after_id)
+                self._iss_update_after_id = None
+            self._iss_update_tick()
+
+    def _update_sky_search_results(self):
+        """Live-filter self._sky_search_index by substring match as the search box is typed
+        into, showing/hiding the results Listbox depending on whether there's anything to show
+        (rather than always reserving space for it)."""
+        query = self.sky_search_var.get().strip().lower()
+        self.sky_search_results.delete(0, "end")
+        if not query:
+            self._sky_search_matches = []
+            self.sky_search_results.pack_forget()
+            return
+        matches = [entry for entry in self._sky_search_index if query in entry["name"].lower()]
+        # Prefer matches where the query is a prefix (e.g. "vega" over something that merely
+        # contains "vega" mid-string), then shortest name first, capped to a manageable list.
+        matches.sort(key=lambda e: (not e["name"].lower().startswith(query), len(e["name"])))
+        self._sky_search_matches = matches[:30]
+        if not self._sky_search_matches:
+            self.sky_search_results.pack_forget()
+            return
+        for entry in self._sky_search_matches:
+            self.sky_search_results.insert("end", entry["name"])
+        self.sky_search_results.pack(fill="x", padx=4, before=self.viz_canvas)
+
+    def _focus_sky_search_results(self, event=None):
+        """Down arrow from the search entry moves focus into the results list (if any)."""
+        if self._sky_search_matches:
+            self.sky_search_results.focus_set()
+            self.sky_search_results.selection_set(0)
+        return "break"
+
+    def _select_first_sky_search_result(self, event=None):
+        """Enter in the search entry itself picks the top (best-ranked) match directly."""
+        if self._sky_search_matches:
+            self._choose_sky_search_entry(self._sky_search_matches[0])
+
+    def _on_sky_search_result_chosen(self, event=None):
+        """Double-click or Enter on an item in the results Listbox."""
+        sel = self.sky_search_results.curselection()
+        if not sel:
+            return
+        self._choose_sky_search_entry(self._sky_search_matches[sel[0]])
+
+    def _choose_sky_search_entry(self, entry):
+        """Resolve the chosen search entry to a real RA/DEC (live-looked-up for Sun/Moon/ISS/
+        planets, since those move - see _build_sky_catalog_state) and target it, same as a viz
+        double-click. Clears the search box/results afterward."""
+        if entry["live"] is not None:
+            live_lookup = {
+                "Sun": (self._sun_ra, self._sun_dec),
+                "Moon": (self._moon_ra, self._moon_dec),
+                "ISS": (self._iss_ra, self._iss_dec),
+            }
+            # self._planet_positions entries are (ra, dec, ang_diam, ring_ang_diam) 4-tuples (see
+            # solar_system.get_planets_info) - only ra/dec matter for targeting, so pull those out
+            # rather than merging the raw 4-tuples in directly (which would break the 2-value
+            # unpack below the moment a planet is looked up).
+            for pname, ppos in self._planet_positions.items():
+                live_lookup[pname] = (ppos[0], ppos[1])
+            live_ra, live_dec = live_lookup.get(entry["live"], (None, None))
+            if live_ra is None:
+                if entry["live"] == "ISS":
+                    self._log(f"{entry['live']} position isn't available - enable its tracking toggle first.")
+                else:
+                    self._log(f"{entry['live']} position isn't available yet - still fetching, try again shortly.")
+                return
+            ra, dec = live_ra, live_dec
+        else:
+            ra, dec = entry["ra"], entry["dec"]
+
+        self.sky_search_var.set("")
+        self.sky_search_results.delete(0, "end")
+        self.sky_search_results.pack_forget()
+        self._select_sky_target(ra, dec, f"Search: {entry['name']}", target_name=entry["name"])
 
     def _on_viz_mouse_leave(self, event=None):
+        self.viz_canvas.delete("hover")
+        self._hovered_sky_object = None
         self.viz_cursor_label.configure(text="Cursor: —")
 
     def _force_stop_tracking(self):
@@ -1971,7 +3404,13 @@ class EQMountApp(ctk.CTk):
         self._update_status_display(status_text, "#ffaa00")
         ok = send_fn()
         self._log(f"Sent {action} ({reason})" if ok else f"{action} write failed ({reason}) - will retry")
-        self._pending_action_after_id = self.after(800, lambda: self._verify_pending_action(action, send_fn))
+        # STOP retries much faster and more times than START - this is the emergency-stop path,
+        # so "give up and just log a warning" after a couple seconds isn't acceptable the way it
+        # might be for a slew start. (The '!' panic-byte sentinel - see send_stop() - is what
+        # actually guarantees near-instant action; this retry loop is the backstop in case that
+        # byte itself somehow doesn't arrive, e.g. a genuinely dead connection.)
+        retry_ms = 150 if action == "STOP" else 800
+        self._pending_action_after_id = self.after(retry_ms, lambda: self._verify_pending_action(action, send_fn))
 
     def _verify_pending_action(self, action: str, send_fn):
         self._pending_action_after_id = None
@@ -1980,7 +3419,9 @@ class EQMountApp(ctk.CTk):
             return
         if not (self.serial and self.serial.ser and self.serial.ser.is_open):
             return
-        if self._pending_action_retry_count >= 3:
+        retry_ms = 150 if action == "STOP" else 800
+        max_retries = 20 if action == "STOP" else 3
+        if self._pending_action_retry_count >= max_retries:
             self._log(f"WARNING: Arduino never confirmed {action} after retries - check the connection/mount.")
             self._update_status_display(f"{action} NOT CONFIRMED - CHECK CONNECTION", "#ff4444")
             return
@@ -1988,7 +3429,7 @@ class EQMountApp(ctk.CTk):
         ok = send_fn()
         self._log(f"{action} not yet confirmed, resending (attempt {self._pending_action_retry_count + 1})" if ok
                    else f"{action} resend also failed to write")
-        self._pending_action_after_id = self.after(800, lambda: self._verify_pending_action(action, send_fn))
+        self._pending_action_after_id = self.after(retry_ms, lambda: self._verify_pending_action(action, send_fn))
 
     def _handle_message(self, msg: str):
         if msg.startswith("CONNECTED:"):
@@ -2074,11 +3515,15 @@ class EQMountApp(ctk.CTk):
 
         # STATUS messages - update prominent top status
         if line.startswith("STATUS:"):
-            # WAITING lines stream at 10 Hz for up to 3s per axis during alignment.
-            # Logging every one of them floods the Textbox (each _log() call does an
-            # insert + index + see("end")) and backs up the message queue badly enough
-            # that later log entries get timestamped minutes late. The live error label
-            # and top status bar already show this info in real time, so skip the text log.
+            # WAITING lines used to stream at 10 Hz for up to 3s per axis during alignment
+            # (firmware's ALIGN_WAIT_RA/ALIGN_WAIT_DEC settle/verify phases) - logging every one
+            # flooded the Textbox (each _log() call does an insert + index + see("end")) and
+            # backed up the message queue badly enough that later log entries got timestamped
+            # minutes late, which was the likely cause of the stability badge occasionally
+            # appearing stuck on ALIGNING until Stop+restart (the final TRACKING_STARTED line
+            # queued up behind a backlog of WAITING spam). Firmware 1.8.35 removed those wait
+            # phases entirely, so STATUS:WAITING should no longer actually be sent - this check is
+            # kept only as a harmless no-op guard against older firmware still running it.
             if not line.startswith("STATUS:WAITING"):
                 self._log(line)
             self.last_status = line
@@ -2113,20 +3558,20 @@ class EQMountApp(ctk.CTk):
 
                 self._update_status_display(status_text, color)
 
-            # Handle rate confirmation from Arduino
+            # Rate confirmation from Arduino - the rate isn't user-adjustable from the GUI, but
+            # this is the actual value the Arduino applied (not just what the GUI requested), so
+            # the label is updated from this, not from POS_UPDATE_RATE_MS directly - previously
+            # the label was a static string set once at UI-build time and never touched again, so
+            # it silently didn't reflect the real rate.
             if "UPDATE_RATE" in line or "UPDATE_RATE,MS:" in line:
                 m = re.search(r"MS:(\d+)", line)
                 if m:
-                    ms_str = m.group(1)
-                    try:
-                        ms = int(ms_str)
-                        hz = int(1000 / ms) if ms > 0 else 0
-                    except (ValueError, TypeError):
-                        ms = 0
-                        hz = 0
-                    self.current_rate_label.configure(text=f"Current: {ms_str} ms ({hz} Hz)")
-                    self.pos_rate_var.set(ms_str)
-                    self._log(f"Arduino confirmed POS rate: {ms_str} ms")
+                    confirmed_ms = int(m.group(1))
+                    self._log(f"Arduino confirmed POS rate: {confirmed_ms} ms")
+                    if hasattr(self, 'pos_rate_label'):
+                        hz = 1000.0 / confirmed_ms if confirmed_ms > 0 else 0.0
+                        self.pos_rate_label.configure(
+                            text=f"Arduino POS Update Rate: {confirmed_ms} ms (~{hz:.1f} Hz)")
 
             # Extract error if present (from STATUS during alignment)
             if "ERROR:" in line:
@@ -2234,10 +3679,12 @@ class EQMountApp(ctk.CTk):
                 pass
 
             # Sky RA/DEC comes purely from Arduino's physics-based calculation (drift when not tracking)
-            mode_char = fields[7] if len(fields) > 7 else None
-            if mode_char in ("S", "O", "L"):
-                self.current_mode = {"S": "SIDEREAL", "O": "SOLAR", "L": "LUNAR"}[mode_char]
-                self.mode_var.set(self.current_mode)
+            # mode/self.current_mode is NOT synced from the Arduino's echoed mode char here (used
+            # to be) - the wire protocol only ever reports 'S' now, since SOLAR/LUNAR are GUI-side
+            # pseudo-modes on top of SIDEREAL (see _on_mode_changed); trusting the echo would
+            # stomp the user's SOLAR/LUNAR radio button selection back to SIDEREAL on every POS
+            # update. self.current_mode/mode_var are purely local state now, same as
+            # target_object_name already was for the ISS.
 
             if len(fields) > 8:
                 pos_track = fields[8].strip() == "1"
@@ -2249,17 +3696,28 @@ class EQMountApp(ctk.CTk):
                         self._update_tracking_button()
 
             self._update_mode_label()
-            # Recenter the follow-mode view on every position update, not just on the coarser
-            # periodic timer - this is cheap (just updates two floats + clamps, no Tk rendering)
-            # since _update_visualization() right after already runs on every POS update anyway
-            # and only repositions existing canvas items via coords(), no full grid rebuild. The
-            # periodic timer (_start_viz_follow_timer) still handles the expensive part (redrawing
-            # the grid/labels/horizon) at its own coarser pace - this only makes the *centering*
-            # track precisely instead of lagging up to one timer tick behind.
+            # _apply_viz_follow_mode() IS called here (cheap - just updates the two
+            # _viz_center_ra/dec floats and clamps them, no drawing) even though the expensive
+            # full _draw_viz_grid() rebuild stays on its own separate follow_tick() timer (see
+            # _start_viz_follow_timer/VIZ_FOLLOW_TICK_MS). Without this, the marker positioning
+            # below used whatever center follow_tick's OWN independent ~20ms timer last set - two
+            # separately-scheduled ~20ms timers (this POS handler's arrival rate and follow_tick's
+            # self.after chain) drift in and out of phase with each other rather than firing in
+            # lockstep, so the center the marker was drawn against was sometimes a full tick
+            # stale relative to self.current_ra - reported as the telescope view occasionally
+            # "jumping" relative to the frame. Recomputing the center fresh right before
+            # positioning the marker removes that beat-frequency mismatch entirely; the
+            # background/grid itself (from the last _draw_viz_grid() rebuild) can still be up to
+            # one follow_tick behind, but that residual gap is now consistently small instead of
+            # occasionally doubled by unlucky timer phase, and _draw_viz_grid() was already
+            # confirmed to keep up at VIZ_FOLLOW_TICK_MS's current rate.
             self._apply_viz_follow_mode()
-            self._update_visualization()
-            self._update_labels()  # updates sky + mount positions + error together
-            self._update_live_error()  # error updated together with position (anytime via POS)
+            now = time.time()
+            if now - self._last_pos_ui_update >= POS_UI_UPDATE_MIN_INTERVAL_S:
+                self._last_pos_ui_update = now
+                self._update_visualization()
+                self._update_labels()  # updates sky + mount positions + error together
+                self._update_live_error()  # error updated together with position (anytime via POS)
 
         elif line.startswith("STATUS:SYNCED") or line.startswith("STATUS:TIME_SET"):
             self._log(line)
@@ -2275,9 +3733,9 @@ class EQMountApp(ctk.CTk):
                     lat_str = line.split("LAT:")[1].split(",")[0]
                     lon_str = line.split("LON:")[1].strip()
                     if self.gps_mode_var.get():
-                        self.location_label.configure(text=f"Loc: {lat_str}, {lon_str} (on Arduino)")
+                        self._set_location_label(f"Loc: {lat_str}, {lon_str} (on Arduino)")
                     else:
-                        self.location_label.configure(text=f"Loc: {lat_str}N {lon_str}E (on Arduino)")
+                        self._set_location_label(f"Loc: {lat_str}N {lon_str}E (on Arduino)")
             except:
                 pass
         elif "SLEW_STOPPED" in line or "SLEWING" in line:
@@ -2328,8 +3786,13 @@ class EQMountApp(ctk.CTk):
 
     def _update_labels(self):
         # Sky positions - PURELY from Arduino (RA/DEC fields): celestial coords with Earth rotation drift when not tracking
-        self.ra_label.configure(text=f"{self.current_ra:010.6f}°")
-        self.dec_label.configure(text=f"{self.current_dec:+010.6f}°")
+        # Field widths sized to the values' actual bounded ranges, not an arbitrary round number:
+        # RA is always 0-360 (3 integer digits, no sign needed) -> width 8 ("XXX.XXXX");
+        # DEC is always +-90 (2 integer digits, always signed) -> width 8 ("+XX.XXXX"). The
+        # previous width (10 for both) padded in 1-2 extra leading zeros neither value can ever
+        # actually use.
+        self.ra_label.configure(text=f"{self.current_ra:08.4f}°")
+        self.dec_label.configure(text=f"{self.current_dec:+08.4f}°")
 
         # Mount physical (relative to Earth/mount) - steps no longer displayed or sent
         # 4 decimals, not 6 - matches the precision the Arduino actually sends on the wire (see
@@ -2346,6 +3809,13 @@ class EQMountApp(ctk.CTk):
         """Update the large clear status at the top of the window."""
         self.status_display.configure(text=text, text_color=color)
         self.system_state = text
+
+    def _update_target_name_label(self):
+        """Shows the current target's object name (see target_object_name / _select_sky_target)
+        in a big badge matching the stability label's size, or nothing at all for an arbitrary
+        sky point that isn't a named catalog object."""
+        if hasattr(self, 'target_name_label'):
+            self.target_name_label.configure(text=self.target_object_name or "")
 
     def _update_live_error(self):
         """Update the live alignment/tracking error (updated at the same time as current position via POS, anytime)."""
@@ -2371,14 +3841,20 @@ class EQMountApp(ctk.CTk):
         self._update_tracking_stability()
 
     def _set_stability(self, text: str, color: str):
-        """Update the stability badge AND recolor the telescope FOV circle in the sky viz to
-        match, so the same STABLE/SETTLING/DRIFTING/ALIGNING state is visible at a glance in
-        both places instead of the circle staying a fixed color regardless of tracking health."""
+        """Update the stability badge AND recolor the telescope FOV circle AND the center
+        reference circle in the sky viz to match, so the same STABLE/SETTLING/DRIFTING/ALIGNING
+        state is visible at a glance in all three places instead of staying a fixed color
+        regardless of tracking health."""
         self.stability_label.configure(text=text, fg_color=color, text_color="#ffffff")
         self._stability_color = color
         if hasattr(self, 'viz_dot'):
             try:
                 self.viz_canvas.itemconfigure(self.viz_dot, outline=color)
+            except Exception:
+                pass
+        if hasattr(self, 'viz_center_ref_circle'):
+            try:
+                self.viz_canvas.itemconfigure(self.viz_center_ref_circle, outline=color)
             except Exception:
                 pass
 
