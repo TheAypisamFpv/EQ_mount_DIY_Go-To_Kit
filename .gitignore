@@ -1,0 +1,8 @@
+__pycache__
+.venv
+.git
+.vscode
+mcps
+test
+gui_config.json
+TODO.md
