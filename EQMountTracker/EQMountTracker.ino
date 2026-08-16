@@ -902,7 +902,23 @@ float OBS_LON_DEG = -0.0005f;   // Positive east
 //            compiler had seen either. Fix: forward-declare both with extern right before
 //            utcElapsedSeconds(), same pattern already used for currentUtcTime itself (see
 //            computeSkyRA()'s forward declaration of it). No logic change from 1.8.46.
-#define FIRMWARE_VERSION "1.8.47"
+//   1.8.48 - Real bug, not a rate/frequency problem: reported as "position updates awfully slow
+//            when not tracking - it's updating once every time sync". autoCalibrateFromHome()
+//            was only guarded by calibrationLocked (true only after a REAL CMD,SYNC), so with no
+//            manual Sync ever done, EVERY CMD,SET_TIME - including tracker_gui.py's ~60s
+//            periodic clock resync, not just the initial connect-time one - re-ran full
+//            home-position auto-calibration: snapped cal_mount_ra back to 0 and re-derived
+//            cal_sky_ra fresh from the current LST every single time, discarding whatever the
+//            smooth per-tick sidereal drift calculation (computeSkyRA()) had been reporting in
+//            between. Looked exactly like "frozen, then jumps once a minute" instead of the
+//            intended continuous drift. Added homeCalibrationSettled (+ timeEverConfirmed/
+//            locationEverConfirmed, set in the SET_TIME/SET_LOCATION handlers): the original
+//            SET_TIME-vs-SET_LOCATION arrival-order race this whole mechanism exists for (see
+//            calibrationLocked's comment) still self-corrects exactly as before, but now freezes
+//            for good the moment BOTH have been seen at least once - normally within the first
+//            couple seconds after connecting, long before the first periodic resync - instead of
+//            re-deriving forever.
+#define FIRMWARE_VERSION "1.8.48"
 
 // Sidereal rate (deg/sec on sky for RA axis). Approx 15.041 arcsec/s.
 const float SIDEREAL_RATE_DEG_S = 0.004178f;
@@ -1429,6 +1445,34 @@ extern STTime currentUtcTime;
 // autoCalibrateFromHome()'s comment for the fix.
 bool calibrationLocked = false;
 
+// Set true the first time a CMD,SET_TIME / CMD,SET_LOCATION has actually been received (in their
+// respective command handlers, before calling autoCalibrateFromHome()) - see
+// homeCalibrationSettled's comment for why these exist.
+bool timeEverConfirmed = false;
+bool locationEverConfirmed = false;
+// True once autoCalibrateFromHome() has run with BOTH a real time AND a real location available
+// at least once - i.e. the SET_TIME-vs-SET_LOCATION arrival-order race (see calibrationLocked's
+// comment) has been resolved. Distinct from calibrationLocked (which additionally requires a REAL
+// CMD,SYNC): this settles on its own, from auto-calibration alone, once there's no more race left
+// to resolve.
+//
+// This is what actually stops autoCalibrateFromHome() from re-running - real regression fixed
+// here: previously ONLY calibrationLocked gated it, so with no manual SYNC ever done, EVERY
+// subsequent CMD,SET_TIME (including tracker_gui.py's ~60s periodic clock resync, not just the
+// initial connect-time one) re-ran full home-position auto-calibration - snapping cal_mount_ra
+// back to 0 and re-deriving cal_sky_ra from the CURRENT LST every single time, discarding
+// whatever the smooth per-tick sidereal drift calculation (computeSkyRA()/utcElapsedSeconds())
+// had been reporting in between. Reported as "position updates awfully slow... it's updating once
+// every time sync" - the displayed Sky RA/DEC wasn't actually failing to update continuously
+// in between, it was being periodically SNAPPED BACK to a fresh home-position value, which
+// (mount stationary, cal_mount_ra reset to the same 0) looked like "nothing happened, then a
+// jump" rather than the intended smooth continuous drift. This flag lets the SET_TIME/
+// SET_LOCATION race still self-correct exactly as before (autoCalibrateFromHome() keeps
+// re-deriving for as long as EITHER piece of info hasn't been confirmed even once), while
+// freezing the calibration reference for good the moment both have - normally within the first
+// couple seconds after connecting, long before the first periodic resync.
+bool homeCalibrationSettled = false;
+
 // True once the user has explicitly confirmed (GUI-side messagebox, before sending) that a
 // specific GOTO/START_TRACKING into the meridian danger zone is intentional - see the RISK_OK
 // flag parsing in the CMD,GOTO and CMD,START_TRACKING handlers. Previously the pre-slew gating
@@ -1472,7 +1516,7 @@ unsigned long lastDebugDumpMs = 0;
 // first: whichever of the two arrives LAST simply recomputes cal_sky_ra fresh from the other
 // value already stored, so the final result always reflects both, however they were ordered.
 void autoCalibrateFromHome() {
-  if (calibrationLocked) return;
+  if (calibrationLocked || homeCalibrationSettled) return;
   cal_mount_ra = 0.0f;
   cal_mount_dec = 0.0f;
   cal_sky_dec = 0.0f;
@@ -1510,6 +1554,11 @@ void autoCalibrateFromHome() {
   Serial.print(lst, 6);
   Serial.print(",cal_sky_ra:");
   Serial.println(cal_sky_ra, 6);
+  // See homeCalibrationSettled's comment - once both inputs to this calculation have been real
+  // at least once, there's no more race to resolve, so stop re-deriving on every future SET_TIME.
+  if (timeEverConfirmed && locationEverConfirmed) {
+    homeCalibrationSettled = true;
+  }
 }
 
 // Compute sky position from mount physical angle + calibration + Earth rotation drift.
@@ -2713,10 +2762,12 @@ void parseAndExecuteCommand(char* cmd) {
     if ((p = strstr(line, "min:"))) sscanf(p, "min:%d", &mi);
     if ((p = strstr(line, "s:"))) sscanf(p, "s:%f", &fval);
     setTimeFromValues(y, mo, d, h, mi, (int)s);
+    timeEverConfirmed = true;  // see homeCalibrationSettled's comment
     Serial.println("STATUS:TIME_SET");
     // Real time is now known - if nothing has calibrated yet (no CMD,SYNC either), establish an
     // initial calibration from the mount's physical home position. See autoCalibrateFromHome()'s
-    // comment; a no-op if a real SYNC already happened first.
+    // comment; a no-op if a real SYNC already happened first, OR (see homeCalibrationSettled) if
+    // this isn't the connect-time race anymore, just the ~60s periodic clock resync.
     autoCalibrateFromHome();
     sendPositionUpdateNow();  // send current state immediately so GUI can restore on reconnect without reset
   }
@@ -2737,9 +2788,10 @@ void parseAndExecuteCommand(char* cmd) {
     Serial.print(OBS_LAT_DEG, 6);
     Serial.print(",LON:");
     Serial.println(OBS_LON_DEG, 6);
+    locationEverConfirmed = true;  // see homeCalibrationSettled's comment
     // Location may arrive AFTER CMD,SET_TIME (that's the normal case - see calibrationLocked's
     // comment), so (re-)run the home-position auto-calibration here too, now that OBS_LON_DEG is
-    // current - a no-op once calibrationLocked is set.
+    // current - a no-op once calibrationLocked/homeCalibrationSettled is set.
     autoCalibrateFromHome();
     sendPositionUpdateNow();  // send current state immediately so GUI can restore on reconnect
   }
