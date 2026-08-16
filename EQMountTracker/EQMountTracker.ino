@@ -895,7 +895,14 @@ float OBS_LON_DEG = -0.0005f;   // Positive east
 //            every loop() tick with a plain += (no floor()), same cheap pattern it already uses
 //            for currentUtcTime.second. utcElapsedSeconds() is now just one subtraction. No
 //            behavior change - same drift values, just without the redundant recompute.
-#define FIRMWARE_VERSION "1.8.46"
+//   1.8.47 - Build fix: 1.8.46 failed to compile ("'currentDaysJ2000' was not declared in this
+//            scope" / same for cal_days_j2000) - utcElapsedSeconds() is defined right after
+//            daysSinceJ2000(), well before cal_days_j2000/currentDaysJ2000's own declarations
+//            further down near cal_utc_time/currentUtcTime, so it referenced them before the
+//            compiler had seen either. Fix: forward-declare both with extern right before
+//            utcElapsedSeconds(), same pattern already used for currentUtcTime itself (see
+//            computeSkyRA()'s forward declaration of it). No logic change from 1.8.46.
+#define FIRMWARE_VERSION "1.8.47"
 
 // Sidereal rate (deg/sec on sky for RA axis). Approx 15.041 arcsec/s.
 const float SIDEREAL_RATE_DEG_S = 0.004178f;
@@ -1225,6 +1232,14 @@ double daysSinceJ2000(int year, int month, int day, int hour, int minute, double
   return d0 + dayFraction;  // small + small - no precision collapse, unlike julianDateFull()'s huge + small
 }
 
+// Forward declarations - the actual definitions live further down with the rest of the
+// calibration/time-tracking globals (cal_days_j2000 near cal_utc_time, currentDaysJ2000 near
+// currentUtcTime), but utcElapsedSeconds() below needs them and is itself used by computeSkyRA()
+// et al., all defined before that point - same reason cal_utc_time/currentUtcTime themselves are
+// forward-declared there.
+extern double cal_days_j2000;
+extern double currentDaysJ2000;
+
 // Elapsed time (seconds) since cal_* was established, via currentDaysJ2000/cal_days_j2000 -
 // continuously-increasing day counts, NOT a millis() diff. This is what lets a CMD,SET_TIME clock
 // jump (tracker_gui.py's Time Travel feature - see its comment) actually translate into RA
@@ -1391,17 +1406,13 @@ STTime cal_utc_time;
 // currentDaysJ2000's comment for why this exists (avoiding a daysSinceJ2000() recompute, with
 // its floor() calls, on every tracking tick). Set at the exact same points as cal_utc_time.
 double cal_days_j2000 = 0.0;
-// Forward declarations - the actual definitions (and updateTimeFromMillis()/setTimeFromValues(),
-// which keep them current) live further down with the rest of the time-tracking code, but
-// computeSkyRA() and updateTrackingModes(), both defined before that point, need to reference
-// them for the drift calculation.
+// Forward declaration - the actual definition (and updateTimeFromMillis()/setTimeFromValues(),
+// which keep it current) lives further down with the rest of the time-tracking code, but
+// computeSkyRA() and updateTrackingModes(), both defined before that point, need to reference it
+// for the drift calculation. currentDaysJ2000 (daysSinceJ2000() equivalent of currentUtcTime,
+// same role for utcElapsedSeconds()) is already forward-declared above, right before
+// utcElapsedSeconds() itself.
 extern STTime currentUtcTime;
-// daysSinceJ2000() equivalent of currentUtcTime, updated incrementally in updateTimeFromMillis()
-// (just += elapsed/86400000.0, no floor()) and set exactly once via daysSinceJ2000() itself in
-// setTimeFromValues() (a rare event - connect, the ~60s periodic resync, or a Time Travel
-// preview) - see utcElapsedSeconds()'s comment for why this exists instead of recomputing
-// daysSinceJ2000() from currentUtcTime's Y/M/D/h/m/s fields on every call.
-extern double currentDaysJ2000;
 
 // True once a REAL calibration event (CMD,SYNC, CMD,SYNC_OFFSET, or the mount actually being
 // commanded to move away from home) has happened. Distinct from isCalibrated - isCalibrated just
