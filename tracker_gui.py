@@ -53,7 +53,13 @@ from sky_data import sky_catalog, iss_tracker, solar_system
 #           the Arduino's own clock sync) reads from that one function, so a Time Travel preview
 #           genuinely covers everything, not just a subset. No Arduino firmware changes needed -
 #           the simulated time is just sent as an ordinary CMD,SET_TIME.
-GUI_VERSION = "1.0.1"
+#   1.0.2 - Sync/Calibrate dropdown gained "East"/"West" horizon (DEC=0) calibration points,
+#           above the existing named stars - useful for re-syncing against the horizon itself
+#           (e.g. after a manual re-home) without needing a visible star. Unlike the named
+#           stars, their RA isn't a fixed J2000 value (it depends on the current LST), so
+#           they're resolved at sync time in _sync_position() using the same Hour Angle
+#           convention as autoCalibrateFromHome() in the .ino (East=LST+90, West=LST-90).
+GUI_VERSION = "1.0.2"
 
 BAUD_RATE = 250000
 # GUI poll rate for the serial queue. Fast enough to comfortably keep up with the Arduino's 50Hz
@@ -748,7 +754,17 @@ class EQMountApp(ctk.CTk):
         # show as a visible misalignment between the synced target cross and the star at high
         # zoom even though picking the same star via search (which reads the catalog directly)
         # lined up correctly.
+        # "East"/"West" are the two horizon calibration points (DEC=0, i.e. celestial equator
+        # crossing the horizon - same points autoCalibrateFromHome() uses for the mount's own
+        # home-position calibration in the .ino, see its comment: due East is Hour Angle -90,
+        # due West is Hour Angle +90, so RA = LST -+ 90 respectively) - useful for re-syncing
+        # against the horizon itself (e.g. after a manual re-home) rather than needing a visible
+        # star. Unlike the named stars below, their RA isn't a fixed J2000 value - it depends on
+        # the current LST - so these are stored as sentinel strings, not (ra, dec) tuples, and
+        # resolved at sync time in _sync_position().
         self.cal_stars = {
+            "East (horizon, DEC=0)": "EAST",
+            "West (horizon, DEC=0)": "WEST",
             "Vega (alpha Lyrae)": (279.234, 38.784),
             "Arcturus (alpha Bootis)": (213.915, 19.182),
             "Altair (alpha Aquilae)": (297.696, 8.868),
@@ -2912,7 +2928,20 @@ class EQMountApp(ctk.CTk):
         star_name = self.sync_star_var.get()
         star_pos = self.cal_stars.get(star_name)
 
-        if star_pos is not None:
+        if star_pos in ("EAST", "WEST"):
+            # Horizon calibration points - DEC=0, RA derived from the current LST (see
+            # cal_stars' comment for the Hour Angle convention this matches in the .ino).
+            lst = self._get_current_lst_deg()
+            ra = (lst + 90.0) % 360.0 if star_pos == "EAST" else (lst - 90.0) % 360.0
+            dec = 0.0
+            self.goto_ra.delete(0, "end")
+            self.goto_ra.insert(0, f"{ra:.2f}")
+            self.goto_dec.delete(0, "end")
+            self.goto_dec.insert(0, f"{dec:.2f}")
+            self.target_ra = ra
+            self.target_dec = dec
+            self._log(f"Using calibration point: {star_name} (LST={lst:.2f}°)")
+        elif star_pos is not None:
             # Use predefined bright star coordinates - prefer the exact value from the bundled
             # catalog (same source the star's own dot on the viz is drawn from - see
             # _star_by_hip) over cal_stars' approximate hand-entered fallback, so the synced
