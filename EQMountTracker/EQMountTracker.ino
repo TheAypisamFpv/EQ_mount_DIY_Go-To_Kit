@@ -148,7 +148,7 @@ void switchMicrosteps(int newMicrosteps);
 // inside RA's resonance band AND inside DEC's - re-tune per-axis if the two ever need genuinely
 // different safe speeds (this constant would need to split into MAX_SLEW_SPEED_RA_DEG_S /
 // MAX_SLEW_SPEED_DEC_DEG_S rather than one shared value).
-const float MAX_SLEW_SPEED_DEG_S   = 5.0f;   // Max speed for ALL non-tracking movements (sky °/s at axis)
+const float MAX_SLEW_SPEED_DEG_S   = 2.5f;   // Max speed for ALL non-tracking movements (sky °/s at axis)
 
 // Position update broadcast interval (can be changed from Python GUI)
 unsigned long positionUpdateIntervalMs = 20;   // default 50 Hz (GUI can override)
@@ -725,7 +725,164 @@ float OBS_LON_DEG = -0.0005f;   // Positive east
 //            there yet" during the dead-zone travel, exactly like the real mechanism behaves -
 //            callers (alignment, tracking, GOTO, offset nudges) all keep working in plain logical
 //            angles and never need to know compensation is happening underneath.
-#define FIRMWARE_VERSION "1.8.38"
+//   1.8.39 - Added meridian-limit protection and a manual-flip mechanism, replacing the old
+//            "mount 0/0 is an arbitrary uncalibrated placeholder" boot state with a physically
+//            meaningful one: mount RA=0/DEC=0 now means counterweight straight down, OTA level
+//            pointing due East (sky DEC=0) - an absolute, location+time-derivable sky position
+//            (RA = LST+90 at that moment, same relationship tracker_gui.py's horizon-drawing
+//            code already uses for its "E"/"W" cardinal markers). autoCalibrateFromHome() derives
+//            a real calibration from this the moment real time is known (end of the CMD,SET_TIME
+//            handler), without waiting for a manual CMD,SYNC - idempotent, never overwrites a
+//            real sync. Because the mount then sits physically still at a non-tracking position,
+//            reported Sky RA correctly starts drifting immediately per the 1.8.37 sign fix.
+//
+//            This mount-frame knowledge is what a meridian-limit check needs: computeHourAngleDeg()
+//            (built on a new shared computeLSTDeg(), extracted out of computeMoonPosition()'s
+//            previously-inline GMST+longitude calc so both share one formula) gives the Hour
+//            Angle of any sky RA right now. pastMeridianLimit() gates both continuous tracking
+//            (updateTrackingModes() calls stopForMeridianLimit() once HA reaches the meridian -
+//            MERIDIAN_LIMIT_MARGIN_DEG=0 for now, stop exactly at the meridian, until a real
+//            mechanical clearance margin is measured on hardware) and pre-slew commands
+//            (startAlignmentSequence()/CMD,GOTO refuse with STATUS:ERROR,MERIDIAN_LIMIT rather
+//            than slewing straight into the danger zone).
+//
+//            A real GEM meridian flip needs the DEC axis to swing to roughly 180-DEC to reach the
+//            "other side" - confirmed on this mount's hardware that DEC has a genuine hard
+//            mechanical stop at +-90 and cannot make that swing. Resolution: the DEC half of the
+//            flip is done MANUALLY (loosen the OTA's rings/dovetail, rotate the tube 180 degrees
+//            around the DEC axis by hand, re-tighten - the DEC motor itself never moves) and
+//            reported via new CMD,SET_FLIPPED,1/0. computeSkyDEC()/skyDecToMountDec() branch on
+//            the new telescopeFlipped flag to reinterpret the (unchanged) DEC reading correctly;
+//            derivation (continuity at the pole, worked numeric example) lives in their comments.
+//            setTelescopeFlipped() then automatically drives RA through a real, dedicated 180-
+//            degree slew (new ALIGN_FLIPPING state - deliberately NOT done by just nudging
+//            cal_mount_ra and letting the ordinary tracking tick produce the jump organically,
+//            since snapToNearestWinding() would collapse exactly that deliberate jump back to the
+//            nearest winding) while shifting cal_mount_ra by the same amount, so computeSkyRA()
+//            reports the same target RA across the whole transition - RA needs no flip-awareness
+//            of its own, only DEC does. Resumes tracking automatically once the slew settles if
+//            it was active before the flip began.
+//
+//            POS broadcasts (both updatePositionBroadcast() and sendPositionUpdateNow()) and the
+//            debug dump now also report telescopeFlipped, so a reconnecting GUI can learn/restore
+//            the real flip state instead of always assuming OFF (which could otherwise cause a
+//            reconnected GUI to send an erroneous un-flip).
+//   1.8.40 - Fixed a real home-position pointing error (reported: off by 20+ degrees toward
+//            south instead of due East) caused by a startup command-ordering race:
+//            tracker_gui.py's SerialHandler.connect() sends CMD,SET_TIME synchronously and
+//            immediately on port-open, while CMD,SET_LOCATION (the real GPS coords) only follows
+//            later, asynchronously, once the GUI's Tk message loop processes the "CONNECTED:"
+//            line - so autoCalibrateFromHome() (triggered by CMD,SET_TIME) was very likely
+//            running against a stale OBS_LON_DEG (an EEPROM-loaded previous session's location,
+//            or the Royal Observatory Greenwich default) rather than the just-sent real location.
+//            Replaced autoCalibrateFromHome()'s old one-shot "if(isCalibrated)return" guard with
+//            a new calibrationLocked flag: the home calibration is now freely RE-derived from
+//            scratch every time either CMD,SET_TIME or CMD,SET_LOCATION arrives, right up until a
+//            real calibration event locks it (CMD,SYNC, CMD,SYNC_OFFSET, or the mount actually
+//            being commanded to move away from home - startAlignmentSequence(), CMD,GOTO,
+//            setTelescopeFlipped()). Whichever of SET_TIME/SET_LOCATION happens to arrive last
+//            now simply recomputes cal_sky_ra correctly from the other value already stored, so
+//            the result is correct regardless of arrival order.
+//            Also: autoCalibrateFromHome() now sets targetRA/targetDEC to match the newly
+//            established cal_sky_ra/cal_sky_dec (previously left at the hardcoded 0.0f/0.0f set
+//            in setup()) - the default target now matches wherever the telescope is actually
+//            pointing at home, per request, instead of an arbitrary sky position unrelated to
+//            this mount-relative calibration scheme.
+//   1.8.41 - Fixed a real bug in the meridian-limit danger zone: pastMeridianLimit() (and the
+//            GUI's matching red-zone visualization) previously just went away entirely once
+//            telescopeFlipped was true, on the assumption that "this session's meridian-collision
+//            risk is behind the mount" once flipped. That's wrong - a real GEM's pier-collision
+//            constraint is symmetric: each pier side (unflipped/flipped) is only safe for roughly
+//            half the sky, and swinging back into the OTHER half (the side that was safe before
+//            flipping) risks the exact same collision, just approached from the mirrored
+//            direction. pastMeridianLimit() now mirrors instead of disabling: unflipped, danger
+//            is HA>=-margin (unchanged); flipped, danger is HA<=margin (the mirror image) - same
+//            boundary at the meridian either way. tracker_gui.py's _draw_meridian_limit_zone()
+//            now always draws (previously gated on "not flipped"), shading [LST-180,LST] when
+//            unflipped or the mirrored [LST,LST+180] once flipped. The meridian-limit countdown
+//            warning label stays suppressed while flipped, unchanged - that's a genuinely
+//            different concern (an imminent-stop ETA, not "where is it currently unsafe to
+//            point"), and the next mirrored stop is a session away, not imminent.
+//            Also fixed a build error introduced in 1.8.40: targetRA/targetDEC's definitions had
+//            to move earlier in the file (before autoCalibrateFromHome(), which now assigns to
+//            them directly) since C++ requires a variable's declaration to precede its use.
+//   1.8.42 - Two requested changes to the meridian-limit danger zone:
+//            1) A DEC-dependent exemption: at low declination the OTA/dovetail passes nowhere
+//               near the tripod/pier even past the meridian (this is a high-DEC-swing-close-to-
+//               the-mount-head problem, not a low-DEC one), so movement is now allowed there
+//               regardless of Hour Angle. New MERIDIAN_LIMIT_DEC_ALLOWED_MIN/MAX_DEG constants
+//               (-15/+20, measured on hardware, deliberately NOT symmetric around 0 - the OTA/
+//               counterweight geometry isn't either), checked in pastMeridianLimit() (now takes a
+//               DEC parameter too) before the HA check even runs.
+//            2) Pre-slew gating (CMD,GOTO / CMD,START_TRACKING) no longer refuses a risky target
+//               outright - it now accepts an explicit ,RISK_OK:1 flag that bypasses the refusal
+//               for that one command, set by the GUI only after the user confirms a warning
+//               dialog (tracker_gui.py's _confirm_risky_slew). New riskAcknowledged flag (see its
+//               comment) carries that confirmation through to the continuous tracking check too,
+//               so tracking doesn't immediately re-trip stopForMeridianLimit() on the very next
+//               tick once it's actually holding the confirmed position - reset on every fresh
+//               GOTO/START_TRACKING decision and by stopForMeridianLimit() itself, so a stop
+//               always requires a fresh confirmation on restart rather than inheriting an old one.
+//               The continuous auto-stop itself (updateTrackingModes(), for a target that drifts
+//               into the danger zone during otherwise-unattended tracking) is UNCHANGED - still a
+//               hard, non-interactive stop, since there's no one to ask mid-session.
+//            tracker_gui.py: the danger-zone visualization (_draw_meridian_limit_zone) now excludes
+//            the allowed DEC band (drawn as two horizontal strips instead of one full-height
+//            rectangle) and switched from red to orange, reflecting that it's now "risky, will
+//            ask for confirmation" rather than "impossible".
+//   1.8.43 - Diagnostics only, no behavior change: STATUS:AUTO_CALIBRATED_FROM_HOME now reports
+//            the exact UTC time, LAT/LON, computed LST, and resulting cal_sky_ra it used - the
+//            1.8.40 SET_TIME/SET_LOCATION race fix alone did not resolve a still-reported ~20-30
+//            degree home-position pointing error (south/west of due East), so the next step is
+//            reading these values back off real hardware to tell apart a remaining software bug
+//            (wrong LAT/LON received, wrong time, or a genuine LST/RA formula error) from the
+//            mount's physical re-homing simply not being precisely due East (a procedure/hardware
+//            precision issue no firmware change can fix).
+//   1.8.44 - FOUND IT: the 1.8.43 diagnostic line (UTC:2026-7-17 20:30:0.38, LAT:49.530696,
+//            LON:0.989518, LST:206.739517) let this be root-caused for real - hand-computing the
+//            correct LST from those exact inputs gives 244.166419, not 206.739517: a genuine
+//            ~37.4 degree math bug, not a location/timing race after all (that 1.8.40 fix was
+//            still correct and needed, just not the whole story). Root cause: on the ATmega2560
+//            (every AVR Arduino), avr-gcc's "double" is NOT a real 64-bit IEEE754 double - it's
+//            just an alias for 32-bit "float" (~7 significant decimal digits total; this is
+//            standard, documented AVR behavior). julianDateFull() forms the full Julian Date
+//            (~2.46 million, a 7-digit integer) and THEN adds the sub-day time-of-day fraction
+//            onto it - by that point the integer part alone has consumed essentially the entire
+//            mantissa, leaving only ~0.25 day (~6 hours, ~90 degrees of LST) of real resolution
+//            for the added fraction. Confirmed exactly: simulating true 32-bit float rounding at
+//            every step of julianDateFull()/computeLSTDeg() with this bug's own reported UTC/LAT/
+//            LON reproduced its exact wrong LST/cal_sky_ra (206.739517/296.739501) to 6 decimal
+//            places - not an approximate match, an exact one. This also silently affected Moon
+//            tracking (computeMoonPosition() used the same lossy julianDateFull() call, and its
+//            481267.88 deg/century mean-longitude term turns the same ~6-hour precision loss into
+//            a multi-degree Moon position error).
+//            Fix: new daysSinceJ2000() keeps the huge whole-day count and the small sub-day
+//            fraction SEPARATE until they're subtracted against the (also huge, similar-
+//            magnitude) J2000 epoch offset FIRST - that subtraction is exact (both operands are
+//            individually-exact whole-day values), and only THEN is the small time fraction added
+//            onto the now-small (~9700-magnitude) result, retaining ~84 seconds (~0.35 degrees of
+//            LST) of resolution instead of ~6 hours (~90 degrees) - verified via the same float32
+//            simulation technique: re-running it through the new code path narrows the exact same
+//            reported inputs down to within ~0.3 degrees of the true LST, a ~100x improvement,
+//            comfortably within this mount's own manual-homing precision. computeLSTDeg(),
+//            computeMoonPosition(), and the Moon's of-date->J2000 precession call all switched
+//            from julianDateFull() to daysSinceJ2000(); julianDateFull() itself is kept only for
+//            contexts that don't need sub-day precision (now documented as such on the function).
+//   1.8.45 - CMD,SET_TIME jumps (tracker_gui.py's Time Travel feature - preview a future/past
+//            date/time) previously barely moved the mount even for a several-hour jump: the RA
+//            tracking-drift math (computeSkyRA(), the continuous correction in
+//            updateTrackingModes(), and its priming copy in resumeTrackingFromAlign()) all
+//            derived drift from millis() elapsed since calibration, never from the settable
+//            currentUtcTime clock, so a clock jump with no real elapsed hardware time produced
+//            ~zero drift - by design, for accurate real-time tracking, but it meant Time Travel
+//            could change the GUI's displayed sky positions without ever moving the mount to
+//            match. Added cal_utc_time (a UTC-clock snapshot alongside the existing cal_time_ms)
+//            and utcElapsedSeconds(), and switched all of the above to compute drift from the
+//            change in currentUtcTime instead - real-time operation is unaffected (the clock
+//            advances in lockstep with real elapsed time either way), but a CMD,SET_TIME jump of
+//            N hours now correctly drifts the RA target by N hours' worth of sidereal rate, and
+//            the mount slews to it, exactly as if that much real time had actually passed.
+#define FIRMWARE_VERSION "1.8.45"
 
 // Sidereal rate (deg/sec on sky for RA axis). Approx 15.041 arcsec/s.
 const float SIDEREAL_RATE_DEG_S = 0.004178f;
@@ -769,11 +926,13 @@ struct MoonPos {
 
 // Forward declarations
 MoonPos computeMoonPosition(const STTime &t, double obsLatDeg, double obsLonDeg);
-void startAlignmentSequence(bool skipDecReset = false);
+void startAlignmentSequence(bool skipDecReset = false, bool riskOk = false);
 void stopAll();
 void stopAlignment();
 void runAlignmentSequence();
 void updateTrackingModes();
+void resumeTrackingFromAlign();
+void setTelescopeFlipped(bool flipped);
 void saveLocationToEEPROM();
 void loadLocationFromEEPROM();
 void queryLocation();
@@ -1000,7 +1159,11 @@ void precessOfDateToJ2000(float *raDeg, float *decDeg, double yearsSince2000) {
 // that full series, to keep the added code/table size reasonable.
 // ============================================================
 
-// Full Julian Date (needed for Moon calculations - different from SolTrack's internal tJD)
+// Full Julian Date (needed for Moon calculations - different from SolTrack's internal tJD).
+// WARNING: do not use this to derive anything that needs SUB-DAY precision (LST, GMST, Moon
+// position) - see daysSinceJ2000()'s comment for why. Only safe for things insensitive to less
+// than ~6 hours of resolution (e.g. the whole-years-since-2000 precession count at its one
+// remaining call site).
 double julianDateFull(int year, int month, int day, int hour, int minute, double second) {
   if (month <= 2) {
     year -= 1;
@@ -1011,6 +1174,68 @@ double julianDateFull(int year, int month, int day, int hour, int minute, double
   double JD = floor(365.25 * (year + 4716)) + floor(30.6001 * (month + 1)) + day + B - 1524.5;
   JD += (hour + (minute / 60.0) + (second / 3600.0)) / 24.0;
   return JD;
+}
+
+// Days since the J2000.0 epoch (JD 2451545.0), i.e. (full Julian Date - 2451545.0) - but computed
+// WITHOUT ever forming the full ~2.46-million-magnitude Julian Date and a fine sub-day fraction in
+// the same value, unlike julianDateFull(). That distinction matters a lot on THIS board: on the
+// ATmega2560 (and every other AVR Arduino), avr-gcc's "double" is NOT a real 64-bit IEEE754 double
+// - it's just an alias for 32-bit "float" (~24-bit mantissa, ~7 significant decimal digits; see
+// the Arduino reference / avr-libc docs, this is standard, well-documented AVR behavior, not a bug
+// in this code's arithmetic). A ~2.46-million value (JD's integer part, ~7 digits) already
+// consumes essentially the ENTIRE mantissa on its own, leaving only ~2 bits (~0.25 day, ~6 hours)
+// of resolution for anything added on top - exactly what julianDateFull()'s
+// "JD += (hour+min/60+sec/3600)/24.0" line does. This was confirmed as the actual root cause of a
+// reported ~20-30 degree home-position pointing error that the 1.8.40 SET_TIME/SET_LOCATION race
+// fix alone did NOT resolve: reproducing this exact 32-bit-float rounding behavior in a
+// standalone simulation, fed the firmware's own reported UTC/LAT/LON inputs, reproduced its exact
+// (wrong) reported LST/cal_sky_ra to 6 decimal places - not a timing/location bug, a genuine
+// precision bug baked into forming the combined value at all on this platform.
+// The fix: keep the huge whole-day count and the small sub-day time fraction SEPARATE right up
+// until they're combined with the (also huge, similar-magnitude) J2000 epoch offset FIRST -
+// subtracting two individually-exact ~2.46-million values against each other is lossless (yields
+// a small, ~9700-magnitude result), and only THEN is the small time fraction added onto that now-
+// small result, retaining roughly 10 mantissa bits of fraction (~84 seconds, ~0.35 degrees of
+// LST) - not perfect, but a huge improvement over ~6 hours (~90 degrees of LST), and good enough
+// given this mount's own manual-homing/pointing precision isn't meaningfully better than that
+// anyway. computeLSTDeg() and computeMoonPosition() both use this instead of julianDateFull().
+double daysSinceJ2000(int year, int month, int day, int hour, int minute, double second) {
+  if (month <= 2) {
+    year -= 1;
+    month += 12;
+  }
+  int A = year / 100;
+  int B = 2 - A + (A / 4);
+  double wholeDayJD = floor(365.25 * (year + 4716)) + floor(30.6001 * (month + 1)) + day + B - 1524.5;
+  double d0 = wholeDayJD - 2451545.0;  // exact - both operands are whole-day magnitude, no fraction yet
+  double dayFraction = (hour + (minute / 60.0) + (second / 3600.0)) / 24.0;  // small, full precision on its own
+  return d0 + dayFraction;  // small + small - no precision collapse, unlike julianDateFull()'s huge + small
+}
+
+// Elapsed time (seconds) between two UTC clock readings, via the continuously-increasing
+// daysSinceJ2000() rather than diffing millis(). This is what lets a CMD,SET_TIME clock jump
+// (tracker_gui.py's Time Travel feature - see its comment) actually translate into RA tracking
+// drift: millis() only ever advances with real elapsed hardware time and has no way to see a
+// SET_TIME jump, but currentUtcTime does (setTimeFromValues() sets it directly), so basing drift
+// on the UTC clock's own elapsed time instead means the mount slews to reflect a simulated
+// future/past time exactly like it would after that much real time actually passed. See
+// computeSkyRA() and updateTrackingModes() for where this replaces the old millis()-based dt.
+double utcElapsedSeconds(const STTime &from, const STTime &to) {
+  double d1 = daysSinceJ2000(from.year, from.month, from.day, from.hour, from.minute, from.second);
+  double d2 = daysSinceJ2000(to.year, to.month, to.day, to.hour, to.minute, to.second);
+  return (d2 - d1) * 86400.0;
+}
+
+// Local Sidereal Time, in degrees (0-360) - standard GMST + observer longitude. Extracted out of
+// computeMoonPosition() (which needs it for topocentric parallax) so the meridian-limit/flip
+// logic can share the exact same formula rather than duplicating it - see computeHourAngleDeg().
+double computeLSTDeg(const STTime &t, double obsLonDeg) {
+  double d = daysSinceJ2000(t.year, t.month, t.day, t.hour, t.minute, t.second);
+  double T = d / 36525.0;
+  double gmstDeg = fmod(280.46061837 + 360.98564736629 * d
+                        + 0.000387933 * T * T - (T * T * T) / 38710000.0, 360.0);
+  if (gmstDeg < 0) gmstDeg += 360.0;
+  return fmod(gmstDeg + obsLonDeg, 360.0);
 }
 
 // Argument multipliers (D, M, M', F) and amplitudes for the longitude/distance series (60 terms)
@@ -1029,8 +1254,10 @@ const int8_t MOON_F_LAT[60] = {1,1,-1,-1,1,-1,1,1,-1,-1,-1,-1,1,-1,1,1,-1,-1,-1,
 const long MOON_SIN_LAT[60] = {5128122,280602,277693,173237,55413,46271,32573,17198,9266,8822,8216,4324,4200,-3359,2463,2211,2065,-1870,1828,-1794,-1749,-1565,-1491,-1475,-1410,-1344,-1335,1107,1021,833,777,671,607,596,491,-451,439,422,421,-366,-351,331,315,302,-283,-229,223,223,-220,-220,-185,181,-177,176,166,-164,132,-119,115,107};
 
 MoonPos computeMoonPosition(const STTime &t, double obsLatDeg, double obsLonDeg) {
-  double jd = julianDateFull(t.year, t.month, t.day, t.hour, t.minute, t.second);
-  double T = (jd - 2451545.0) / 36525.0;
+  // daysSinceJ2000(), not julianDateFull() - see its comment. The Moon's mean longitude term
+  // alone (481267.88 deg/century) turns julianDateFull()'s ~6-hour sub-day precision loss into a
+  // multi-degree error here, same root cause as the home-position/LST bug.
+  double T = daysSinceJ2000(t.year, t.month, t.day, t.hour, t.minute, t.second) / 36525.0;
   double T2 = T * T, T3 = T2 * T, T4 = T3 * T;
 
   // Mean longitude, mean elongation, Sun's mean anomaly, Moon's mean anomaly, Moon's argument
@@ -1103,10 +1330,7 @@ MoonPos computeMoonPosition(const STTime &t, double obsLatDeg, double obsLonDeg)
   // horizon, since it's only ~380,000 km away) was silently not being corrected for at all.
   const double EARTH_RADIUS_KM = 6378.14;
   double horizontalParallaxRad = asin(EARTH_RADIUS_KM / distanceKm);
-  double gmstDeg = fmod(280.46061837 + 360.98564736629 * (jd - 2451545.0)
-                        + 0.000387933 * T * T - (T * T * T) / 38710000.0, 360.0);
-  if (gmstDeg < 0) gmstDeg += 360.0;
-  double lstDeg = fmod(gmstDeg + obsLonDeg, 360.0);
+  double lstDeg = computeLSTDeg(t, obsLonDeg);
   double hourAngle = (lstDeg - raDeg) * (PI / 180.0);
   double latRad = obsLatDeg * (PI / 180.0);
   double decRad = decDeg * (PI / 180.0);
@@ -1135,17 +1359,124 @@ float cal_sky_ra = 0.0;
 float cal_mount_dec = 0.0;
 float cal_sky_dec = 0.0;
 unsigned long cal_time_ms = 0;
+// UTC clock reading at the moment cal_* was established - the RA drift calculation now uses this
+// (via utcElapsedSeconds()) instead of cal_time_ms/millis(), so it follows CMD,SET_TIME jumps.
+// cal_time_ms itself is kept alongside, still used for its own debug/report fields. Set wherever
+// cal_time_ms is set - see autoCalibrateFromHome() and the CMD,SYNC handler.
+STTime cal_utc_time;
+// Forward declaration - the actual definition (and updateTimeFromMillis()/setTimeFromValues(),
+// which keep it current) lives further down with the rest of the time-tracking code, but
+// computeSkyRA() and updateTrackingModes(), both defined before that point, need to reference it
+// for the drift calculation.
+extern STTime currentUtcTime;
+
+// True once a REAL calibration event (CMD,SYNC, CMD,SYNC_OFFSET, or the mount actually being
+// commanded to move away from home) has happened. Distinct from isCalibrated - isCalibrated just
+// means "cal_* mean something", true from the moment autoCalibrateFromHome() first fires; this
+// flag means "cal_* now reflects something that must NOT be silently overwritten again". Needed
+// because CMD,SET_TIME and CMD,SET_LOCATION arrive as two separate, independently-timed commands
+// right after connecting (tracker_gui.py's SerialHandler.connect() sends CMD,SET_TIME immediately
+// and synchronously on port-open, while CMD,SET_LOCATION with the real GPS coords only follows
+// later, asynchronously, once the GUI's Tk message loop processes the "CONNECTED:" line) - with no
+// lock, whichever of the two happened to arrive first would permanently latch
+// autoCalibrateFromHome()'s old if(isCalibrated)return guard using a stale OBS_LON_DEG (an
+// EEPROM-loaded previous session's location, or the Greenwich default), producing a systematic
+// home-position pointing error even though the correct location arrived moments later. See
+// autoCalibrateFromHome()'s comment for the fix.
+bool calibrationLocked = false;
+
+// True once the user has explicitly confirmed (GUI-side messagebox, before sending) that a
+// specific GOTO/START_TRACKING into the meridian danger zone is intentional - see the RISK_OK
+// flag parsing in the CMD,GOTO and CMD,START_TRACKING handlers. Previously the pre-slew gating
+// just refused these outright; now it accepts an explicit override instead, and this flag lets
+// updateTrackingModes()'s continuous check know NOT to immediately re-trip stopForMeridianLimit()
+// on the very next tick once tracking is actually holding a position the user already agreed to.
+// Freshly re-decided on every single GOTO/START_TRACKING call (sets to riskOk each time, not just
+// OR'd in) - each such command is its own decision, and stopForMeridianLimit() also resets this
+// to false, so a stop-then-restart always requires a fresh confirmation rather than inheriting an
+// old one silently.
+bool riskAcknowledged = false;
+
+// Declared here (moved up from their old spot further down) so autoCalibrateFromHome() below can
+// assign to them directly - C++ requires the declaration to precede use in the same translation
+// unit, unlike a forward-declared function.
+float targetRA = 0.0;   // Current target sky angles (updated by mode)
+float targetDEC = 0.0;
+
+// True once the telescope has been manually flipped 180 degrees in its rings/dovetail around the
+// DEC axis (the DEC motor itself never moves for this - see computeSkyDEC()'s flipped branch and
+// setTelescopeFlipped(), which drives the accompanying real RA 180-degree rotation). Toggled via
+// CMD,SET_FLIPPED.
+bool telescopeFlipped = false;
 
 // Debug flag - when true, dumps a lot of internal state variables periodically + on key events.
 // Enable from GUI with: CMD,DEBUG,ON   (OFF to disable, DUMP for one-shot)
 bool debugVerbose = false;
 unsigned long lastDebugDumpMs = 0;
 
-// Compute sky position from mount physical angle + calibration + Earth rotation drift
+// Establishes an initial calibration from the mount's physical HOME position alone (counterweight
+// straight down, OTA level pointing due East, sky DEC=0), without waiting for a manual CMD,SYNC -
+// see the FIRMWARE_VERSION changelog entry for the full reasoning. Due East at the horizon is
+// Hour Angle -90 (standard: the celestial equator always crosses the horizon due east/west,
+// regardless of latitude - same relationship tracker_gui.py's horizon-drawing code already uses
+// for its "E"/"W" cardinal markers), so RA = LST + 90 at that exact position/moment.
+// Safe to call repeatedly (called from both the CMD,SET_TIME and CMD,SET_LOCATION handlers,
+// since either can arrive first right after connecting) - freely RE-derives cal_* every time,
+// right up until calibrationLocked becomes true (a real CMD,SYNC/CMD,SYNC_OFFSET, or the mount
+// being commanded to actually move away from home - see calibrationLocked's comment). This makes
+// the result self-correcting regardless of whether time or location happens to reach the Arduino
+// first: whichever of the two arrives LAST simply recomputes cal_sky_ra fresh from the other
+// value already stored, so the final result always reflects both, however they were ordered.
+void autoCalibrateFromHome() {
+  if (calibrationLocked) return;
+  cal_mount_ra = 0.0f;
+  cal_mount_dec = 0.0f;
+  cal_sky_dec = 0.0f;
+  STTime t = getCurrentTime();
+  float lst = (float)computeLSTDeg(t, OBS_LON_DEG);
+  cal_sky_ra = fmod(lst + 90.0f, 360.0f);
+  if (cal_sky_ra < 0.0f) cal_sky_ra += 360.0f;
+  cal_time_ms = millis();
+  cal_utc_time = t;
+  isCalibrated = true;
+  // The default target should be wherever the telescope is actually pointing at home, not an
+  // arbitrary 0/0 that has nothing to do with this mount-relative calibration scheme - see the
+  // FIRMWARE_VERSION changelog entry. Only while nothing else has claimed targetRA/DEC yet
+  // (calibrationLocked also gates every real target-setting path - SET_TARGET/GOTO/tracking start
+  // - so this never clobbers a real target the user already asked for).
+  targetRA = cal_sky_ra;
+  targetDEC = cal_sky_dec;
+  // Diagnostic fields appended so a wrong home-position calibration can be root-caused from the
+  // GUI log alone (bad LAT/LON received vs bad time vs the LST/RA math itself) rather than
+  // guessing - report back UTC:/LAT:/LON:/LST:/cal_sky_ra: from this line if the home position
+  // still doesn't read as due East after connecting.
+  Serial.print("STATUS:AUTO_CALIBRATED_FROM_HOME,UTC:");
+  Serial.print(t.year); Serial.print('-');
+  Serial.print(t.month); Serial.print('-');
+  Serial.print(t.day); Serial.print(' ');
+  Serial.print(t.hour); Serial.print(':');
+  Serial.print(t.minute); Serial.print(':');
+  Serial.print(t.second);
+  Serial.print(",LAT:");
+  Serial.print(OBS_LAT_DEG, 6);
+  Serial.print(",LON:");
+  Serial.print(OBS_LON_DEG, 6);
+  Serial.print(",LST:");
+  Serial.print(lst, 6);
+  Serial.print(",cal_sky_ra:");
+  Serial.println(cal_sky_ra, 6);
+}
+
+// Compute sky position from mount physical angle + calibration + Earth rotation drift.
+// t_ms is unused (kept only so every existing call site didn't need touching) - dt now comes
+// from utcElapsedSeconds() against the UTC clock (currentUtcTime/cal_utc_time) instead of a
+// millis() diff, so this follows CMD,SET_TIME jumps (real OR simulated - see its comment) rather
+// than only real elapsed hardware time.
 float computeSkyRA(float mount_angle, unsigned long t_ms) {
+  (void)t_ms;
   if (!isCalibrated) return mount_angle;
   float delta_m = mount_angle - cal_mount_ra;
-  float dt = (t_ms - cal_time_ms) / 1000.0;
+  float dt = (float)utcElapsedSeconds(cal_utc_time, currentUtcTime);
   float drift = SIDEREAL_RATE_DEG_S * dt;
   // + drift, not -: with the mount held physically STILL (delta_m=0), the real sky RA under the
   // crosshair INCREASES over time (a stationary equatorial RA axis holds constant Hour Angle,
@@ -1165,9 +1496,82 @@ float computeSkyRA(float mount_angle, unsigned long t_ms) {
 
 float computeSkyDEC(float mount_angle, unsigned long t_ms) {
   if (!isCalibrated) return mount_angle;
+  // DEC has negligible sidereal drift for fixed mount (unlike RA, no time-dependent term).
+  if (telescopeFlipped) {
+    // The OTA has been manually rotated 180 degrees around the DEC axis (rings/dovetail
+    // loosened, tube reversed, re-tightened) - the DEC MOTOR itself never moved for this, so
+    // mount_angle here is still the same raw stepper reading as before the flip. Derivation
+    // (see the FIRMWARE_VERSION changelog for the full worked-example writeup): requiring this
+    // to agree with the unflipped formula at the pole (mount_angle=90, the one point a flip
+    // doesn't change) and working out the mirror branch on the other side gives
+    // sky_dec = cal_sky_dec - cal_mount_dec - mount_angle - notably NOT simply the negative of
+    // the unflipped formula, the cal_mount_dec term's sign does not flip.
+    return cal_sky_dec - cal_mount_dec - mount_angle;
+  }
   float delta_m = mount_angle - cal_mount_dec;
-  // DEC has negligible sidereal drift for fixed mount
   return cal_sky_dec + delta_m;
+}
+
+// Inverse of computeSkyDEC() - what mount DEC angle should be commanded to point at a given real
+// sky declination right now. Every real DEC target-computation site in this file (GOTO,
+// SAFE_TARGET, the alignment sequence, ongoing tracking) should go through this instead of the
+// inline `cal_mount_dec + (sky_dec - cal_sky_dec)` formula repeated at each call site, so the
+// flipped-branch logic only has to be written and verified once.
+float skyDecToMountDec(float sky_dec) {
+  if (telescopeFlipped) {
+    // Solving computeSkyDEC's flipped branch (sky_dec = cal_sky_dec - cal_mount_dec -
+    // mount_angle) for mount_angle.
+    return cal_sky_dec - cal_mount_dec - sky_dec;
+  }
+  return cal_mount_dec + (sky_dec - cal_sky_dec);
+}
+
+// Stop margin past the meridian, in HA degrees - 0 for now (stop exactly at the meridian, the
+// safest choice with no measured mechanical clearance yet). Raise once a real margin is measured:
+// starting from the home/counterweight-down position, slowly track a low-declination target past
+// the meridian and note how many EXTRA degrees of HA are available before the OTA/dovetail
+// actually contacts the tripod/pier - that number is this margin.
+const float MERIDIAN_LIMIT_MARGIN_DEG = 0.0f;
+
+// At low declination the OTA/dovetail passes nowhere near the tripod/pier even past the meridian
+// (the collision risk is a high-DEC-swing-close-to-the-mount-head problem, not a low-DEC one), so
+// movement into the meridian danger zone is allowed while target DEC falls in this range -
+// measured on hardware, NOT symmetric around 0 (the OTA/counterweight geometry isn't symmetric
+// either). Only takes effect once the RA side is already past the meridian limit - see
+// pastMeridianLimit().
+const float MERIDIAN_LIMIT_DEC_ALLOWED_MIN_DEG = -15.0f;
+const float MERIDIAN_LIMIT_DEC_ALLOWED_MAX_DEG = 20.0f;
+
+// Hour Angle of a given sky RA right now, normalized to (-180, 180] - negative means before
+// transit (east of meridian, rising - the safe/reachable side given this mount's home position is
+// defined as due East), positive means past transit (west of meridian - the danger zone this
+// mount can't safely continue into without a flip, since its DEC axis has a hard stop at +-90 and
+// can't make the ~180 degree swing a real flip would otherwise need there).
+float computeHourAngleDeg(float skyRaDeg) {
+  STTime t = getCurrentTime();
+  float ha = fmod((float)computeLSTDeg(t, OBS_LON_DEG) - skyRaDeg, 360.0f);
+  if (ha <= -180.0f) ha += 360.0f;
+  if (ha > 180.0f) ha -= 360.0f;
+  return ha;
+}
+
+// Convenience check used by both the continuous tracking-time enforcement
+// (updateTrackingModes()) and the pre-slew gating (startAlignmentSequence()/CMD,GOTO). The danger
+// zone does NOT disappear once flipped - a real GEM's collision constraint is symmetric: each
+// pier side (unflipped/flipped) is only safe for roughly half the sky, and swinging into the
+// OTHER half risks the same pier/tripod collision, just approached from the mirrored direction.
+// Unflipped, the OTA is set up for the rising/east side (HA<0) and danger is the far/west side
+// (HA>=0, what necessitated the flip in the first place). Flipped, the OTA has been physically
+// reversed onto the opposite side of the pier specifically so it CAN continue safely into what
+// used to be the danger zone - so danger mirrors to the side that's now behind it (HA<=0).
+// skyDecDeg exempts the low-DEC band (MERIDIAN_LIMIT_DEC_ALLOWED_MIN/MAX_DEG) from the HA check
+// entirely - see that constant's comment.
+bool pastMeridianLimit(float skyRaDeg, float skyDecDeg) {
+  if (!isCalibrated) return false;
+  if (skyDecDeg >= MERIDIAN_LIMIT_DEC_ALLOWED_MIN_DEG && skyDecDeg <= MERIDIAN_LIMIT_DEC_ALLOWED_MAX_DEG) return false;
+  float ha = computeHourAngleDeg(skyRaDeg);
+  if (telescopeFlipped) return ha <= MERIDIAN_LIMIT_MARGIN_DEG;
+  return ha >= -MERIDIAN_LIMIT_MARGIN_DEG;
 }
 
 // ============================================================
@@ -1230,11 +1634,14 @@ void switchMicrosteps(int newMicrosteps) {
 enum TrackingMode { MODE_SIDEREAL, MODE_SOLAR, MODE_LUNAR };
 TrackingMode currentMode = MODE_SIDEREAL;
 
-enum AlignState { ALIGN_IDLE, ALIGN_RESETTING_DEC, ALIGN_RA, ALIGN_DEC, ALIGN_TRACKING };
+enum AlignState { ALIGN_IDLE, ALIGN_RESETTING_DEC, ALIGN_RA, ALIGN_DEC, ALIGN_TRACKING, ALIGN_FLIPPING };
 AlignState alignState = ALIGN_IDLE;
 
 bool trackingActive = false;
 bool timeIsValid = false;
+// Whether tracking should automatically resume once the ALIGN_FLIPPING RA slew settles - see
+// setTelescopeFlipped(). Only meaningful while alignState == ALIGN_FLIPPING.
+bool resumeTrackingAfterFlip = false;
 
 // Manual GoTo sequenced slew state (DEC first then RA, instead of direct both axes)
 bool isManualSlewing = false;
@@ -1244,9 +1651,6 @@ float slewTargetDEC = 0.0;
 STTime currentUtcTime;
 unsigned long lastMillis = 0;
 unsigned long alignStartTime = 0;
-
-float targetRA = 0.0;   // Current target sky angles (updated by mode)
-float targetDEC = 0.0;
 
 float syncRA = 180.0;   // Last synced position (calibration reference point from SYNC, used to map physical <-> sky)
 float syncDEC = 0.0;
@@ -1429,8 +1833,11 @@ void computeTargetFromMode(float &raOut, float &decOut) {
     // is also of-date) - see the KNOWN LIMITATION comment on computeMoonPosition for why this
     // (and the parallax correction already applied inside it) don't fully close the Moon's
     // accuracy gap the way this alone does for the Sun.
-    double jdFull = julianDateFull(t.year, t.month, t.day, t.hour, t.minute, t.second);
-    precessOfDateToJ2000(&raOut, &decOut, (jdFull - 2451545.0) / 365.25);
+    // daysSinceJ2000(), not julianDateFull() - see its comment. Not critical here (this only
+    // needs ~0.01-year precision for a precession-years count), but cheap/free to use the
+    // precise path consistently rather than leave one lossy call site lying around.
+    precessOfDateToJ2000(&raOut, &decOut,
+                          daysSinceJ2000(t.year, t.month, t.day, t.hour, t.minute, t.second) / 365.25);
   } else {
     // SIDEREAL: use the user-provided target from input boxes (via SET_TARGET) if set;
     // otherwise fall back to last sync (the cal star). This is the fixed sky position to hold -
@@ -1473,9 +1880,11 @@ void sendStatus(const char* action, const char* axis, float error = -1.0) {
 }
 
 // Positional CSV, field order fixed as:
-//   POS,skyRA,skyDEC,targetRA,targetDEC,mountRA,mountDEC,mode,tracking
-// mode is S=SIDEREAL, O=SOLAR, L=LUNAR. tracking is 0/1. Keep tracker_gui.py's POS parser in
-// sync with this exact field order if it ever changes.
+//   POS,skyRA,skyDEC,targetRA,targetDEC,mountRA,mountDEC,mode,tracking,flipped
+// mode is S=SIDEREAL, O=SOLAR, L=LUNAR. tracking and flipped are each 0/1. flipped lets the GUI
+// learn/restore telescopeFlipped's real state on reconnect (rather than always assuming OFF,
+// which could cause a reconnecting GUI to send an erroneous un-flip) - see setTelescopeFlipped().
+// Keep tracker_gui.py's POS parser in sync with this exact field order if it ever changes.
 // ERR_RA/ERR_DEC are not sent - trivially reconstructed on the GUI side as abs(sky - target).
 //
 // Even at ~55-60 bytes (comfortably under the Mega's 64-byte Serial TX buffer, so Serial.print()
@@ -1598,7 +2007,9 @@ void updatePositionBroadcast() {
         case MODE_LUNAR:    Serial.print('L'); break;
       }
       Serial.print(',');
-      Serial.println(trackingActive ? '1' : '0');
+      Serial.print(trackingActive ? '1' : '0');
+      Serial.print(',');
+      Serial.println(telescopeFlipped ? '1' : '0');
       posSendState = POS_SEND_IDLE;
       break;
     default:
@@ -1641,7 +2052,9 @@ void sendPositionUpdateNow() {
     case MODE_LUNAR:    Serial.print('L'); break;
   }
   Serial.print(',');
-  Serial.println(trackingActive ? '1' : '0');
+  Serial.print(trackingActive ? '1' : '0');
+  Serial.print(',');
+  Serial.println(telescopeFlipped ? '1' : '0');
 }
 
 float estimateMovementTime(float deltaDeg, float speedDegS, float accelDegS2 = 1.0f) {  // default matches current 5s ramp (1 °/s²)
@@ -1674,7 +2087,9 @@ void dumpDebugState(const char* trigger) {
   float mDEC = axisDEC.getCurrentAngle();
   float sRA = isCalibrated ? computeSkyRA(mRA, now) : mRA;
   float sDEC = isCalibrated ? computeSkyDEC(mDEC, now) : mDEC;
-  float dt = isCalibrated ? (now - cal_time_ms) / 1000.0f : 0.0f;
+  // UTC-clock-based, not millis()-based - matches what computeSkyRA()/updateTrackingModes()
+  // actually use now, so this debug field reflects real tracking behavior (see their comments).
+  float dt = isCalibrated ? (float)utcElapsedSeconds(cal_utc_time, currentUtcTime) : 0.0f;
   float drift = isCalibrated ? (SIDEREAL_RATE_DEG_S * dt) : 0.0f;
 
   Serial.print("DEBUG:STATE,trigger:");
@@ -1685,6 +2100,8 @@ void dumpDebugState(const char* trigger) {
   Serial.print(now);
   Serial.print(",isCalibrated:");
   Serial.print(isCalibrated ? 1 : 0);
+  Serial.print(",telescopeFlipped:");
+  Serial.print(telescopeFlipped ? 1 : 0);
   Serial.print(",cal_mount_ra:");
   Serial.print(cal_mount_ra, 6);
   Serial.print(",cal_sky_ra:");
@@ -1753,16 +2170,18 @@ void parseAndExecuteCommand(char* cmd) {
   // CMD,MODE,SIDEREAL
   // CMD,MODE,SOLAR
   // CMD,MODE,LUNAR
-  // CMD,START_TRACKING
+  // CMD,START_TRACKING   (optionally ,SKIP_DEC_RESET and/or ,RISK_OK:1 - see riskAcknowledged)
   // CMD,STOP
   // CMD,SYNC,RA:123.45,DEC:-12.3   (calibration: sets both cal ref + initial sidereal target)
   // CMD,SYNC_OFFSET,RA:0.1,DEC:-0.05   (nudge the mount by this amount to fine-tune pointing;
   //                                     target/sync values are untouched, so this only corrects
   //                                     where the CURRENT target sits, not future sun/moon/star targets)
   // CMD,SET_TARGET,RA:xx,DEC:yy   (for SIDEREAL: sets the fixed star to track from input boxes; does not affect cal)
-  // CMD,GOTO,RA:45.0,DEC:30.0
+  // CMD,GOTO,RA:45.0,DEC:30.0   (append ,RISK_OK:1 to override a meridian-limit refusal - see riskAcknowledged)
   // CMD,SET_TIME,Y:2026,M:7,D:11,h:20,min:30,s:15
   // CMD,SET_LOCATION,LAT:xx.x,LON:yy.y   (real GPS coords from GUI)
+  // CMD,SET_FLIPPED,1   CMD,SET_FLIPPED,0   (telescope manually flipped in its clamps or not -
+  //                                          see setTelescopeFlipped())
   // CMD,SET_POS_UPDATE,MS:200   // change how often Arduino broadcasts POS (10-5000)
   // CMD,DEBUG,ON   CMD,DEBUG,OFF   CMD,DEBUG,DUMP   // heavy internal variable dump for debugging (sync, cal, drift etc)
   // CMD,SAVE_LOCATION_EEPROM   // save current location to EEPROM
@@ -1805,9 +2224,10 @@ void parseAndExecuteCommand(char* cmd) {
   }
   else if (strcmp(action, "START_TRACKING") == 0) {
     // "action" is truncated at the first comma by the sscanf above, so any
-    // suffix like ",SKIP_DEC_RESET" only exists in the full line (p) -- check there.
+    // suffix like ",SKIP_DEC_RESET"/",RISK_OK:1" only exists in the full line (p) -- check there.
     bool skipDecReset = strstr(p, "SKIP_DEC_RESET") != NULL;
-    startAlignmentSequence(skipDecReset);
+    bool riskOk = strstr(p, "RISK_OK:1") != NULL;  // see riskAcknowledged's comment
+    startAlignmentSequence(skipDecReset, riskOk);
   }
   else if (strcmp(action, "STOP") == 0) {
     stopAll();
@@ -1840,7 +2260,9 @@ void parseAndExecuteCommand(char* cmd) {
     cal_mount_dec = axisDEC.getCurrentAngle();
     cal_sky_dec = dec;
     cal_time_ms = millis();
+    cal_utc_time = currentUtcTime;
     isCalibrated = true;
+    calibrationLocked = true;  // a real SYNC - never let autoCalibrateFromHome() overwrite this
 
     // Debug info so we can see in GUI log whether Arduino actually received + accepted the sync values
     Serial.print("DEBUG:SYNC_PARSED ra=");
@@ -1890,11 +2312,14 @@ void parseAndExecuteCommand(char* cmd) {
     alignState = ALIGN_IDLE;
     isManualSlewing = false;
 
-    // For the immediate sync confirmation report, refresh cal_time so dt~0 and sky snaps to exactly
-    // the provided star coordinates. Ongoing periodic reports will use the original sync instant
-    // for correct future drift.
+    // For the immediate sync confirmation report, refresh cal_time (and cal_utc_time, which is
+    // what computeSkyRA()'s drift actually reads now - see its comment) so dt~0 and sky snaps to
+    // exactly the provided star coordinates. Ongoing periodic reports will use the original sync
+    // instant for correct future drift.
     unsigned long saved_cal_time = cal_time_ms;
+    STTime saved_cal_utc_time = cal_utc_time;
     cal_time_ms = millis();
+    cal_utc_time = currentUtcTime;
 
     // Extra debug: what sky value is the immediate POS going to contain?
     float dbg_snap_ra = computeSkyRA(axisRA.getCurrentAngle(), millis());
@@ -1906,6 +2331,7 @@ void parseAndExecuteCommand(char* cmd) {
 
     sendPositionUpdateNow();
     cal_time_ms = saved_cal_time;
+    cal_utc_time = saved_cal_utc_time;
 
     if (debugVerbose) {
       dumpDebugState("SYNC_SNAP");
@@ -1938,6 +2364,7 @@ void parseAndExecuteCommand(char* cmd) {
       // future targets.
       cal_mount_ra += ra_offset;
       cal_mount_dec += dec_offset;
+      calibrationLocked = true;  // a real fine-tune adjustment - never let autoCalibrateFromHome() overwrite this
 
       Serial.print("DEBUG:SYNC_OFFSET_APPLIED ra_offset=");
       Serial.print(ra_offset, 6);
@@ -2087,6 +2514,27 @@ void parseAndExecuteCommand(char* cmd) {
     if (dec_p) dec = atof(dec_p + 4);
     if (ra == 0.0f && ra_p) { float tmp; if (sscanf(ra_p, "RA:%f", &tmp)==1) ra=tmp; }
     if (dec == 0.0f && dec_p) { float tmp; if (sscanf(dec_p, "DEC:%f", &tmp)==1) dec=tmp; }
+    // "RISK_OK:1" - the GUI has already shown the user a confirmation dialog for this specific
+    // slew (see _confirm_risky_slew() in tracker_gui.py) and they chose to proceed anyway - see
+    // riskAcknowledged's comment.
+    bool riskOk = strstr(line, "RISK_OK:1") != NULL;
+
+    // Refuse rather than slew straight into the meridian-collision danger zone, UNLESS the user
+    // already confirmed it GUI-side - see pastMeridianLimit()'s/riskAcknowledged's comments.
+    if (pastMeridianLimit(ra, dec) && !riskOk) {
+      // "STATUS:ERROR,..." (not a bare "ERROR:...") so this flows through the GUI's existing
+      // STATUS-line handling (tracker_gui.py's _parse_arduino_line only special-cases DEBUG:/
+      // STATUS:/POS, prefixes - a bare ERROR: line would be silently dropped, never logged or
+      // shown on the status bar, unlike "ERROR" appearing inside a STATUS: line, which is
+      // already in that function's "important" keyword list).
+      Serial.println("STATUS:ERROR,MERIDIAN_LIMIT");
+      return;
+    }
+    riskAcknowledged = riskOk;
+
+    // A real move is about to be commanded - never let autoCalibrateFromHome() re-derive cal_*
+    // out from under it again (see calibrationLocked's comment).
+    calibrationLocked = true;
 
     // Ground safeguard removed: use the requested RA/DEC exactly (even below horizon).
     stopAlignment();
@@ -2116,7 +2564,7 @@ void parseAndExecuteCommand(char* cmd) {
       // it" means pre-slewing further in the increasing direction than the lead margin, i.e.
       // subtracting it here (the lead margin itself is a positive quantity).
       float desired_m_ra = axisRA.getCurrentAngle() + deltaRA - SIDEREAL_RATE_DEG_S * lead;
-      float desired_m_dec = cal_mount_dec + (dec - cal_sky_dec);
+      float desired_m_dec = skyDecToMountDec(dec);
       // Sequenced: DEC first (physical mount angle). Ensure high slew speed is commanded.
       axisDEC.setMaxSpeed(MAX_SLEW_SPEED_DEG_S);
       axisDEC.setAcceleration(SLEW_ACCEL_DEG_S2);
@@ -2160,7 +2608,7 @@ void parseAndExecuteCommand(char* cmd) {
     axisDEC.setAcceleration(SLEW_ACCEL_DEG_S2);
     axisRA.setTargetPosition(axisRA.getCurrentAngle(), false);  // RA: stay put
     if (isCalibrated) {
-      float desired_mount_dec = cal_mount_dec + (SAFE_TARGET_DEC_DEG - cal_sky_dec);
+      float desired_mount_dec = skyDecToMountDec(SAFE_TARGET_DEC_DEG);
       axisDEC.setTargetPosition(desired_mount_dec, true);
     } else {
       // No calibration yet - nothing to convert sky DEC through, so fall back to using it
@@ -2206,6 +2654,10 @@ void parseAndExecuteCommand(char* cmd) {
     if ((p = strstr(line, "s:"))) sscanf(p, "s:%f", &fval);
     setTimeFromValues(y, mo, d, h, mi, (int)s);
     Serial.println("STATUS:TIME_SET");
+    // Real time is now known - if nothing has calibrated yet (no CMD,SYNC either), establish an
+    // initial calibration from the mount's physical home position. See autoCalibrateFromHome()'s
+    // comment; a no-op if a real SYNC already happened first.
+    autoCalibrateFromHome();
     sendPositionUpdateNow();  // send current state immediately so GUI can restore on reconnect without reset
   }
   else if (strcmp(action, "SET_LOCATION") == 0) {
@@ -2225,7 +2677,18 @@ void parseAndExecuteCommand(char* cmd) {
     Serial.print(OBS_LAT_DEG, 6);
     Serial.print(",LON:");
     Serial.println(OBS_LON_DEG, 6);
+    // Location may arrive AFTER CMD,SET_TIME (that's the normal case - see calibrationLocked's
+    // comment), so (re-)run the home-position auto-calibration here too, now that OBS_LON_DEG is
+    // current - a no-op once calibrationLocked is set.
+    autoCalibrateFromHome();
     sendPositionUpdateNow();  // send current state immediately so GUI can restore on reconnect
+  }
+  else if (strcmp(action, "SET_FLIPPED") == 0) {
+    // CMD,SET_FLIPPED,1 (telescope manually flipped in its clamps) or CMD,SET_FLIPPED,0 - see
+    // setTelescopeFlipped()'s comment for the full mechanism.
+    const char* p = strstr(line, "SET_FLIPPED,");
+    bool flipped = p && atoi(p + 12) != 0;  // "SET_FLIPPED," is 12 chars
+    setTelescopeFlipped(flipped);
   }
   else if (strcmp(action, "SET_POS_UPDATE") == 0) {
     const char* p;
@@ -2314,7 +2777,7 @@ void readSerialCommands() {
 // ALIGNMENT AND TRACKING LOGIC
 // ============================================================
 
-void startAlignmentSequence(bool skipDecReset) {
+void startAlignmentSequence(bool skipDecReset, bool riskOk) {
   // Only a genuinely idle mount starts a fresh alignment. This used to also allow re-entry from
   // ALIGN_TRACKING (i.e. restarting alignment from scratch even though already stably tracking) -
   // the GUI's only caller (CMD,START_TRACKING) never deliberately sends START while
@@ -2326,6 +2789,25 @@ void startAlignmentSequence(bool skipDecReset) {
   // back to ALIGNING with no user action. Restricting this to ALIGN_IDLE only makes a stray
   // duplicate START a safe no-op instead.
   if (alignState != ALIGN_IDLE) return;
+
+  // A real move is about to be commanded - never let autoCalibrateFromHome() re-derive cal_* out
+  // from under it again (see calibrationLocked's comment).
+  calibrationLocked = true;
+
+  // Refuse rather than slew straight toward/into the meridian-collision danger zone, UNLESS the
+  // user already confirmed it GUI-side (riskOk - see riskAcknowledged's comment) - check the
+  // intended target's Hour Angle BEFORE committing to any axis movement. See
+  // pastMeridianLimit()/the FIRMWARE_VERSION changelog for why this can't just flip like a real
+  // GEM (DEC hard-stops at +-90) and instead requires the user to flip manually.
+  float checkRA, checkDEC;
+  computeTargetFromMode(checkRA, checkDEC);
+  if (pastMeridianLimit(checkRA, checkDEC) && !riskOk) {
+    // "STATUS:ERROR,..." not a bare "ERROR:..." - see the matching comment in the CMD,GOTO
+    // handler for why (tracker_gui.py's _parse_arduino_line would silently drop a bare one).
+    Serial.println("STATUS:ERROR,MERIDIAN_LIMIT");
+    return;
+  }
+  riskAcknowledged = riskOk;
 
   trackingActive = false;
   isManualSlewing = false;
@@ -2356,7 +2838,7 @@ void startAlignmentSequence(bool skipDecReset) {
     axisDEC.setTargetPosition(axisDEC.getCurrentAngle(), false);
   } else if (isCalibrated) {
     float targetSkyDec = 0.0f;
-    float desiredMDec = cal_mount_dec + (targetSkyDec - cal_sky_dec);
+    float desiredMDec = skyDecToMountDec(targetSkyDec);
     axisDEC.setMaxSpeed(MAX_SLEW_SPEED_DEG_S);
     axisDEC.setAcceleration(SLEW_ACCEL_DEG_S2);
     axisDEC.setTargetPosition(desiredMDec, true);
@@ -2390,6 +2872,70 @@ void stopAll() {
   axisDEC.commandStop(curDEC);
   switchMicrosteps(TRACKING_MICROSTEPS);
   sendStatus("STOPPED", "BOTH");
+}
+
+// Stops tracking because the target has reached the meridian limit (see pastMeridianLimit()) -
+// same underlying stop as stopAll(), plus a distinguishable status line so the GUI can tell this
+// apart from a manual Stop/Delete-key stop and show an actionable "flip the telescope" message
+// instead of a plain "stopped".
+void stopForMeridianLimit() {
+  stopAll();
+  // A fresh stop means a future restart needs a fresh confirmation, not to silently inherit this
+  // one - see riskAcknowledged's comment.
+  riskAcknowledged = false;
+  sendStatus("STOPPED", "MERIDIAN_LIMIT");
+}
+
+// Shared by ALIGN_DEC's completion (normal alignment finishing) and ALIGN_FLIPPING's completion
+// (resuming tracking after a manual flip) - both moments prime a fresh target and hand off to
+// ALIGN_TRACKING identically, so this was pulled out rather than duplicated at both call sites.
+void resumeTrackingFromAlign() {
+  sendStatus("TRACKING_STARTED", "DEC");
+  alignState = ALIGN_TRACKING;
+  trackingActive = true;
+  switchMicrosteps(TRACKING_MICROSTEPS);
+  // Prime targets - compute logical target (exact for sidereal)
+  computeTargetFromMode(targetRA, targetDEC);
+  if (isCalibrated) {
+    // UTC-clock-based, not millis()-based - see utcElapsedSeconds()'s comment; same formula as
+    // updateTrackingModes(), just priming the first target before that starts ticking, so it
+    // needs the same fix to stay consistent with it.
+    float elapsed = (float)utcElapsedSeconds(cal_utc_time, currentUtcTime);
+    float drift = SIDEREAL_RATE_DEG_S * elapsed;
+    // Minus, not plus - see computeSkyRA's comment on the drift sign fix (same formula as
+    // updateTrackingModes(), just priming the first target before that starts ticking).
+    float des_m_ra = cal_mount_ra + shortestDeltaDeg(targetRA, cal_sky_ra) - drift;
+    des_m_ra = snapToNearestWinding(des_m_ra, axisRA.getCurrentAngle());
+    float des_m_dec = skyDecToMountDec(targetDEC);
+    axisRA.setTargetPosition(des_m_ra, false);
+    axisDEC.setTargetPosition(des_m_dec, false);
+  } else {
+    axisRA.setTargetPosition(targetRA, false);
+    axisDEC.setTargetPosition(targetDEC, false);
+  }
+}
+
+// Toggled by CMD,SET_FLIPPED - see the FIRMWARE_VERSION changelog for the full derivation. The
+// user has (or is about to) manually rotate the OTA 180 degrees around the DEC axis in its
+// rings/dovetail - the DEC motor itself never moves for this, only the firmware's INTERPRETATION
+// of the (unchanged) DEC reading needs to flip (see computeSkyDEC/skyDecToMountDec). RA still
+// needs a real, motorized 180-degree rotation to keep pointing at the same target - shifting
+// cal_mount_ra by the same amount keeps computeSkyRA() reporting the same RA across that slew
+// (see this function's own header comment in the design notes), so RA's tracking-correction
+// formula needs no flip-awareness of its own, unlike DEC's.
+void setTelescopeFlipped(bool flipped) {
+  if (flipped == telescopeFlipped || !isCalibrated) return;
+  telescopeFlipped = flipped;
+  calibrationLocked = true;  // a real move is about to be commanded - see calibrationLocked's comment
+  float raShift = flipped ? 180.0f : -180.0f;
+  cal_mount_ra += raShift;
+  resumeTrackingAfterFlip = trackingActive;
+  trackingActive = false;
+  axisRA.setMaxSpeed(MAX_SLEW_SPEED_DEG_S);
+  axisRA.setAcceleration(SLEW_ACCEL_DEG_S2);
+  axisRA.setTargetPosition(axisRA.getCurrentAngle() + raShift, true);  // DEC untouched by design
+  alignState = ALIGN_FLIPPING;
+  sendStatus("FLIPPING", "RA");
 }
 
 void runAlignmentSequence() {
@@ -2470,7 +3016,7 @@ void runAlignmentSequence() {
         axisDEC.setMaxSpeed(MAX_SLEW_SPEED_DEG_S);
         axisDEC.setAcceleration(SLEW_ACCEL_DEG_S2);
         if (isCalibrated) {
-          float desired_m = cal_mount_dec + (futureDEC2 - cal_sky_dec);
+          float desired_m = skyDecToMountDec(futureDEC2);
           axisDEC.setTargetPosition(desired_m, true);
         } else {
           axisDEC.setTargetPosition(futureDEC2, true);
@@ -2481,31 +3027,27 @@ void runAlignmentSequence() {
     case ALIGN_DEC:
       // DEC slew complete - start tracking immediately, same reasoning as ALIGN_RA above.
       if (!axisDEC.isMoving()) {
-        sendStatus("TRACKING_STARTED", "DEC");
-        alignState = ALIGN_TRACKING;
-        trackingActive = true;
-        switchMicrosteps(TRACKING_MICROSTEPS);
-        // Prime targets - compute logical target (exact for sidereal)
-        computeTargetFromMode(targetRA, targetDEC);
-        if (isCalibrated) {
-          float elapsed = (millis() - cal_time_ms) / 1000.0;
-          float drift = SIDEREAL_RATE_DEG_S * elapsed;
-          // Minus, not plus - see computeSkyRA's comment on the drift sign fix (same formula as
-          // updateTrackingModes(), just priming the first target before that starts ticking).
-          float des_m_ra = cal_mount_ra + shortestDeltaDeg(targetRA, cal_sky_ra) - drift;
-          des_m_ra = snapToNearestWinding(des_m_ra, axisRA.getCurrentAngle());
-          float des_m_dec = cal_mount_dec + (targetDEC - cal_sky_dec);
-          axisRA.setTargetPosition(des_m_ra, false);
-          axisDEC.setTargetPosition(des_m_dec, false);
-        } else {
-          axisRA.setTargetPosition(targetRA, false);
-          axisDEC.setTargetPosition(targetDEC, false);
-        }
+        resumeTrackingFromAlign();
       }
       break;
 
     case ALIGN_TRACKING:
       // Handled in updateTrackingModes
+      break;
+
+    case ALIGN_FLIPPING:
+      // RA's real, motorized 180-degree rotation (see setTelescopeFlipped()) has settled - DEC
+      // was never touched (the flip's DEC half is done manually, in the clamps, before this
+      // state was even entered). Resume tracking if it was active before the flip started,
+      // otherwise just go idle - either way the flip itself is now done.
+      if (!axisRA.isMoving()) {
+        sendStatus("FLIP_COMPLETE", "RA");
+        if (resumeTrackingAfterFlip) {
+          resumeTrackingFromAlign();
+        } else {
+          alignState = ALIGN_IDLE;
+        }
+      }
       break;
 
     default:
@@ -2523,6 +3065,14 @@ void updateTrackingModes() {
   targetRA = newRA;
   targetDEC = newDEC;
 
+  // !riskAcknowledged - a confirmed GOTO/START_TRACKING into the danger zone must not immediately
+  // undo itself the moment continuous tracking starts evaluating the same target - see
+  // riskAcknowledged's comment.
+  if (pastMeridianLimit(targetRA, targetDEC) && !riskAcknowledged) {
+    stopForMeridianLimit();
+    return;
+  }
+
   if (!isCalibrated) {
     // Fallback old behavior
     axisRA.setTargetPosition(targetRA, false);
@@ -2530,7 +3080,12 @@ void updateTrackingModes() {
     return;
   }
 
-  float elapsed = (millis() - cal_time_ms) / 1000.0;
+  // UTC-clock-based elapsed time (see utcElapsedSeconds()'s comment), not a millis() diff - so
+  // this, the core ongoing RA tracking correction, actually responds to a CMD,SET_TIME jump
+  // (tracker_gui.py's Time Travel feature) by slewing to where the target now needs to be, the
+  // same way it would after that much real time had actually passed, instead of requiring real
+  // wall-clock time to elapse.
+  float elapsed = (float)utcElapsedSeconds(cal_utc_time, currentUtcTime);
   float drift = SIDEREAL_RATE_DEG_S * elapsed;
   // Minus, not plus: this is the core ongoing tracking correction, and its sign was backwards -
   // see computeSkyRA's comment for the full derivation. A stationary RA axis holds constant Hour
@@ -2542,7 +3097,7 @@ void updateTrackingModes() {
   // OFF entirely, which is only possible with a full sign inversion, not just an imprecise rate.
   float desired_mount_ra = cal_mount_ra + shortestDeltaDeg(targetRA, cal_sky_ra) - drift;
   desired_mount_ra = snapToNearestWinding(desired_mount_ra, axisRA.getCurrentAngle());
-  float desired_mount_dec = cal_mount_dec + (targetDEC - cal_sky_dec);
+  float desired_mount_dec = skyDecToMountDec(targetDEC);
   // Use position following for ALL modes (including sidereal) so the RA axis is driven
   // to the exact required mount angle. This matches the method that makes solar/lunar
   // reach near-zero error and ensures sidereal holds the fixed sky target precisely

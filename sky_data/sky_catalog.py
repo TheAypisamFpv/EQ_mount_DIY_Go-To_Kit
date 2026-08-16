@@ -1,5 +1,5 @@
 """
-sky_catalog.py - builds/updates the bundled night-sky object catalog (stars + Messier DSOs)
+sky_catalog.py - builds/updates the bundled night-sky object catalog (stars + deep-sky objects)
 used by tracker_gui.py's sky visualization.
 
 Data sources (all public, freely licensed):
@@ -17,15 +17,22 @@ Data sources (all public, freely licensed):
     compressed download, well under the multi-hundred-MB-plus of the full AT-HYG catalog or
     catalogs like Tycho-2/UCAC4 in their native formats).
   - Deep-sky objects: OpenNGC, CC-BY-SA-4.0. https://github.com/mattiaverga/OpenNGC
-    Filtered to Messier-numbered objects only (110 objects) - the well-known "highlight reel"
-    of naked-eye/small-telescope targets, rather than the full ~14000-object NGC/IC catalog,
-    to keep the bundled file small.
+    Every Messier object (110, unconditionally kept regardless of magnitude - the well-known
+    "highlight reel") PLUS every other NGC/IC object of a genuinely visual type (galaxies,
+    nebulae of every kind, clusters, supernova remnants - see DSO_INTERESTING_TYPES) brighter
+    than DSO_MAG_LIMIT - not the full ~14000-object catalog (which is mostly extremely faint or
+    non-visual entries: photographic plate defects, duplicate records, uncertain/other
+    classifications), but a large step up from Messier-only. See _build_dso().
   - Constellation lines: Stellarium's "modern" skyculture, CC BY-SA 4.0.
     https://github.com/Stellarium/stellarium (skycultures/modern/index.json) - each line is a
     polyline of Hipparcos catalog numbers, which join directly against HYG's own "hip" column.
+  - Milky Way band: NOT bundled as data at all - tracker_gui.py draws it analytically from the
+    standard IAU 1958 galactic coordinate system (see _galactic_to_radec/_draw_milky_way there),
+    rather than shipping a brightness image/outline asset.
 
 Run directly (`python sky_catalog.py`) to force a rebuild, or import ensure_catalog_current()
-to build/update only if the local file is missing or stale (used at GUI startup).
+to build/update only if the local file is missing/stale/an old schema version (used at GUI
+startup).
 """
 
 import csv
@@ -33,6 +40,7 @@ import gzip
 import io
 import json
 import os
+import re
 import time
 import urllib.request
 
@@ -43,6 +51,13 @@ CONSTELLATIONS_URL = "https://raw.githubusercontent.com/Stellarium/stellarium/ma
 
 CATALOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sky_catalog.json")
 
+# Bumped whenever build_catalog()'s output schema changes in a way old cached sky_catalog.json
+# files on disk won't have (new/renamed fields, different filtering) - ensure_catalog_current()
+# forces a rebuild if the cached file's version doesn't match, regardless of its age, so a schema
+# change actually reaches users who already have a catalog on disk instead of silently sitting
+# there stale for up to max_age_days.
+CATALOG_SCHEMA_VERSION = 2
+
 # Stars fainter than this are dropped entirely. Set to 21.0 - comfortably past the faintest
 # magnitude actually present in the AT-HYG reduced_m11 subset (verified directly against the
 # source data: 20.1, from the "every star within 100ly regardless of magnitude" bonus inclusions
@@ -50,6 +65,32 @@ CATALOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sky_cat
 # subset's own selection criteria are the only real limit. _star_mag_limit_for_zoom() scales how
 # many of these actually get DRAWN at any given zoom level against this same constant.
 STAR_MAG_LIMIT = 21.0
+
+# Non-Messier DSOs fainter than this (V-Mag, falling back to B-Mag - same as the "mag" field
+# below) are dropped. 13.0 comfortably covers everything reachable as a real GoTo target on a
+# modest DIY amateur setup (naked-eye/small-scope visual observing tops out around mag 8-10;
+# stacked/long-exposure imaging on modest equipment reasonably reaches into the 12-13 range) while
+# keeping the catalog from ballooning with objects nobody on this kind of setup will ever actually
+# find. Objects with no recorded magnitude at all are kept regardless (better to show an object of
+# unknown brightness than silently drop it) - same policy the existing Messier-only build already
+# used. Messier objects are ALWAYS kept regardless of this limit (see _build_dso) - a handful are
+# technically extended/low-surface-brightness enough to lack a clean point magnitude, but they're
+# also exactly the ones everyone actually wants in a "greatest hits" list.
+DSO_MAG_LIMIT = 13.0
+
+# OpenNGC "Type" codes worth including as real visual/GoTo DSOs - galaxies (single, pairs, triples,
+# groups), star clusters (open, globular, cluster+nebula combos), and every nebula flavor
+# (planetary, HII region, dark, emission, reflection, generic, supernova remnant). Deliberately
+# excludes: "*"/"**" (plain single/double stars - not deep-sky objects), "*Ass" (star
+# associations - borderline, left out to keep the "nebula/galaxy" focus the catalog was expanded
+# for), "Nova" (a transient event, not a fixed target), "NonEx"/"Dup"/"PD"/"Other" (nonexistent
+# objects, duplicate records, photographic plate defects, and uncertain/unclassified entries -
+# none of these are real, well-defined observing targets).
+DSO_INTERESTING_TYPES = {
+    "G", "GPair", "GTrpl", "GGroup",
+    "OCl", "GCl", "Cl+N",
+    "PN", "HII", "DrkN", "EmN", "Neb", "RfN", "SNR",
+}
 
 # (B-V color index, (R,G,B)) stops for a simple piecewise-linear color approximation - not a
 # rigorous blackbody model, but a widely-used approximation good enough to render "this star
@@ -261,14 +302,25 @@ def _format_ngc_ic_name(raw_name):
 
 
 def _build_dso():
+    """Every Messier object (unconditional) plus every other NGC/IC object of a genuinely visual
+    type (DSO_INTERESTING_TYPES) brighter than DSO_MAG_LIMIT - see the module docstring and both
+    constants' comments for the reasoning."""
     dso = []
     for url in (NGC_URL, ADDENDUM_URL):
         raw = _fetch_text(url).decode("utf-8", errors="replace")
         reader = csv.DictReader(io.StringIO(raw), delimiter=";")
         for row in reader:
             m = (row.get("M") or "").strip()
+            obj_type = row.get("Type", "")
+            mag = row.get("V-Mag") or row.get("B-Mag") or ""
+            mag_val = float(mag) if mag else None
             if not m:
-                continue  # Messier-numbered objects only - see module docstring
+                # Not a Messier object - only keep it if it's a genuinely interesting visual
+                # target and not fainter than the practical limit for this kind of setup.
+                if obj_type not in DSO_INTERESTING_TYPES:
+                    continue
+                if mag_val is not None and mag_val > DSO_MAG_LIMIT:
+                    continue
             try:
                 ra_deg = _parse_sexagesimal_ra(row["RA"])
                 dec_deg = _parse_sexagesimal_dec(row["Dec"])
@@ -277,20 +329,30 @@ def _build_dso():
             maj_ax = row.get("MajAx") or ""
             min_ax = row.get("MinAx") or ""
             pos_ang = row.get("PosAng") or ""
-            mag = row.get("V-Mag") or row.get("B-Mag") or ""
             common = (row.get("Common names") or "").split(",")[0].strip()
-            # Catalog/official identifier ("NGC 224" etc.) alongside the Messier number and any
-            # common name - so a search for either the official designation or the popular name
-            # finds the same object (e.g. "andromeda galaxy", "m31", and "ngc 224" should all work).
-            aliases = set()
+            # int() strips OpenNGC's zero-padding ("031" -> 31) - left as-is, "M031" wouldn't
+            # even substring-match a search for "M31", the exact official designation people
+            # actually type.
+            messier = f"M{int(m)}" if m else None
             catalog_name = _format_ngc_ic_name(row.get("Name"))
-            if catalog_name:
+            # "designation" is the primary catalog identifier ALWAYS present (unlike "messier",
+            # which is only set for the ~110 objects that actually have one) - used as the
+            # display-name/label fallback for the thousands of objects with no Messier number and
+            # often no common name either. Prefers the Messier number when both exist (matches the
+            # pre-expansion behavior for those 110 objects exactly).
+            designation = messier or catalog_name
+            # Catalog/official identifier ("NGC 224" etc.) alongside the Messier number (if any)
+            # and any common name - so a search for either the official designation or the
+            # popular name finds the same object (e.g. "andromeda galaxy", "m31", and "ngc 224"
+            # should all work).
+            aliases = set()
+            if catalog_name and catalog_name != designation:
                 aliases.add(catalog_name)
-            dso.append({
+            entry = {
                 "ra": round(ra_deg, 5),
                 "dec": round(dec_deg, 5),
-                "type": row.get("Type", ""),
-                "mag": float(mag) if mag else None,
+                "type": obj_type,
+                "mag": mag_val,
                 # Apparent size in arcmin (major/minor axis) - used to draw an "accurate-ish"
                 # ellipse instead of a plain point once zoomed in enough for it to matter.
                 "size_maj_arcmin": float(maj_ax) if maj_ax else None,
@@ -300,14 +362,17 @@ def _build_dso():
                 # axis-aligned (major axis always horizontal), which is wrong for the ~2/3 of
                 # galaxies/nebulae that aren't oriented that way on the sky.
                 "pos_ang_deg": float(pos_ang) if pos_ang else 0.0,
-                # int() strips OpenNGC's zero-padding ("031" -> 31) - left as-is, "M031" wouldn't
-                # even substring-match a search for "M31", the exact official designation people
-                # actually type.
-                "messier": f"M{int(m)}",
+                "designation": designation,
                 "name": common,
                 "aliases": sorted(aliases),
-            })
-    dso.sort(key=lambda d: int(d["messier"][1:]))
+            }
+            if messier:
+                entry["messier"] = messier  # only present when real - see "designation" above
+            dso.append(entry)
+    # Messier objects first (in M-number order, matching the old Messier-only build exactly),
+    # then everything else in whatever catalog order it came in - there's no single natural sort
+    # key shared by both (NGC/IC numbers aren't comparable across the two source files/prefixes).
+    dso.sort(key=lambda d: (0, int(d["messier"][1:])) if d.get("messier") else (1, 0))
     return dso
 
 
@@ -328,6 +393,7 @@ def build_catalog(path=CATALOG_PATH):
     """Fetch fresh data from all sources and write the combined catalog JSON. Requires internet."""
     catalog = {
         "built_unix": time.time(),
+        "schema_version": CATALOG_SCHEMA_VERSION,
         "stars": _build_stars(),
         "dso": _build_dso(),
         "const_lines": _build_constellation_lines(),
@@ -337,14 +403,41 @@ def build_catalog(path=CATALOG_PATH):
     return catalog
 
 
+def _peek_schema_version(path, chunk_size=4096):
+    """Reads just the schema_version out of a catalog file WITHOUT parsing the entire (~90MB+)
+    JSON body - build_catalog() always writes "built_unix" then "schema_version" first, before
+    the huge "stars" array, and dict insertion order is preserved by json.dump() (guaranteed since
+    Python 3.7), so a small prefix read + regex reliably finds it. Returns None (treated as "needs
+    rebuild") if the key isn't in that prefix or the file can't be read - a full json.load() isn't
+    warranted just to answer this one small question, especially since callers usually go on to
+    load the whole file for real anyway right after (paying for a full parse here too, on every
+    single startup, was pure waste)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            prefix = f.read(chunk_size)
+    except OSError:
+        return None
+    m = re.search(r'"schema_version"\s*:\s*(\d+)', prefix)
+    return int(m.group(1)) if m else None
+
+
+def needs_rebuild(path=CATALOG_PATH, max_age_days=60):
+    """True if ensure_catalog_current() would actually trigger a rebuild - exposed separately so
+    callers (e.g. the GUI) can log an honest "downloading updated data, this may take a while"
+    message BEFORE kicking off a potentially multi-minute network fetch, instead of the caller
+    just going quiet with no feedback until it's done."""
+    if not os.path.exists(path):
+        return True
+    age_days = (time.time() - os.path.getmtime(path)) / 86400.0
+    return age_days >= max_age_days or _peek_schema_version(path) != CATALOG_SCHEMA_VERSION
+
+
 def ensure_catalog_current(path=CATALOG_PATH, max_age_days=60):
-    """Build the catalog if missing, or refresh it if older than max_age_days. Safe to call
-    from a background thread at GUI startup - does nothing (and raises nothing but a logged
-    exception upstream) if there's no internet available and a catalog already exists."""
-    if os.path.exists(path):
-        age_days = (time.time() - os.path.getmtime(path)) / 86400.0
-        if age_days < max_age_days:
-            return False  # up to date, nothing to do
+    """Build the catalog if missing, older than max_age_days, or on an old schema version. Safe
+    to call from a background thread at GUI startup - does nothing (and raises nothing but a
+    logged exception upstream) if there's no internet available and a catalog already exists."""
+    if not needs_rebuild(path, max_age_days):
+        return False  # up to date, nothing to do
     build_catalog(path)
     return True
 
@@ -352,5 +445,7 @@ def ensure_catalog_current(path=CATALOG_PATH, max_age_days=60):
 if __name__ == "__main__":
     print("Building sky catalog from AT-HYG + OpenNGC + Stellarium constellation lines ...")
     cat = build_catalog()
+    n_messier = sum(1 for d in cat["dso"] if d.get("messier"))
     print(f"Wrote {CATALOG_PATH}: {len(cat['stars'])} stars (mag <= {STAR_MAG_LIMIT}), "
-          f"{len(cat['dso'])} Messier objects, {len(cat['const_lines'])} constellation line segments.")
+          f"{len(cat['dso'])} DSOs ({n_messier} Messier + {len(cat['dso']) - n_messier} other, "
+          f"mag <= {DSO_MAG_LIMIT} for non-Messier), {len(cat['const_lines'])} constellation line segments.")
