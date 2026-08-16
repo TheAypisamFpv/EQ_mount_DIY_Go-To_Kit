@@ -918,7 +918,28 @@ float OBS_LON_DEG = -0.0005f;   // Positive east
 //            for good the moment BOTH have been seen at least once - normally within the first
 //            couple seconds after connecting, long before the first periodic resync - instead of
 //            re-deriving forever.
-#define FIRMWARE_VERSION "1.8.48"
+//   1.8.49 - The REAL root cause of "position updates once every time sync" (1.8.46-1.8.48 fixed
+//            two other real bugs along the way, but not this one - it persisted even in 1.8.48,
+//            now reported specifically as the mount axis visibly lagging then jumping to catch up
+//            WHILE ACTIVELY TRACKING). 1.8.46 replaced computeSkyRA()/updateTrackingModes()'s
+//            millis()-based elapsed-time calc with a running currentDaysJ2000 total (days since
+//            J2000, ~9700 magnitude for 2026 dates) to fix a genuine performance regression - but
+//            "double" on this AVR is really a 32-bit float (~7 significant decimal digits - see
+//            the 1.8.44 changelog entry for the exact same bug class, already found and fixed
+//            once in daysSinceJ2000() itself, then reintroduced here without noticing). At ~9700
+//            magnitude, the smallest representable increment is ~0.001-0.003 days (~100-250
+//            seconds) - every tiny per-loop += was silently rounded away, so the position only
+//            visibly updated once enough lost increments happened to land on a representable
+//            step, then jumped to catch up all at once. Fix: back to an exact millis() diff
+//            (cal_time_ms, plain unsigned long subtraction - no precision loss possible at any
+//            realistic session length) for the real-elapsed-time part, same as the
+//            original/pre-1.8.45 code. Time Travel awareness is now layered on separately via
+//            manualTimeJumpOffsetSec, a small value (bounded by how much the clock has jumped
+//            since the LAST calibration, not an absolute epoch-scale count) accumulated in
+//            setTimeFromValues() and reset to 0 at every calibration - deliberately kept far
+//            below the magnitude where float32 precision loss becomes a problem. currentDaysJ2000/
+//            cal_days_j2000 (the 1.8.46-1.8.48 running-total approach) are removed entirely.
+#define FIRMWARE_VERSION "1.8.49"
 
 // Sidereal rate (deg/sec on sky for RA axis). Approx 15.041 arcsec/s.
 const float SIDEREAL_RATE_DEG_S = 0.004178f;
@@ -1249,33 +1270,42 @@ double daysSinceJ2000(int year, int month, int day, int hour, int minute, double
 }
 
 // Forward declarations - the actual definitions live further down with the rest of the
-// calibration/time-tracking globals (cal_days_j2000 near cal_utc_time, currentDaysJ2000 near
-// currentUtcTime), but utcElapsedSeconds() below needs them and is itself used by computeSkyRA()
-// et al., all defined before that point - same reason cal_utc_time/currentUtcTime themselves are
-// forward-declared there.
-extern double cal_days_j2000;
-extern double currentDaysJ2000;
+// calibration/time-tracking globals (cal_time_ms/manualTimeJumpOffsetSec near cal_utc_time,
+// lastMillis near currentUtcTime), but utcElapsedSeconds() below needs them and is itself used by
+// computeSkyRA() et al., all defined before that point - same reason cal_utc_time/currentUtcTime
+// themselves are forward-declared there.
+extern unsigned long cal_time_ms;
+extern double manualTimeJumpOffsetSec;
 
-// Elapsed time (seconds) since cal_* was established, via currentDaysJ2000/cal_days_j2000 -
-// continuously-increasing day counts, NOT a millis() diff. This is what lets a CMD,SET_TIME clock
-// jump (tracker_gui.py's Time Travel feature - see its comment) actually translate into RA
-// tracking drift: millis() only ever advances with real elapsed hardware time and has no way to
-// see a SET_TIME jump, but currentUtcTime (and currentDaysJ2000, its running day-count) does. See
-// computeSkyRA() and updateTrackingModes() for where this replaces the old millis()-based dt.
+// Elapsed time (seconds) since cal_* was established: real elapsed time via an EXACT millis()
+// diff (unsigned long subtraction - no floating-point precision loss possible, whatever the
+// session length), plus manualTimeJumpOffsetSec - a small, separately-tracked correction for
+// whatever a CMD,SET_TIME clock jump (tracker_gui.py's Time Travel feature) added on top of
+// ordinary real-time progression since calibration. See manualTimeJumpOffsetSec's own comment for
+// why it's kept deliberately small-magnitude and rebased at every calibration, rather than one
+// running "days since J2000" total the way the 1.8.46-1.8.48 version of this function did.
 //
-// Deliberately just a subtraction, NOT a daysSinceJ2000() recompute from STTime fields (that was
-// the original 1.8.45 version, and it was a real, measured regression: this runs on EVERY
-// tracking tick - updateTrackingModes(), every loop() iteration while tracking is active,
-// including ordinary continuous SIDEREAL/SOLAR/LUNAR tracking, not just Time Travel - and
-// daysSinceJ2000() has two floor() calls plus several float multiplies, genuinely expensive on
-// an 8-bit AVR with no hardware FPU. Reported as "position updates awfully slow, even for the
-// actively tracked object" - exactly the symptom of adding real per-loop-iteration cost to this
-// hot path. currentDaysJ2000/cal_days_j2000 do the expensive part (daysSinceJ2000() itself) only
-// at the rare events that actually need it (a fresh SET_TIME, or a new calibration) and are kept
-// current the cheap way (a running += for currentDaysJ2000 in updateTimeFromMillis(), literally
-// no cost at all for cal_days_j2000 between calibrations) - see their own comments.
+// 1.8.46-1.8.48 HISTORY (why this isn't a daysSinceJ2000()-per-call recompute, NOR a running
+// epoch-scale day-count either): the *original* 1.8.45 version recomputed daysSinceJ2000() (two
+// floor() calls, several float multiplies) from STTime fields on every call - genuinely expensive
+// on an 8-bit AVR with no hardware FPU, and this runs on EVERY tracking tick
+// (updateTrackingModes(), every loop() iteration while tracking is active - ordinary continuous
+// SIDEREAL/SOLAR/LUNAR tracking, not just Time Travel). 1.8.46 "fixed" that by maintaining a
+// running currentDaysJ2000 total (a plain += every loop, no floor()) instead - cheap, but wrong:
+// currentDaysJ2000's magnitude is ~9700 (days since J2000 for 2026 dates), and on this AVR,
+// "double" is really a 32-bit float (~7 significant decimal digits total - see the 1.8.44
+// changelog entry for the exact same class of bug, already found and fixed once in
+// daysSinceJ2000() itself). At that magnitude, the smallest representable increment is roughly
+// 0.001-0.003 days (~100-250 seconds) - every tiny per-loop += (order 1e-8 days) was silently
+// rounded away, and the position only visibly updated once enough lost increments happened to
+// land on a representable step. Reported as "position updates awfully slow... updating once
+// every time sync" (both when idle - sky RA frozen between snaps - and while actively tracking -
+// the mount visibly lagging then jumping to catch up). Fix: back to an exact millis() diff for
+// the (large-magnitude-safe, since it's plain integer arithmetic) real-elapsed-time part, with
+// the Time-Travel-jump-awareness layered on separately via a value that's deliberately kept small.
 double utcElapsedSeconds() {
-  return (currentDaysJ2000 - cal_days_j2000) * 86400.0;
+  double realElapsedSec = (millis() - cal_time_ms) / 1000.0;
+  return realElapsedSec + manualTimeJumpOffsetSec;
 }
 
 // Local Sidereal Time, in degrees (0-360) - standard GMST + observer longitude. Extracted out of
@@ -1411,23 +1441,28 @@ float cal_sky_ra = 0.0;
 float cal_mount_dec = 0.0;
 float cal_sky_dec = 0.0;
 unsigned long cal_time_ms = 0;
-// UTC clock reading at the moment cal_* was established - the RA drift calculation now uses this
-// (via utcElapsedSeconds()) instead of cal_time_ms/millis(), so it follows CMD,SET_TIME jumps.
-// cal_time_ms itself is kept alongside, still used for its own debug/report fields. Set wherever
-// cal_time_ms is set - see autoCalibrateFromHome() and the CMD,SYNC handler. cal_utc_time itself
-// is no longer read by the drift calculation (see cal_days_j2000 below) - kept only because
-// dumpDebugState()/other diagnostics may still want the human-readable Y/M/D/h/m/s.
+// UTC clock reading at the moment cal_* was established - kept for dumpDebugState()/other
+// diagnostics that want the human-readable Y/M/D/h/m/s. NOT used by the drift calculation itself
+// any more (see cal_time_ms above, and manualTimeJumpOffsetSec below, which utcElapsedSeconds()
+// actually reads) - it was, briefly (1.8.45-1.8.48), see manualTimeJumpOffsetSec's comment for
+// why that was reverted.
 STTime cal_utc_time;
-// daysSinceJ2000() equivalent of cal_utc_time, maintained as a plain double alongside it - see
-// currentDaysJ2000's comment for why this exists (avoiding a daysSinceJ2000() recompute, with
-// its floor() calls, on every tracking tick). Set at the exact same points as cal_utc_time.
-double cal_days_j2000 = 0.0;
+// Small, rarely-updated correction (seconds) for whatever a CMD,SET_TIME clock jump has added on
+// top of ordinary real-time progression SINCE cal_time_ms - see utcElapsedSeconds()'s comment for
+// the full history/reasoning. Reset to 0 at every calibration point (autoCalibrateFromHome(), the
+// CMD,SYNC handler, and its snapshot/restore) alongside cal_time_ms/cal_utc_time - "since
+// calibration" starts fresh there, so no prior jump is relevant any more. Updated (accumulated)
+// in setTimeFromValues() whenever a new CMD,SET_TIME arrives. Deliberately kept small in
+// magnitude (bounded by how much Time Travel has jumped the clock since the LAST calibration, not
+// an absolute epoch-scale count) specifically so it stays safely representable at the mantissa
+// precision "double" (really 32-bit float on this AVR) actually has - unlike the 1.8.46-1.8.48
+// currentDaysJ2000 running total this replaces, which grew to epoch-scale (~9700) magnitude and
+// silently lost precision on every small per-loop increment.
+double manualTimeJumpOffsetSec = 0.0;
 // Forward declaration - the actual definition (and updateTimeFromMillis()/setTimeFromValues(),
 // which keep it current) lives further down with the rest of the time-tracking code, but
 // computeSkyRA() and updateTrackingModes(), both defined before that point, need to reference it
-// for the drift calculation. currentDaysJ2000 (daysSinceJ2000() equivalent of currentUtcTime,
-// same role for utcElapsedSeconds()) is already forward-declared above, right before
-// utcElapsedSeconds() itself.
+// for the drift calculation.
 extern STTime currentUtcTime;
 
 // True once a REAL calibration event (CMD,SYNC, CMD,SYNC_OFFSET, or the mount actually being
@@ -1526,7 +1561,7 @@ void autoCalibrateFromHome() {
   if (cal_sky_ra < 0.0f) cal_sky_ra += 360.0f;
   cal_time_ms = millis();
   cal_utc_time = t;
-  cal_days_j2000 = currentDaysJ2000;  // cheap - see its own comment; t IS currentUtcTime here
+  manualTimeJumpOffsetSec = 0.0;  // fresh calibration - no prior jump is relevant any more
   isCalibrated = true;
   // The default target should be wherever the telescope is actually pointing at home, not an
   // arbitrary 0/0 that has nothing to do with this mount-relative calibration scheme - see the
@@ -1743,11 +1778,6 @@ float slewTargetRA = 0.0;
 float slewTargetDEC = 0.0;
 
 STTime currentUtcTime;
-// daysSinceJ2000() equivalent of currentUtcTime - see the extern declaration's comment (near
-// cal_days_j2000) for why this exists. Set exactly (via daysSinceJ2000() itself) in
-// setTimeFromValues(); advanced cheaply (a plain += , no daysSinceJ2000() call) in
-// updateTimeFromMillis() every loop() tick, mirroring how currentUtcTime.second itself advances.
-double currentDaysJ2000 = 0.0;
 unsigned long lastMillis = 0;
 unsigned long alignStartTime = 0;
 
@@ -1830,15 +1860,35 @@ uint8_t bufIndex = 0;
 // ============================================================
 
 void setTimeFromValues(int y, int m, int d, int h, int min, int s) {
+  // How much this new time differs from what real elapsed time alone would have predicted (i.e.
+  // a genuine clock JUMP - Time Travel, or a big correction - not just the normal march of real
+  // time since the last SET_TIME/loop tick) - accumulated into manualTimeJumpOffsetSec, which
+  // utcElapsedSeconds() actually reads. currentUtcTime here is still the OLD value (this loop's
+  // updateTimeFromMillis() already ran before readSerialCommands() processes this - see loop()'s
+  // ordering - so it's accurate to within one loop iteration, microseconds in practice). Calling
+  // daysSinceJ2000() twice here is fine - this is a rare event (connect, ~60s periodic resync, or
+  // a Time Travel preview), not the per-tracking-tick hot path - see utcElapsedSeconds()'s
+  // comment for why that path must never do this.
+  //
+  // Skipped entirely on the very first SET_TIME (!timeIsValid): currentUtcTime is still its
+  // zero-initialized boot value then (year 0 etc.), not a real "old" time to diff against - doing
+  // the diff anyway would compute a ~2026-year jump and immediately reintroduce a huge-magnitude
+  // manualTimeJumpOffsetSec, exactly the precision problem this whole redesign exists to avoid.
+  // Calibration hasn't happened yet at boot anyway (isCalibrated is false), so there's nothing
+  // for a jump to even be relative to yet.
+  if (timeIsValid) {
+    double oldExpectedDays = daysSinceJ2000(currentUtcTime.year, currentUtcTime.month, currentUtcTime.day,
+                                             currentUtcTime.hour, currentUtcTime.minute, currentUtcTime.second);
+    double newDays = daysSinceJ2000(y, m, d, h, min, s);
+    manualTimeJumpOffsetSec += (newDays - oldExpectedDays) * 86400.0;
+  }
+
   currentUtcTime.year   = y;
   currentUtcTime.month  = m;
   currentUtcTime.day    = d;
   currentUtcTime.hour   = h;
   currentUtcTime.minute = min;
   currentUtcTime.second = s;
-  // The one place currentDaysJ2000 actually pays for daysSinceJ2000()'s floor()s - a rare event
-  // (connect, ~60s periodic resync, or a Time Travel preview), not the per-loop-tick hot path.
-  currentDaysJ2000 = daysSinceJ2000(y, m, d, h, min, s);
   timeIsValid = true;
   lastMillis = millis();
 }
@@ -1848,9 +1898,6 @@ void updateTimeFromMillis() {
   unsigned long now = millis();
   unsigned long elapsed = now - lastMillis;
   lastMillis = now;
-
-  // Cheap running update - no floor(), no daysSinceJ2000() call - see currentDaysJ2000's comment.
-  currentDaysJ2000 += elapsed / 86400000.0;  // ms -> days
 
   // Advance time (simple, no DST/leap handling needed for astro approx)
   currentUtcTime.second += elapsed / 1000.0;
@@ -2366,7 +2413,7 @@ void parseAndExecuteCommand(char* cmd) {
     cal_sky_dec = dec;
     cal_time_ms = millis();
     cal_utc_time = currentUtcTime;
-    cal_days_j2000 = currentDaysJ2000;  // cheap - see its own comment
+    manualTimeJumpOffsetSec = 0.0;  // fresh calibration - no prior jump is relevant any more
     isCalibrated = true;
     calibrationLocked = true;  // a real SYNC - never let autoCalibrateFromHome() overwrite this
 
@@ -2424,10 +2471,10 @@ void parseAndExecuteCommand(char* cmd) {
     // instant for correct future drift.
     unsigned long saved_cal_time = cal_time_ms;
     STTime saved_cal_utc_time = cal_utc_time;
-    double saved_cal_days_j2000 = cal_days_j2000;
+    double saved_manual_jump = manualTimeJumpOffsetSec;
     cal_time_ms = millis();
     cal_utc_time = currentUtcTime;
-    cal_days_j2000 = currentDaysJ2000;  // cheap - see its own comment
+    manualTimeJumpOffsetSec = 0.0;
 
     // Extra debug: what sky value is the immediate POS going to contain?
     float dbg_snap_ra = computeSkyRA(axisRA.getCurrentAngle(), millis());
@@ -2440,7 +2487,7 @@ void parseAndExecuteCommand(char* cmd) {
     sendPositionUpdateNow();
     cal_time_ms = saved_cal_time;
     cal_utc_time = saved_cal_utc_time;
-    cal_days_j2000 = saved_cal_days_j2000;
+    manualTimeJumpOffsetSec = saved_manual_jump;
 
     if (debugVerbose) {
       dumpDebugState("SYNC_SNAP");
