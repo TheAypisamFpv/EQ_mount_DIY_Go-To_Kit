@@ -41,6 +41,20 @@ from sky_data import sky_catalog, iss_tracker, solar_system
 # ============================================================
 # CONFIG
 # ============================================================
+# Bumped on every functional change, same convention as (and independent of) the Arduino's own
+# FIRMWARE_VERSION in EQMountTracker.ino - see CLAUDE.md's commit workflow. Not sent over serial
+# or otherwise load-bearing; purely a changelog anchor so "what did the GUI look like when X was
+# true" is answerable from git history without guessing at commit dates.
+#   1.0.0 - Baseline (first version tracked here).
+#   1.0.1 - Time Travel simplified to one single time source: SerialHandler now pulls "now" via
+#           a get_time_fn callback (EQMountApp._get_effective_utc_now) instead of a separately
+#           mirrored offset, and the ISS (iss_tracker.get_current_radec) now takes at_time too -
+#           every position lookup in the app (Sun, Moon, planets, stars/DSOs via LST, ISS, and
+#           the Arduino's own clock sync) reads from that one function, so a Time Travel preview
+#           genuinely covers everything, not just a subset. No Arduino firmware changes needed -
+#           the simulated time is just sent as an ordinary CMD,SET_TIME.
+GUI_VERSION = "1.0.1"
+
 BAUD_RATE = 250000
 # GUI poll rate for the serial queue. Fast enough to comfortably keep up with the Arduino's 50Hz
 # (20ms) POS broadcast rate (POSITION_BROADCAST_HZ below) with headroom to spare, per request to
@@ -286,21 +300,22 @@ ctk.set_default_color_theme("blue")
 # SERIAL HANDLER (background thread)
 # ============================================================
 class SerialHandler:
-    def __init__(self, message_queue: queue.Queue):
+    def __init__(self, message_queue: queue.Queue, get_time_fn=None):
         self.ser: Optional[serial.Serial] = None
         self.queue = message_queue
         self.running = False
         self.thread: Optional[threading.Thread] = None
         self.port = ""
         self.last_error = ""
-        # Time Travel offset (see EQMountApp._time_travel_offset) - zero (real time) by default.
-        # send_time() adds this to the real clock before sending CMD,SET_TIME, so the Arduino's
-        # own onboard clock - and anything it computes off of it (meridian-limit geometry, home
-        # calibration) - follows the same simulated time the GUI is previewing, not just the GUI's
-        # own display. Set by EQMountApp whenever a Time Travel preview is applied/reset, so it's
-        # already current the next time send_time()/send_time_if_connected() fires here, on
-        # connect (see connect() below), or from the periodic resync timer.
-        self.time_offset: timedelta = timedelta(0)
+        # The ONE time source send_time() sends to the Arduino - a callable returning the current
+        # datetime (UTC, tz-aware). EQMountApp passes its own _get_effective_utc_now, the exact
+        # same function every other position lookup in the app (LST, Sun/Moon/planets, ISS) reads
+        # from - so there's a single place that decides "what time is it right now" (real, or a
+        # Time Travel preview), not a copy mirrored between here and the App. Queried fresh on
+        # every send_time() call (on connect, the periodic resync, and an explicit preview) rather
+        # than cached, so it's always current. Falls back to genuine real time if no App is wired
+        # up (e.g. standalone use/testing of SerialHandler).
+        self.get_time_fn = get_time_fn or (lambda: datetime.now(timezone.utc))
 
     def list_ports(self):
         ports = serial.tools.list_ports.comports()
@@ -457,10 +472,9 @@ class SerialHandler:
             return False
 
     def send_time(self):
-        # See self.time_offset's comment - zero (real time) unless a Time Travel preview is
-        # active, in which case the Arduino's clock is set to the simulated time too, not just
-        # the GUI's own display.
-        now = datetime.now(timezone.utc) + self.time_offset
+        # See self.get_time_fn's comment - real time unless a Time Travel preview is active, in
+        # which case the Arduino's clock is set to the same simulated time as everything else.
+        now = self.get_time_fn()
         cmd = (f"CMD,SET_TIME,Y:{now.year},M:{now.month},D:{now.day},"
                f"h:{now.hour},min:{now.minute},s:{now.second}")
         self.send_command(cmd)
@@ -558,7 +572,10 @@ class EQMountApp(ctk.CTk):
         self.minsize(900, 620)
 
         self.message_queue: queue.Queue = queue.Queue()
-        self.serial = SerialHandler(self.message_queue)
+        # get_time_fn=self._get_effective_utc_now wires SerialHandler.send_time() to the same
+        # single time source everything else uses (see _get_effective_utc_now's comment) - no
+        # separate offset mirrored/kept in sync here, just one function queried live.
+        self.serial = SerialHandler(self.message_queue, get_time_fn=self._get_effective_utc_now)
 
         # Opened once, in append mode, for the life of the app - see LOG_FILE_PATH's comment.
         # Kept open (rather than open/close per line) so a session with heavy traffic (e.g.
@@ -610,14 +627,12 @@ class EQMountApp(ctk.CTk):
         self._last_sent_location = None  # Track last sent location to avoid duplicates
         self._connection_timeout_id = None  # For tracking connection timeout
 
-        # Time Travel: lets both the GUI (Sun/Moon/planet/star/DSO positions) AND the Arduino's
-        # own onboard clock believe a chosen date/time is "now" instead of the real one - so the
-        # mount actually tracks/computes as if that were the current time, not just the GUI
-        # display. Mirrored into self.serial.time_offset (see its comment) so send_time()/
-        # send_time_if_connected() pick it up too. Stored as an offset from real UTC (rather than
-        # a frozen instant) so the preview keeps advancing at 1x, same as actually being at that
-        # moment, instead of freezing - see _get_effective_utc_now / the Time Travel controls in
-        # _build_ui.
+        # Time Travel: the ONE piece of state behind _get_effective_utc_now, the single time
+        # source every position lookup in the app reads from - GUI (Sun/Moon/planet/star/DSO/ISS
+        # positions) AND the Arduino's own onboard clock (SerialHandler.get_time_fn) alike. Stored
+        # as an offset from real UTC (rather than a frozen instant) so the preview keeps advancing
+        # at 1x, same as actually being at that moment, instead of freezing - see
+        # _get_effective_utc_now / the Time Travel controls in _build_ui.
         self._time_travel_offset = timedelta(0)
 
         # Sky viz zoom/pan state. zoom=1.0 shows the full sky (RA 0-360, DEC -90..+90);
@@ -1361,10 +1376,15 @@ class EQMountApp(ctk.CTk):
         # Make sure initial time will be sent on connect (plus periodic)
 
     def _get_effective_utc_now(self) -> datetime:
-        """The single source of "now" for all GUI-side sky math (LST, Sun/Moon/planet positions):
-        real UTC time, shifted by _time_travel_offset when Time Travel is active (offset is zero,
-        i.e. this is exactly real time, otherwise). The Arduino's own clock is kept in sync with
-        this same offset separately - see self.serial.time_offset / _apply_time_travel."""
+        """THE single source of "now" for this entire app - real UTC time, shifted by
+        _time_travel_offset when a Time Travel preview is active (offset is zero, i.e. this is
+        exactly real time, otherwise). Every position lookup reads from this one function and
+        nothing else: LST (_get_current_lst_deg, so stars/DSOs alt-az follow it too), Sun/Moon/
+        planets (_solar_system_update_tick), the ISS (_iss_update_tick), AND the Arduino's own
+        onboard clock (SerialHandler.get_time_fn - see its constructor comment; send_time() calls
+        this directly, not a separately-tracked copy). One offset, one accessor, everything
+        derives from it - flipping Time Travel on/off changes what this function returns and that
+        alone is enough for the whole app (GUI display and physical mount alike) to follow."""
         return datetime.now(timezone.utc) + self._time_travel_offset
 
     def _reset_time_travel_inputs_to_now(self):
@@ -1375,14 +1395,15 @@ class EQMountApp(ctk.CTk):
 
     def _apply_time_travel(self):
         """Applies the date/time typed into the Time Travel fields (interpreted in the computer's
-        own local timezone, same as the rest of this GUI/OS) as the simulated "now" used for
-        Sun/Moon/planet positions and star/DSO alt-az (via LST) - see _get_effective_utc_now -
-        AND pushes the same simulated time to the Arduino's own onboard clock (CMD,SET_TIME), so
-        the mount itself computes/tracks as if that were the current time, not just the GUI
-        display. Stored as an offset from real time (mirrored into self.serial.time_offset) so
-        the preview keeps ticking forward at 1x from whatever moment was requested, rather than
-        freezing there - the Arduino's clock advances right along with it via the existing
-        60s periodic resync (_start_time_sync_timer), on top of the immediate push below."""
+        own local timezone, same as the rest of this GUI/OS) by updating _time_travel_offset - the
+        one single piece of state _get_effective_utc_now reads. Nothing else needs telling: every
+        consumer (LST/stars/DSOs, Sun/Moon/planets, ISS, and the Arduino's own clock via
+        SerialHandler.get_time_fn) calls that same function fresh each time it needs "now", so
+        this one assignment is the entire toggle. Stored as an offset from real time (not a frozen
+        instant) so the preview keeps ticking forward at 1x from whatever moment was requested,
+        counting up from the instant it's set, exactly like the real clock does. The Arduino gets
+        an immediate push below rather than waiting for the periodic resync, so its physical
+        pointing/tracking picks up the new time right away too."""
         date_str = self.time_travel_date_var.get().strip()
         time_str = self.time_travel_time_var.get().strip() or "00:00:00"
         if time_str.count(":") == 1:
@@ -1395,7 +1416,6 @@ class EQMountApp(ctk.CTk):
         local_tz = datetime.now().astimezone().tzinfo
         target_utc = naive.replace(tzinfo=local_tz).astimezone(timezone.utc)
         self._time_travel_offset = target_utc - datetime.now(timezone.utc)
-        self.serial.time_offset = self._time_travel_offset
         pushed_to_arduino = self.serial.send_time_if_connected()
         self._log(f"Time Travel: previewing sky as of {naive.strftime('%Y-%m-%d %H:%M:%S')} (local)"
                    + (" - Arduino clock synced to it too" if pushed_to_arduino else
@@ -1405,11 +1425,10 @@ class EQMountApp(ctk.CTk):
         self._schedule_viz_redraw()
 
     def _reset_time_travel(self):
-        """Cancels any active preview and goes back to showing the real-time sky - also resyncs
-        the Arduino's clock back to real time immediately, same as _apply_time_travel does for a
-        simulated one."""
+        """Cancels any active preview and goes back to showing the real-time sky - the same single
+        _time_travel_offset assignment (this time to zero) is again the entire toggle; see
+        _apply_time_travel. Also resyncs the Arduino's clock back to real time immediately."""
         self._time_travel_offset = timedelta(0)
-        self.serial.time_offset = timedelta(0)
         self.serial.send_time_if_connected()
         self._reset_time_travel_inputs_to_now()
         self._log("Time Travel: back to real-time sky (Arduino clock resynced to real time)")
@@ -3549,11 +3568,12 @@ class EQMountApp(ctk.CTk):
         if not self._iss_enabled:
             return
         lat, lon = self._get_lat_lon_from_input()
+        at_time = self._get_effective_utc_now()  # single time source - see its comment
 
         def worker():
             try:
                 iss_tracker.ensure_tle_current()
-                ra, dec, alt, az, above = iss_tracker.get_current_radec(lat, lon)
+                ra, dec, alt, az, above = iss_tracker.get_current_radec(lat, lon, at_time=at_time)
             except ImportError:
                 self.after(0, lambda: self._log(
                     "ISS tracking needs the 'skyfield' package - pip install skyfield"))

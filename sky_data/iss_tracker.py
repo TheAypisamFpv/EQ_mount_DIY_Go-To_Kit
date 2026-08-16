@@ -48,14 +48,18 @@ def _load_satellite():
     return EarthSatellite(lines[1], lines[2], lines[0], ts), ts
 
 
-def get_current_radec(lat_deg, lon_deg, elevation_m=0.0):
-    """Topocentric ISS position right now, as seen from (lat_deg, lon_deg).
+def get_current_radec(lat_deg, lon_deg, elevation_m=0.0, at_time=None):
+    """Topocentric ISS position, as seen from (lat_deg, lon_deg), at at_time (a timezone-aware
+    datetime.datetime) or right now if at_time is None - see tracker_gui.py's single
+    App._get_effective_utc_now() time source, which every position lookup in the app (Sun, Moon,
+    planets, stars/DSOs via LST, and this) is driven from, so a Time Travel preview covers the ISS
+    too, not just the solar system.
     Returns (ra_deg, dec_deg, alt_deg, az_deg, above_horizon).
     Raises ImportError if skyfield isn't installed, or OSError/ValueError if no TLE is cached
     yet and none could be fetched (caller should call ensure_tle_current() first)."""
     from skyfield.api import wgs84  # optional dependency, imported lazily
     satellite, ts = _load_satellite()
-    t = ts.now()
+    t = ts.now() if at_time is None else ts.from_datetime(at_time)
     observer = wgs84.latlon(lat_deg, lon_deg, elevation_m)
     topocentric = (satellite - observer).at(t)
     ra, dec, _ = topocentric.radec()
