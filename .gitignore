@@ -5,7 +5,6 @@ __pycache__
 mcps
 test
 gui_config.json
-tracker_log.txt
 TODO.md
 iss_tle.txt
 *.bsp

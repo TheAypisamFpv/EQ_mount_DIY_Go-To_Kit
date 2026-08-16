@@ -36,24 +36,11 @@ def _angular_diameter_deg(distance_km, radius_km):
     return math.degrees(2.0 * math.atan(radius_km / distance_km))
 
 
-def _resolve_time(ts, at_time):
-    """Returns a skyfield Time for `at_time` (a timezone-aware datetime.datetime), or ts.now()
-    if at_time is None - the "real time" default every caller had before at_time existed, kept
-    so passing nothing behaves exactly as it always has. Used to let callers (see
-    tracker_gui.py's Time Travel controls) preview positions at a chosen date/time instead of
-    right now, without any real-time-vs-simulated branching duplicated at every call site."""
-    if at_time is None:
-        return ts.now()
-    return ts.from_datetime(at_time)
-
-
-def get_sun_info(lat_deg, lon_deg, elevation_m=0.0, at_time=None):
-    """Returns (ra_deg, dec_deg, angular_diameter_deg).
-
-    at_time: optional timezone-aware datetime.datetime - defaults to the real current time."""
+def get_sun_info(lat_deg, lon_deg, elevation_m=0.0):
+    """Returns (ra_deg, dec_deg, angular_diameter_deg)."""
     from skyfield.api import wgs84
     eph, ts = _load_ephemeris()
-    t = _resolve_time(ts, at_time)
+    t = ts.now()
     earth, sun = eph['earth'], eph['sun']
     observer = earth + wgs84.latlon(lat_deg, lon_deg, elevation_m)
     astrometric = observer.at(t).observe(sun).apparent()
@@ -62,18 +49,18 @@ def get_sun_info(lat_deg, lon_deg, elevation_m=0.0, at_time=None):
     return ra.hours * 15.0, dec.degrees, ang_diam
 
 
-def get_moon_info(lat_deg, lon_deg, elevation_m=0.0, at_time=None):
+def get_moon_info(lat_deg, lon_deg, elevation_m=0.0):
     """Returns (ra_deg, dec_deg, angular_diameter_deg, illuminated_fraction, phase_deg, waxing).
 
     phase_deg: 0=new, 90=first quarter, 180=full, 270=last quarter (standard "moon age angle").
     illuminated_fraction: 0 (new) to 1 (full), derived from phase_deg.
     waxing: True from new->full (phase_deg 0-180), False from full->new (180-360).
-    at_time: optional timezone-aware datetime.datetime - defaults to the real current time."""
+    """
     import math
     from skyfield.api import wgs84
     from skyfield import almanac
     eph, ts = _load_ephemeris()
-    t = _resolve_time(ts, at_time)
+    t = ts.now()
     earth, moon = eph['earth'], eph['moon']
     observer = earth + wgs84.latlon(lat_deg, lon_deg, elevation_m)
     astrometric = observer.at(t).observe(moon).apparent()
@@ -122,11 +109,9 @@ _PLANET_RADII_KM = {
 _SATURN_RING_OUTER_KM = 136780.0
 
 
-def get_planets_info(lat_deg, lon_deg, elevation_m=0.0, at_time=None):
+def get_planets_info(lat_deg, lon_deg, elevation_m=0.0):
     """Returns {name: (ra_deg, dec_deg, angular_diameter_deg, ring_angular_diameter_deg,
     illuminated_fraction)} for all 8 planets, all sampled at the same instant.
-
-    at_time: optional timezone-aware datetime.datetime - defaults to the real current time.
     ring_angular_diameter_deg is None for every planet except Saturn, where it's the ring system's
     own real angular diameter (see _SATURN_RING_OUTER_KM) - the GUI uses angular_diameter_deg the
     same way it already does for the Sun/Moon (draw to true scale once zoomed in enough that it
@@ -142,7 +127,7 @@ def get_planets_info(lat_deg, lon_deg, elevation_m=0.0, at_time=None):
     special-case which planets bother to compute it."""
     from skyfield.api import wgs84
     eph, ts = _load_ephemeris()
-    t = _resolve_time(ts, at_time)
+    t = ts.now()
     sun = eph['sun']
     observer = eph['earth'] + wgs84.latlon(lat_deg, lon_deg, elevation_m)
     result = {}

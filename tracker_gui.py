@@ -34,7 +34,7 @@ import json
 import os
 import bisect
 from collections import deque
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional
 from sky_data import sky_catalog, iss_tracker, solar_system
 
@@ -81,78 +81,12 @@ POS_UPDATE_RATE_MS = int(1000 / POSITION_BROADCAST_HZ)  # 20 ms
 # relying on the extrapolation between updates.
 ISS_TRACKING_UPDATE_MS = 20
 
-# Matches the firmware's own SIDEREAL_RATE_DEG_S exactly (EQMountTracker.ino) - used ONLY for the
-# client-side meridian-limit countdown estimate (_update_meridian_warning), never for any
-# safety-critical decision - the firmware enforces the actual stop independently and
-# authoritatively (pastMeridianLimit()/stopForMeridianLimit()), exactly like the Delete-key panic
-# stop is enforced firmware-side regardless of what the GUI thinks the state is.
-SIDEREAL_RATE_DEG_S = 0.004178
-MERIDIAN_LIMIT_WARNING_S = 300.0  # first warning: 5 minutes out
-MERIDIAN_LIMIT_URGENT_S = 10.0    # escalate: 10 seconds out
-
-# Matches the firmware's MERIDIAN_LIMIT_DEC_ALLOWED_MIN/MAX_DEG (EQMountTracker.ino) - at low
-# declination the OTA/dovetail passes nowhere near the tripod/pier even past the meridian, so
-# movement is allowed there regardless of Hour Angle. Used only to draw the danger-zone
-# visualization correctly (_draw_meridian_limit_zone) - the firmware enforces the actual
-# exemption independently and authoritatively, same as the HA check itself.
-MERIDIAN_LIMIT_DEC_ALLOWED_MIN_DEG = -15.0
-MERIDIAN_LIMIT_DEC_ALLOWED_MAX_DEG = 20.0
-
-# Standard IAU 1958 galactic coordinate system reference points (J2000-epoch RA/Dec of the North
-# Galactic Pole, and the galactic longitude of the North Celestial Pole) - used only to draw a
-# schematic Milky Way band on the sky viz (_build_milky_way_bands/_draw_milky_way). There's no
-# bundled all-sky Milky Way brightness image/outline (would be a large asset for a DIY project
-# like this); instead this analytically converts a swept range of galactic latitude/longitude
-# into RA/Dec, giving a geometrically correct band (right shape, width, and orientation, sweeping
-# across the sky exactly where the real Milky Way does) even though it can't capture the real
-# thing's patchiness/dark rifts/bulge brightness structure - a schematic "here's roughly where and
-# how wide it is", not a photographic rendering.
-_GAL_NGP_RA_DEG = 192.85948
-_GAL_NGP_DEC_DEG = 27.12825
-_GAL_L_NCP_DEG = 122.93192
-
-# Half-widths (galactic latitude, degrees) of the nested bands drawn by _draw_milky_way, widest/
-# faintest first so each narrower/stronger band is drawn on top of it - approximates a soft glow
-# fading outward from the galactic plane without needing real alpha transparency (Tkinter canvas
-# fills don't support that - see _draw_horizon/_draw_meridian_limit_zone for the same "solid but
-# subtle color" approach used elsewhere in this file). Paired 1:1 with MILKY_WAY_BAND_COLORS.
-MILKY_WAY_BAND_HALF_WIDTHS_DEG = [18.0, 10.0, 4.0]
-MILKY_WAY_BAND_COLORS = ["#161b28", "#1d2436", "#26314e"]
-
-# Galactic longitude sample step (degrees) for building each band's edge curves - smaller is
-# smoother but more polygons to draw every redraw; 4 degrees (90 samples around the full 360) is
-# smooth enough for a soft glow band at any zoom level actually used on this viz.
-MILKY_WAY_L_STEP_DEG = 4.0
-
-
-def _galactic_to_radec(l_deg, b_deg):
-    """Converts galactic (l, b) to equatorial (RA, Dec), both in degrees - standard spherical
-    coordinate rotation using the IAU 1958 galactic pole constants above. Verified against the
-    well-known Galactic Center position (l=0, b=0 should give RA=266.4 deg, Dec=-28.9 deg)."""
-    l_rad = math.radians(l_deg)
-    b = math.radians(b_deg)
-    ngp_dec = math.radians(_GAL_NGP_DEC_DEG)
-    l_ncp = math.radians(_GAL_L_NCP_DEG)
-    sin_dec = math.sin(b) * math.sin(ngp_dec) + math.cos(b) * math.cos(ngp_dec) * math.cos(l_ncp - l_rad)
-    dec = math.asin(max(-1.0, min(1.0, sin_dec)))
-    y = math.cos(b) * math.sin(l_ncp - l_rad)
-    x = math.sin(b) * math.cos(ngp_dec) - math.cos(b) * math.sin(ngp_dec) * math.cos(l_ncp - l_rad)
-    ra = (math.degrees(math.atan2(y, x)) + _GAL_NGP_RA_DEG) % 360.0
-    return ra, math.degrees(dec)
-
 # Anchored to this script's own directory, NOT the process's current working directory - a
 # bare relative "gui_config.json" depends on wherever the app happens to be launched from
 # (shortcut, IDE default CWD, a different terminal dir, ...) and silently misses the file
 # (os.path.exists just returns False, no error) if that doesn't match, even when the file is
 # sitting right next to the script.
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_config.json")
-
-# Same anchoring reasoning as CONFIG_PATH above. Every line that goes into the Status/message box
-# is also appended here in real time (see App._log) - the on-screen box trims old lines to stay
-# responsive (see _log's line-count check below), but nothing is ever lost from this file. Opened
-# once in append mode (never "w", never truncated) so relaunching the GUI keeps piling onto the
-# same running history rather than overwriting it - see App.__init__/on_closing.
-LOG_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracker_log.txt")
 
 # Placeholder observer location shown before a real one is set/loaded. Deliberately NOT a real
 # address - Royal Observatory Greenwich (home of the Prime Meridian) is a public astronomical
@@ -293,14 +227,6 @@ class SerialHandler:
         self.thread: Optional[threading.Thread] = None
         self.port = ""
         self.last_error = ""
-        # Time Travel offset (see EQMountApp._time_travel_offset) - zero (real time) by default.
-        # send_time() adds this to the real clock before sending CMD,SET_TIME, so the Arduino's
-        # own onboard clock - and anything it computes off of it (meridian-limit geometry, home
-        # calibration) - follows the same simulated time the GUI is previewing, not just the GUI's
-        # own display. Set by EQMountApp whenever a Time Travel preview is applied/reset, so it's
-        # already current the next time send_time()/send_time_if_connected() fires here, on
-        # connect (see connect() below), or from the periodic resync timer.
-        self.time_offset: timedelta = timedelta(0)
 
     def list_ports(self):
         ports = serial.tools.list_ports.comports()
@@ -457,35 +383,23 @@ class SerialHandler:
             return False
 
     def send_time(self):
-        # See self.time_offset's comment - zero (real time) unless a Time Travel preview is
-        # active, in which case the Arduino's clock is set to the simulated time too, not just
-        # the GUI's own display.
-        now = datetime.now(timezone.utc) + self.time_offset
+        now = datetime.now(timezone.utc)
         cmd = (f"CMD,SET_TIME,Y:{now.year},M:{now.month},D:{now.day},"
                f"h:{now.hour},min:{now.minute},s:{now.second}")
         self.send_command(cmd)
 
-    def send_time_if_connected(self) -> bool:
-        """Returns whether the time was actually sent (i.e. we're connected) - callers like
-        EQMountApp._apply_time_travel use this to tell the user whether the Arduino's clock was
-        just synced or will only pick up the change once a connection exists."""
+    def send_time_if_connected(self):
         if self.ser and self.ser.is_open:
             self.send_time()
-            return True
-        return False
 
     def send_mode(self, mode: str):
         self.send_command(f"CMD,MODE,{mode}")
 
-    def send_start_tracking(self, risk_ok: bool = False) -> bool:
-        # risk_ok: the GUI already confirmed a meridian-limit warning for this target with the
-        # user (see App._confirm_risky_slew) - see riskAcknowledged's comment in the .ino.
-        cmd = "CMD,START_TRACKING,RISK_OK:1" if risk_ok else "CMD,START_TRACKING"
-        return self.send_command(cmd)
+    def send_start_tracking(self) -> bool:
+        return self.send_command("CMD,START_TRACKING")
 
-    def send_start_tracking_skip_dec_reset(self, risk_ok: bool = False) -> bool:
-        cmd = "CMD,START_TRACKING,SKIP_DEC_RESET,RISK_OK:1" if risk_ok else "CMD,START_TRACKING,SKIP_DEC_RESET"
-        return self.send_command(cmd)
+    def send_start_tracking_skip_dec_reset(self) -> bool:
+        return self.send_command("CMD,START_TRACKING,SKIP_DEC_RESET")
 
     def send_stop(self) -> bool:
         # A bare '!' byte is sent first, immediately, ahead of the normal text command - the
@@ -508,11 +422,8 @@ class SerialHandler:
     def send_sync_offset(self, ra_offset: float, dec_offset: float):
         self.send_command(f"CMD,SYNC_OFFSET,RA:{ra_offset:.6f},DEC:{dec_offset:.6f}")
 
-    def send_goto(self, ra: float, dec: float, risk_ok: bool = False):
-        cmd = f"CMD,GOTO,RA:{ra:.6f},DEC:{dec:.6f}"
-        if risk_ok:
-            cmd += ",RISK_OK:1"  # see riskAcknowledged's comment in the .ino
-        self.send_command(cmd)
+    def send_goto(self, ra: float, dec: float):
+        self.send_command(f"CMD,GOTO,RA:{ra:.6f},DEC:{dec:.6f}")
 
     def send_safe_target(self):
         self.send_command("CMD,SAFE_TARGET")
@@ -560,19 +471,6 @@ class EQMountApp(ctk.CTk):
         self.message_queue: queue.Queue = queue.Queue()
         self.serial = SerialHandler(self.message_queue)
 
-        # Opened once, in append mode, for the life of the app - see LOG_FILE_PATH's comment.
-        # Kept open (rather than open/close per line) so a session with heavy traffic (e.g.
-        # Arduino debug dump ON) doesn't pay a filesystem open() per log line; flushed after every
-        # write in _log() instead, so "real time" still holds - a crash loses at most the last
-        # unflushed line, not the whole session. Failure here (e.g. read-only install dir) must
-        # not prevent the GUI from starting - falls back to None, and _log() just skips the file
-        # write when that happens.
-        try:
-            self._log_file = open(LOG_FILE_PATH, "a", encoding="utf-8")
-        except OSError as e:
-            self._log_file = None
-            print(f"WARNING: could not open log file {LOG_FILE_PATH}: {e}")
-
         self.current_ra = 0.0
         self.current_dec = 0.0
         self.target_ra = 0.0
@@ -601,24 +499,11 @@ class EQMountApp(ctk.CTk):
         self.current_mode = "SIDEREAL"
         self.tracking = False
         self.slewing = False
-        # Last CONFIRMED telescope-flip state (from POS's "flipped" field or STATUS:FLIP_COMPLETE)
-        # - see _toggle_telescope_flipped/flipped_toggle_btn and the .ino's setTelescopeFlipped().
-        self._telescope_flipped = False
         self.arduino_debug_enabled = False
         self.last_status = "Disconnected"
         self.system_state = "DISCONNECTED"
         self._last_sent_location = None  # Track last sent location to avoid duplicates
         self._connection_timeout_id = None  # For tracking connection timeout
-
-        # Time Travel: lets both the GUI (Sun/Moon/planet/star/DSO positions) AND the Arduino's
-        # own onboard clock believe a chosen date/time is "now" instead of the real one - so the
-        # mount actually tracks/computes as if that were the current time, not just the GUI
-        # display. Mirrored into self.serial.time_offset (see its comment) so send_time()/
-        # send_time_if_connected() pick it up too. Stored as an offset from real UTC (rather than
-        # a frozen instant) so the preview keeps advancing at 1x, same as actually being at that
-        # moment, instead of freezing - see _get_effective_utc_now / the Time Travel controls in
-        # _build_ui.
-        self._time_travel_offset = timedelta(0)
 
         # Sky viz zoom/pan state. zoom=1.0 shows the full sky (RA 0-360, DEC -90..+90);
         # center is the (RA, DEC) at the middle of the canvas. See _get_viz_view_bounds().
@@ -648,18 +533,6 @@ class EQMountApp(ctk.CTk):
         self._hovered_sky_object = None  # see _on_viz_mouse_move / _on_viz_double_click
         self._sky_search_index = []  # see _build_sky_catalog_state / _update_sky_search_results
         self._constellations_enabled = False  # toggled via the Constellations button
-
-        # DSO min-apparent-size filter - hides deep-sky objects (galaxies/nebulae/clusters, NOT
-        # stars, which have no meaningful angular size) that would project smaller than
-        # self._min_dso_size_px on the ACTUAL camera sensor (CAMERA_FOV_DEG_PER_PIXEL - the real
-        # measured optics/sensor spec, same one TRACKING_STABLE_ERR_DEG is built on), i.e. "is
-        # this actually big enough to be worth imaging with this setup", NOT how big it happens to
-        # render on the GUI's own arbitrary, independently-zoomable viz canvas - a fixed physical
-        # quantity per object, unaffected by zooming/panning the viz. Off by default - see
-        # _toggle_min_dso_size_filter/_on_min_dso_size_entry_commit and the size check in
-        # _draw_sky_objects.
-        self._min_dso_size_filter_enabled = False
-        self._min_dso_size_px = 100.0
 
         # Real-time ISS marker (see iss_tracker.py). Off by default - it needs internet (TLE
         # fetch from CelesTrak) and the skyfield package, neither of which should be required
@@ -758,7 +631,6 @@ class EQMountApp(ctk.CTk):
         self._start_time_sync_timer()
         self._start_ground_update_timer()
         self._start_viz_follow_timer()
-        self._start_time_travel_label_timer()
         # Sun/Moon/planets are always on (see the comment near their state above) - kicked off
         # once here, same as the sky catalog/ground timer, rather than needing a toggle press.
         self._solar_system_update_tick()
@@ -847,32 +719,6 @@ class EQMountApp(ctk.CTk):
                     self._set_location_label(f"Loc: {g} (loaded)")
             except Exception:
                 pass
-
-        # Time Travel: preview Sun/Moon/planet/star/DSO positions at a chosen date/time instead of
-        # right now (see _time_travel_offset's comment for what this does/doesn't affect).
-        time_travel_bar = ctk.CTkFrame(self, corner_radius=6, fg_color="transparent")
-        time_travel_bar.pack(fill="x", padx=12, pady=(0, 4))
-
-        ctk.CTkLabel(time_travel_bar, text="\U0001F550 Time Travel:", font=ctk.CTkFont(size=12, weight="bold")).pack(side="left", padx=(10, 6))
-
-        self.time_travel_date_var = ctk.StringVar()
-        self.time_travel_time_var = ctk.StringVar()
-        self._reset_time_travel_inputs_to_now()
-
-        self.time_travel_date_entry = ctk.CTkEntry(time_travel_bar, textvariable=self.time_travel_date_var, width=90, placeholder_text="YYYY-MM-DD")
-        self.time_travel_date_entry.pack(side="left", padx=2)
-        self.time_travel_time_entry = ctk.CTkEntry(time_travel_bar, textvariable=self.time_travel_time_var, width=75, placeholder_text="HH:MM:SS")
-        self.time_travel_time_entry.pack(side="left", padx=2)
-        # Enter in either field applies it immediately, same commit pattern as other entries
-        # in this GUI (e.g. cam_rot_entry) rather than requiring a mouse click on Preview.
-        self.time_travel_date_entry.bind("<Return>", lambda e: self._apply_time_travel())
-        self.time_travel_time_entry.bind("<Return>", lambda e: self._apply_time_travel())
-
-        ctk.CTkButton(time_travel_bar, text="Preview", width=70, command=self._apply_time_travel).pack(side="left", padx=4)
-        ctk.CTkButton(time_travel_bar, text="Now (Real Time)", width=120, fg_color="#555555", command=self._reset_time_travel).pack(side="left", padx=4)
-
-        self.time_travel_label = ctk.CTkLabel(time_travel_bar, text="Showing: real-time sky", font=ctk.CTkFont(size=11), text_color="#8888aa")
-        self.time_travel_label.pack(side="left", padx=10)
 
         # Prominent system status at the very top (clear state)
         status_bar = ctk.CTkFrame(self, corner_radius=6, fg_color="#1a1a2e")
@@ -1000,20 +846,6 @@ class EQMountApp(ctk.CTk):
         )
         self.target_name_label.pack(pady=(0, 6))
 
-        # Meridian-limit countdown - separate from the main STATUS-driven status bar
-        # (_update_status_display) deliberately: this updates every POS tick (~50Hz) while the
-        # status bar only updates on real STATUS-line events (rare), so sharing one label would
-        # mean the countdown constantly clobbers/flickers away real status messages like
-        # TRACKING_STARTED or STOPPED almost as soon as they appear. Blank/hidden whenever not
-        # relevant - see _update_meridian_warning.
-        self.meridian_warning_label = ctk.CTkLabel(
-            pos_frame,
-            text="",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            text_color="#ffaa00"
-        )
-        self.meridian_warning_label.pack(pady=(0, 4))
-
         # Spell out the actual numeric criteria behind the badge (built from the same
         # constants _update_tracking_stability uses, so it can't drift out of sync with them).
         ctk.CTkLabel(
@@ -1055,22 +887,6 @@ class EQMountApp(ctk.CTk):
                                               font=ctk.CTkFont(size=11), fg_color="#444444",
                                               command=self._toggle_constellations)
         self.const_toggle_btn.pack(side="left", padx=(6, 0))
-
-        # DSO min-apparent-size filter - see self._min_dso_size_filter_enabled's comment. The
-        # threshold (camera SENSOR pixels, not viz screen pixels) is directly editable (same
-        # pattern as cam_rot_entry below: type a value, Enter or click away commits it) rather
-        # than fixed, since what counts as "too small to bother imaging" depends on the setup.
-        self.min_size_toggle_btn = ctk.CTkButton(viz_toolbar, text="Min Size: OFF", height=22, width=110,
-                                                 font=ctk.CTkFont(size=11), fg_color="#444444",
-                                                 command=self._toggle_min_dso_size_filter)
-        self.min_size_toggle_btn.pack(side="left", padx=(6, 0))
-        self.min_dso_size_var = ctk.DoubleVar(value=self._min_dso_size_px)
-        self.min_dso_size_entry = ctk.CTkEntry(viz_toolbar, textvariable=self.min_dso_size_var,
-                                               width=45, font=ctk.CTkFont(size=11))
-        self.min_dso_size_entry.pack(side="left", padx=(4, 0))
-        self.min_dso_size_entry.bind("<Return>", self._on_min_dso_size_entry_commit)
-        self.min_dso_size_entry.bind("<FocusOut>", self._on_min_dso_size_entry_commit)
-        ctk.CTkLabel(viz_toolbar, text="cam-px", font=ctk.CTkFont(size=11), text_color="#8888aa").pack(side="left", padx=(2, 0))
 
         # Camera FOV rotation - purely a display setting to match the camera rectangle/top
         # marker overlay (see _camera_rect_points/_camera_top_marker_points) to however the
@@ -1224,23 +1040,6 @@ class EQMountApp(ctk.CTk):
         )
         self.home_axes_btn.pack(fill="x", pady=(0, 4))
 
-        # Manual meridian-flip toggle: the DEC axis has a hard mechanical stop at +-90° and can't
-        # make the ~180° swing a real motorized flip needs, so the DEC half is done BY HAND -
-        # loosen the OTA's rings/dovetail, rotate the tube 180° around the DEC axis, re-tighten -
-        # and this toggle tells the firmware, which then auto-drives RA through the matching
-        # 180° rotation (CMD,SET_FLIPPED - see setTelescopeFlipped() in the .ino). Always reflects
-        # the last CONFIRMED state (from POS's "flipped" field or STATUS:FLIP_COMPLETE), not an
-        # optimistic guess - the RA rotation takes real time, and showing "ON" before it's
-        # actually settled would be misleading.
-        self.flipped_toggle_btn = ctk.CTkButton(
-            btn_frame,
-            text="Telescope Flipped: OFF",
-            height=28,
-            fg_color="#444444",
-            command=self._toggle_telescope_flipped
-        )
-        self.flipped_toggle_btn.pack(fill="x", pady=(0, 4))
-
         # Sync with star selector
         sync_frame = ctk.CTkFrame(right)
         sync_frame.pack(fill="x", padx=12, pady=4)
@@ -1360,102 +1159,10 @@ class EQMountApp(ctk.CTk):
 
         # Make sure initial time will be sent on connect (plus periodic)
 
-    def _get_effective_utc_now(self) -> datetime:
-        """The single source of "now" for all GUI-side sky math (LST, Sun/Moon/planet positions):
-        real UTC time, shifted by _time_travel_offset when Time Travel is active (offset is zero,
-        i.e. this is exactly real time, otherwise). The Arduino's own clock is kept in sync with
-        this same offset separately - see self.serial.time_offset / _apply_time_travel."""
-        return datetime.now(timezone.utc) + self._time_travel_offset
-
-    def _reset_time_travel_inputs_to_now(self):
-        """Prefills the Time Travel date/time entries with the current local wall-clock time."""
-        local_now = datetime.now().astimezone()
-        self.time_travel_date_var.set(local_now.strftime("%Y-%m-%d"))
-        self.time_travel_time_var.set(local_now.strftime("%H:%M:%S"))
-
-    def _apply_time_travel(self):
-        """Applies the date/time typed into the Time Travel fields (interpreted in the computer's
-        own local timezone, same as the rest of this GUI/OS) as the simulated "now" used for
-        Sun/Moon/planet positions and star/DSO alt-az (via LST) - see _get_effective_utc_now -
-        AND pushes the same simulated time to the Arduino's own onboard clock (CMD,SET_TIME), so
-        the mount itself computes/tracks as if that were the current time, not just the GUI
-        display. Stored as an offset from real time (mirrored into self.serial.time_offset) so
-        the preview keeps ticking forward at 1x from whatever moment was requested, rather than
-        freezing there - the Arduino's clock advances right along with it via the existing
-        60s periodic resync (_start_time_sync_timer), on top of the immediate push below."""
-        date_str = self.time_travel_date_var.get().strip()
-        time_str = self.time_travel_time_var.get().strip() or "00:00:00"
-        if time_str.count(":") == 1:
-            time_str += ":00"
-        try:
-            naive = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            self._log(f"Time Travel: invalid date/time - use YYYY-MM-DD and HH:MM:SS (got '{date_str} {time_str}')")
-            return
-        local_tz = datetime.now().astimezone().tzinfo
-        target_utc = naive.replace(tzinfo=local_tz).astimezone(timezone.utc)
-        self._time_travel_offset = target_utc - datetime.now(timezone.utc)
-        self.serial.time_offset = self._time_travel_offset
-        pushed_to_arduino = self.serial.send_time_if_connected()
-        self._log(f"Time Travel: previewing sky as of {naive.strftime('%Y-%m-%d %H:%M:%S')} (local)"
-                   + (" - Arduino clock synced to it too" if pushed_to_arduino else
-                      " - Arduino not connected, will sync on connect"))
-        self._update_time_travel_label()
-        self._force_solar_system_refresh()
-        self._schedule_viz_redraw()
-
-    def _reset_time_travel(self):
-        """Cancels any active preview and goes back to showing the real-time sky - also resyncs
-        the Arduino's clock back to real time immediately, same as _apply_time_travel does for a
-        simulated one."""
-        self._time_travel_offset = timedelta(0)
-        self.serial.time_offset = timedelta(0)
-        self.serial.send_time_if_connected()
-        self._reset_time_travel_inputs_to_now()
-        self._log("Time Travel: back to real-time sky (Arduino clock resynced to real time)")
-        self._update_time_travel_label()
-        self._force_solar_system_refresh()
-        self._schedule_viz_redraw()
-
-    def _update_time_travel_label(self):
-        if not hasattr(self, 'time_travel_label') or not self.time_travel_label.winfo_exists():
-            return
-        if self._time_travel_offset == timedelta(0):
-            self.time_travel_label.configure(text="Showing: real-time sky", text_color="#8888aa")
-        else:
-            eff_local = self._get_effective_utc_now().astimezone()
-            connected = bool(self.serial and self.serial.ser and self.serial.ser.is_open)
-            suffix = "" if connected else " - Arduino not connected"
-            self.time_travel_label.configure(
-                text=f"⚠ TIME TRAVEL: {eff_local.strftime('%Y-%m-%d %H:%M:%S')} (local){suffix}",
-                text_color="#ff9944")
-
-    def _start_time_travel_label_timer(self):
-        """Keeps the Time Travel status label ticking forward once a second while a preview is
-        active - separate from the 10ms _poll_queue loop (POLL_INTERVAL_MS) since a text label
-        with 1-second resolution doesn't need updating anywhere near that often."""
-        def tick():
-            self._update_time_travel_label()
-            self.after(1000, tick)
-        tick()
-
-    def _force_solar_system_refresh(self):
-        """Re-fetches Sun/Moon/planet positions right away instead of waiting for the next
-        scheduled _solar_system_update_tick (up to 2s away) - used after a Time Travel
-        preview/reset so the jump feels immediate. Must cancel the pending scheduled call first:
-        _solar_system_update_tick reschedules itself via self.after(2000, ...), so calling it
-        again without cancelling would leave two independent recurring loops running forever."""
-        if getattr(self, '_solar_system_update_after_id', None) is not None:
-            try:
-                self.after_cancel(self._solar_system_update_after_id)
-            except Exception:
-                pass
-        self._solar_system_update_tick()
-
     def _get_current_lst_deg(self):
         """Approximate Local Sidereal Time in degrees using system time + longitude."""
         _, lon = self._get_lat_lon_from_input()
-        utc = self._get_effective_utc_now()
+        utc = datetime.now(timezone.utc)
         # Julian date (simplified)
         year, month, day = utc.year, utc.month, utc.day
         hour = utc.hour + utc.minute / 60.0 + utc.second / 3600.0
@@ -1675,123 +1382,6 @@ class EQMountApp(ctk.CTk):
         self.viz_mode_btn.configure(text="View: Free")
         self._redraw_viz()
 
-    def _build_milky_way_bands(self):
-        """Precomputes, once, the (RA, Dec) quad segments for each nested Milky Way band (see
-        MILKY_WAY_BAND_HALF_WIDTHS_DEG/_galactic_to_radec) - fixed in equatorial coordinates
-        (unlike the horizon or meridian-limit zone, the galactic plane doesn't move with time), so
-        there's no reason to redo this trig on every redraw. Called lazily from _draw_milky_way
-        the first time it's needed and cached in self._milky_way_bands.
-
-        Each band is a list of quads (4 (ra,dec) point tuples each), one quad per adjacent pair of
-        sampled galactic-longitude points, covering the ring l=[i*STEP, (i+1)*STEP] between the
-        band's +halfwidth and -halfwidth edges. Built as many small independent quads rather than
-        one big polygon per band specifically so the RA=0/360 seam (crossed once per full lap of
-        l) doesn't need special-case splitting - a quad whose two longitude samples land on
-        opposite sides of the seam just gets skipped (a ~4 degree gap in a soft glow band is
-        visually negligible), instead of drawing one huge wraparound chord across the whole
-        canvas."""
-        bands = []
-        n_steps = int(round(360.0 / MILKY_WAY_L_STEP_DEG))
-        for half_width, color in zip(MILKY_WAY_BAND_HALF_WIDTHS_DEG, MILKY_WAY_BAND_COLORS):
-            top = [_galactic_to_radec(i * MILKY_WAY_L_STEP_DEG, half_width) for i in range(n_steps + 1)]
-            bot = [_galactic_to_radec(i * MILKY_WAY_L_STEP_DEG, -half_width) for i in range(n_steps + 1)]
-            quads = []
-            for i in range(n_steps):
-                ra_t0, dec_t0 = top[i]
-                ra_t1, dec_t1 = top[i + 1]
-                ra_b0, dec_b0 = bot[i]
-                ra_b1, dec_b1 = bot[i + 1]
-                # Skip quads whose samples straddle the RA=0/360 seam - see docstring.
-                if abs(ra_t1 - ra_t0) > 180.0 or abs(ra_b1 - ra_b0) > 180.0:
-                    continue
-                quads.append(((ra_t0, dec_t0), (ra_t1, dec_t1), (ra_b1, dec_b1), (ra_b0, dec_b0)))
-            bands.append((color, quads))
-        return bands
-
-    def _draw_milky_way(self, c, w, h, margin, ra_min, ra_max, dec_min, dec_max):
-        """Draws the schematic Milky Way band - see MILKY_WAY_BAND_HALF_WIDTHS_DEG's comment for
-        why it's an analytic galactic-coordinate band rather than a real brightness image, and
-        _build_milky_way_bands for how the underlying (RA,Dec) geometry is built (once, cached,
-        reused every redraw). Widest/faintest band drawn first, narrowest/brightest last, so they
-        naturally layer into a glow that's strongest right at the galactic plane."""
-        if not hasattr(self, "_milky_way_bands"):
-            self._milky_way_bands = self._build_milky_way_bands()
-        ra_span, dec_span = ra_max - ra_min, dec_max - dec_min
-        # Generous margin so a quad with one corner just outside the visible window (common, since
-        # quads are ~4 degrees wide) doesn't get culled before its other corners are checked -
-        # cheap bounding-box overlap test, not exact clipping (create_polygon handles off-canvas
-        # coordinates fine on its own, this is purely to skip trig/draw calls for whole bands/
-        # quads nowhere near the current view).
-        pad = 10.0
-        for color, quads in self._milky_way_bands:
-            for quad in quads:
-                quad_ra_min = min(p[0] for p in quad)
-                quad_ra_max = max(p[0] for p in quad)
-                quad_dec_min = min(p[1] for p in quad)
-                quad_dec_max = max(p[1] for p in quad)
-                if quad_ra_max < ra_min - pad or quad_ra_min > ra_max + pad:
-                    continue
-                if quad_dec_max < dec_min - pad or quad_dec_min > dec_max + pad:
-                    continue
-                pts = []
-                for ra, dec in quad:
-                    pts.append(self._viz_ra_to_x(ra, w, margin, ra_min, ra_span))
-                    pts.append(self._viz_dec_to_y(dec, h, margin, dec_min, dec_span))
-                c.create_polygon(pts, fill=color, outline="", tags="milky_way")
-
-    def _draw_meridian_limit_zone(self, c, w, h, margin, ra_min, ra_max, dec_min, dec_max):
-        """Shades the RA band currently past the meridian limit (see MERIDIAN_LIMIT_MARGIN_DEG/
-        pastMeridianLimit() in the .ino - the zone tracking auto-stops at, and GOTO/START_TRACKING
-        now only warn-and-confirm about rather than refusing outright, since this mount's DEC axis
-        can't make the ~180deg swing a real flip would otherwise need) in orange - "risky, will
-        ask for confirmation", not "impossible" (see _confirm_risky_slew) - same rendering
-        approach as _draw_horizon's ground shading (a solid, subtle-colored polygon), but
-        geometrically simpler: Hour Angle
-        only depends on RA, not DEC, so this isn't a latitude-dependent curve like the horizon -
-        it's a plain vertical band spanning the full visible DEC range, from RA=(LST-180) to
-        RA=LST (the 180-degree-wide "already past meridian" half of the sky), sweeping around as
-        LST advances. Does NOT disappear once flipped - the collision constraint is symmetric
-        (each pier side is only safe for roughly half the sky), so the band mirrors to the other
-        half of RA instead (LST to LST+180) once flipped, matching the .ino's pastMeridianLimit()
-        mirroring the same way for the same reason - see its comment. Excludes the
-        MERIDIAN_LIMIT_DEC_ALLOWED_MIN/MAX_DEG band (movement is allowed there regardless of HA -
-        see that constant's comment), so this is now up to two horizontal strips (above and below
-        the allowed band) per RA sub-interval, not one full-height rectangle."""
-        lst = self._get_current_lst_deg()
-        if self._telescope_flipped:
-            danger_lo, danger_hi = lst % 360.0, (lst + 180.0) % 360.0
-        else:
-            danger_lo, danger_hi = (lst - 180.0) % 360.0, lst % 360.0
-        # 180-degree band may wrap across the RA=0/360 seam - split into up to two non-wrapping
-        # sub-intervals, same technique used elsewhere in this file for RA wraparound.
-        intervals = [(danger_lo, danger_hi)] if danger_lo <= danger_hi \
-            else [(danger_lo, 360.0), (0.0, danger_hi)]
-        ra_span, dec_span = ra_max - ra_min, dec_max - dec_min
-        # DEC sub-bands still in danger: above the allowed band and below it, each clipped to the
-        # visible DEC range. Skipped individually if the allowed band fully covers/exceeds it.
-        dec_bands = []
-        upper_lo = max(MERIDIAN_LIMIT_DEC_ALLOWED_MAX_DEG, dec_min)
-        if upper_lo < dec_max:
-            dec_bands.append((upper_lo, dec_max))
-        lower_hi = min(MERIDIAN_LIMIT_DEC_ALLOWED_MIN_DEG, dec_max)
-        if dec_min < lower_hi:
-            dec_bands.append((dec_min, lower_hi))
-        for lo, hi in intervals:
-            clip_lo, clip_hi = max(lo, ra_min), min(hi, ra_max)
-            if clip_lo >= clip_hi:
-                continue
-            x_lo = self._viz_ra_to_x(clip_lo, w, margin, ra_min, ra_span)
-            x_hi = self._viz_ra_to_x(clip_hi, w, margin, ra_min, ra_span)
-            # min()/max() on the pixel coords, not the RA values - RA increases leftward on
-            # screen (_viz_ra_to_x's mirrored convention), so x_lo isn't necessarily the
-            # visually-left edge.
-            x_left, x_right = min(x_lo, x_hi), max(x_lo, x_hi)
-            for dec_lo, dec_hi in dec_bands:
-                y_top = self._viz_dec_to_y(dec_hi, h, margin, dec_min, dec_span)
-                y_bot = self._viz_dec_to_y(dec_lo, h, margin, dec_min, dec_span)
-                c.create_rectangle(x_left, y_top, x_right, y_bot,
-                                   fill="#3a2814", outline="", tags="meridian_limit")
-
     def _draw_horizon(self, c, w, h, margin, ra_min, ra_max, dec_min, dec_max):
         """Shade the region below the horizon and draw the horizon curve (simple approx)."""
         ra_span, dec_span = ra_max - ra_min, dec_max - dec_min
@@ -1963,17 +1553,9 @@ class EQMountApp(ctk.CTk):
 
     def _dso_render_style(self, type_code):
         """Rough shape/color per OpenNGC type code - not meant to be exhaustive, just
-        distinguishable at a glance. See https://github.com/mattiaverga/OpenNGC for the full type
-        code list. Previously every non-galaxy/non-cluster/non-planetary-nebula type (HII,
-        emission, reflection, dark nebulae, supernova remnants) shared one generic teal color,
-        which was fine back when the catalog only had Messier's handful of each - now that the
-        catalog covers far more of each type (see sky_catalog.py's DSO_INTERESTING_TYPES), that
-        bucket needed splitting out for real. Colors loosely follow common astro-app convention:
-        red for emission/HII (real H-alpha glow is red), blue for reflection (scattered starlight
-        is blue), brown/gray for dark nebulae (dust silhouettes, don't glow at all), orange for
-        supernova remnants, purple for planetary nebulae, orange-tan for galaxies, yellow for
-        clusters, teal as the catch-all for anything else (generic "Neb", cluster+nebula combos,
-        unrecognized codes)."""
+        distinguishable at a glance: galaxies as ellipses, clusters as scattered rings,
+        planetary nebulae as small rings, everything else (nebulae, SNRs, etc.) as a cloud
+        ellipse. See https://github.com/mattiaverga/OpenNGC for the full type code list."""
         t = type_code or ""
         if t in ("OCl", "GCl"):
             return "cluster", "#ffee88"
@@ -1981,14 +1563,6 @@ class EQMountApp(ctk.CTk):
             return "ring", "#dd88ff"
         if t.startswith("G") and t not in ("GCl",):
             return "ellipse", "#ffaa66"
-        if t in ("HII", "EmN"):
-            return "ellipse", "#ff6666"
-        if t == "RfN":
-            return "ellipse", "#77aaff"
-        if t == "DrkN":
-            return "ellipse", "#998877"
-        if t == "SNR":
-            return "ellipse", "#ff9933"
         return "ellipse", "#66ddcc"
 
     def _star_mag_limit_for_zoom(self):
@@ -2109,20 +1683,6 @@ class EQMountApp(ctk.CTk):
             shape, color = self._dso_render_style(d["type"])
             maj = d.get("size_maj_arcmin")
             min_ax = d.get("size_min_arcmin") or maj
-            # Min-apparent-size clutter filter - see self._min_dso_size_filter_enabled's comment.
-            # Deliberately NOT based on how big the object is drawn on the viz canvas (that
-            # changes with the GUI's own arbitrary zoom level, which has nothing to do with
-            # whether the object is actually a worthwhile imaging target) - instead this is the
-            # object's real major-axis size projected onto the ACTUAL camera sensor
-            # (CAMERA_FOV_DEG_PER_PIXEL, the same real measured optics/sensor spec used for
-            # TRACKING_STABLE_ERR_DEG), a fixed physical quantity independent of any GUI setting.
-            # No size data (maj is None) is treated as "unknown, so can't confirm it clears the
-            # threshold" and excluded - same reasoning as before, just against the real optics
-            # instead of screen pixels now.
-            if self._min_dso_size_filter_enabled:
-                sensor_px = (maj / 60.0 / CAMERA_FOV_DEG_PER_PIXEL) if maj else 0.0
-                if sensor_px < self._min_dso_size_px:
-                    continue
             if maj:
                 half_w = max(3.0, (maj / 60.0 / 2.0) * pixels_per_deg)
                 half_h = max(3.0, ((min_ax or maj) / 60.0 / 2.0) * pixels_per_deg)
@@ -2141,19 +1701,18 @@ class EQMountApp(ctk.CTk):
                 pts = self._rotated_ellipse_points(x, y, half_w, half_h, d.get("pos_ang_deg") or 0.0)
                 c.create_polygon(pts, outline=color, width=1, fill="", dash=(3, 2), tags="sky_obj")
             # Label only once objects are large enough on-screen to have room for text, and only
-            # a modest zoom in - otherwise a full-sky view would be solid text clutter (thousands
-            # of DSOs all fighting for the same small area, now that the catalog covers more than
-            # just the 110 Messier objects - see sky_catalog.py's DSO_INTERESTING_TYPES).
+            # a modest zoom in - otherwise a full-sky view would be solid text clutter (110
+            # Messier objects all fighting for the same small area).
             already_labeled = half_w >= 8 and self._viz_zoom >= 3.0
             if already_labeled:
-                label = d.get("name") or d["designation"]
+                label = d.get("name") or d["messier"]
                 c.create_text(x, y - half_h - 8, text=label, fill=color,
                              font=("Consolas", 8), tags="sky_obj")
 
             self._visible_object_hits.append({
                 "x": x, "y": y, "ra": ra, "dec": dec, "radius": max(12.0, half_w, half_h),
-                "name": d.get("name") or d["designation"],
-                "extra": f"{d['designation']} · {d['type']}",
+                "name": d.get("name") or d["messier"],
+                "extra": f"{d['messier']} · {d['type']}",
                 "labeled": already_labeled,
             })
 
@@ -2202,26 +1761,6 @@ class EQMountApp(ctk.CTk):
         r_e, r_n = self._rotate_ne(half_h, 6, pos_ang_deg)
         return [cx - tip_e, cy - tip_n, cx - l_e, cy - l_n, cx - r_e, cy - r_n]
 
-    def _safe_tag_raise(self, c, tag, above):
-        """tag_raise(tag, above) but tolerant of either tag matching zero current canvas items -
-        plain Tk raises a bare TclError ("tagOrId ... doesn't match any items") in that case,
-        which crashes the whole redraw. This is a real, expected situation now (not just a
-        theoretical edge case): _draw_meridian_limit_zone can legitimately draw nothing when the
-        visible Dec range falls entirely inside the allowed-DEC exemption band, and
-        _draw_milky_way can draw nothing at extreme zoom levels where no band segment overlaps
-        the visible window - both now var y with the view instead of always drawing at least one
-        shape the way they used to. If `tag` itself has nothing, there's nothing to raise - skip.
-        If `above` has nothing (e.g. the previous layer in the chain was itself empty), fall back
-        to "viz_bg", which is always drawn unconditionally and unconditionally first."""
-        if not c.find_withtag(tag):
-            return
-        if not c.find_withtag(above):
-            above = "viz_bg"
-        try:
-            c.tag_raise(tag, above)
-        except tk.TclError:
-            pass
-
     def _draw_viz_grid(self):
         """Draw a larger, clearer reticle / position visualization. Grid density adapts to
         the current zoom level: as you zoom in, coarse ~10 deg lines give way to 5, 1, 0.1 deg
@@ -2241,31 +1780,18 @@ class EQMountApp(ctk.CTk):
         # Background
         c.create_rectangle(8, 8, w-8, h-8, outline="#222233", width=2, fill="#111118", tags="viz_bg")
 
-        # Horizon shading (below horizon gets darker color) - the absolute furthest-back layer of
-        # the three below, right above the plain background rectangle: "below the horizon" means
-        # physically unreachable regardless of what else is there, so the ground should mute/sit
-        # behind the Milky Way band and the meridian danger zone wherever they overlap it, not
-        # paint over and hide them - previously drawn LAST (on top of both), which had it doing
-        # exactly the opposite of that.
-        # tag_raise explicitly pins "horizon"-tagged items directly above "viz_bg" rather than
+        # Horizon shading (below horizon gets darker color) - drawn right after the background
+        # so everything else (grid, labels, FOV circle, target cross) renders on top of it,
+        # rather than the ground shading covering those. Still visible as a shaded layer against
+        # the background, just at the back of the stack instead of the front.
+        # tag_raise explicitly pins "horizon"-tagged items directly above "viz_bg", rather than
         # relying only on creation order - reported as still covering the grid even after
         # restarting with the creation-order fix in place, so this makes the stacking explicit
         # and unambiguous instead of depending on it falling out naturally from draw order.
+        # (A bare tag_lower("horizon") would send it below viz_bg too, hiding it completely
+        # behind the opaque background - has to be anchored relative to viz_bg specifically.)
         self._draw_horizon(c, w, h, margin, ra_min, ra_max, dec_min, dec_max)
-        self._safe_tag_raise(c, "horizon", "viz_bg")
-
-        # Milky Way band - fixed in equatorial coordinates (doesn't depend on time/location the
-        # way horizon/meridian-limit do), drawn above the ground shading so it stays visible even
-        # across the horizon - see _draw_milky_way's docstring.
-        self._draw_milky_way(c, w, h, margin, ra_min, ra_max, dec_min, dec_max)
-        self._safe_tag_raise(c, "milky_way", "horizon")
-
-        # Meridian-limit danger zone (red/orange) - drawn last of these three so it stays visible
-        # on top of both the ground shading and the Milky Way band wherever they overlap. Drawn
-        # regardless of flip state - the zone mirrors to the other half of RA once flipped rather
-        # than disappearing, see _draw_meridian_limit_zone's docstring.
-        self._draw_meridian_limit_zone(c, w, h, margin, ra_min, ra_max, dec_min, dec_max)
-        self._safe_tag_raise(c, "meridian_limit", "milky_way")
+        c.tag_raise("horizon", "viz_bg")
 
         # DEC lines (horizontal), spacing adaptive to zoom
         dec_step = self._pick_grid_step(dec_span)
@@ -2717,21 +2243,13 @@ class EQMountApp(ctk.CTk):
                 else:
                     self._log(f"{mode.title()} position not available yet (still loading skyfield ephemeris?) - "
                               f"using previous sync/target values.")
-
-            risky = self._is_target_risky(self.target_ra, self.target_dec)
-            if not self._confirm_risky_slew(self.target_ra, self.target_dec):
-                # self.tracking is still False here - _request_tracking_action (not yet reached)
-                # is what actually flips it, so there's nothing to unwind.
-                self._log("Start Tracking cancelled - target past the meridian limit, not confirmed.")
-                return
-
             if self._force_full_align_next_start:
                 # See _on_mode_changed: right after a mode switch the GUI's cached target is
                 # stale (Arduino hasn't recomputed it for the new mode yet, since that only
                 # happens once tracking is active), so the distance-based fast-path decision
                 # below can't be trusted this one time - always do a full alignment instead.
                 self._force_full_align_next_start = False
-                self._request_tracking_action("START", lambda: self.serial.send_start_tracking(risk_ok=risky),
+                self._request_tracking_action("START", self.serial.send_start_tracking,
                                                "normal alignment, forced after mode change", "STARTING…")
             else:
                 # Check if target is within ±5° of current position to skip DEC reset
@@ -2741,12 +2259,11 @@ class EQMountApp(ctk.CTk):
                 )
                 if distance <= 5.0:
                     # Target is close, skip DEC reset for faster alignment
-                    self._request_tracking_action(
-                        "START", lambda: self.serial.send_start_tracking_skip_dec_reset(risk_ok=risky),
-                        f"DEC reset skip, target within {distance:.2f}°", "STARTING…")
+                    self._request_tracking_action("START", self.serial.send_start_tracking_skip_dec_reset,
+                                                   f"DEC reset skip, target within {distance:.2f}°", "STARTING…")
                 else:
                     # Target is far, use normal alignment sequence
-                    self._request_tracking_action("START", lambda: self.serial.send_start_tracking(risk_ok=risky),
+                    self._request_tracking_action("START", self.serial.send_start_tracking,
                                                    f"normal alignment, target {distance:.2f}° away", "STARTING…")
         else:
             # Stop
@@ -2937,16 +2454,11 @@ class EQMountApp(ctk.CTk):
             self._log("Invalid RA/DEC numbers for GoTo.")
             return
 
-        risky = self._is_target_risky(ra, dec)
-        if not self._confirm_risky_slew(ra, dec):
-            self._log("GoTo cancelled - target past the meridian limit, not confirmed.")
-            return
-
         self.target_ra = ra
         self.target_dec = dec
 
         if self.serial.ser and self.serial.ser.is_open:
-            self.serial.send_goto(ra, dec, risk_ok=risky)
+            self.serial.send_goto(ra, dec)
             self._log(f"GoTo sent: RA={ra:.6f} DEC={dec:.6f}")
         else:
             self._log("Not connected.")
@@ -2964,13 +2476,9 @@ class EQMountApp(ctk.CTk):
             except ValueError:
                 self._log("Invalid RA/DEC numbers for GoTo.")
                 return
-            risky = self._is_target_risky(ra, dec)
-            if not self._confirm_risky_slew(ra, dec):
-                self._log("GoTo cancelled - target past the meridian limit, not confirmed.")
-                return
             self.target_ra = ra
             self.target_dec = dec
-            self.serial.send_goto(ra, dec, risk_ok=risky)
+            self.serial.send_goto(ra, dec)
             self.slewing = True
             self._log(f"GoTo sent: RA={ra:.6f} DEC={dec:.6f}")
         else:
@@ -3367,16 +2875,6 @@ class EQMountApp(ctk.CTk):
                 data = json.load(f)
             sky_stars = data.get("stars", [])
             sky_dso = data.get("dso", [])
-            # Backfill "designation" (added in CATALOG_SCHEMA_VERSION 2) for a catalog file still
-            # on disk from before that change - every pre-2 entry has "messier" unconditionally
-            # (that schema was Messier-only), so this is a full, lossless fix, not a guess. Needed
-            # because this on-disk file gets loaded and rendered immediately, before
-            # sky_catalog.ensure_catalog_current()'s own schema-version check has a chance to
-            # trigger a real rebuild moments later (see _load_sky_catalog_async) - without this,
-            # that gap crashes the loader thread with a bare KeyError on old files.
-            for d in sky_dso:
-                if "designation" not in d:
-                    d["designation"] = d.get("messier") or ""
             const_line_segments = data.get("const_lines", [])
             # Indexed by Hipparcos number - constellation line segments only give HIP numbers,
             # so this is how their endpoints get resolved back to actual RA/DEC for drawing.
@@ -3423,7 +2921,7 @@ class EQMountApp(ctk.CTk):
                 "name": s["name"], "ra": s["ra"], "dec": s["dec"], "live": None, "search_blob": blob,
             })
         for d in sky_dso:
-            display = f"{d['designation']} ({d['name']})" if d.get("name") else d["designation"]
+            display = f"{d['messier']} ({d['name']})" if d.get("name") else d["messier"]
             blob = " ".join([display] + d.get("aliases", [])).lower()
             sky_search_index.append({
                 "name": display, "ra": d["ra"], "dec": d["dec"], "live": None, "search_blob": blob,
@@ -3453,7 +2951,7 @@ class EQMountApp(ctk.CTk):
         self._sky_stars_ra_values = state["sky_stars_ra_values"]
         self._sky_search_index = state["sky_search_index"]
         self._star_tiers = state["star_tiers"]
-        self._log(f"Sky catalog loaded: {len(self._sky_stars)} stars, {len(self._sky_dso)} DSOs, "
+        self._log(f"Sky catalog loaded: {len(self._sky_stars)} stars, {len(self._sky_dso)} Messier objects, "
                   f"{len(self._const_line_segments)} constellation line segments.")
         self._schedule_viz_redraw()
 
@@ -3472,15 +2970,6 @@ class EQMountApp(ctk.CTk):
             state = self._build_sky_catalog_state()
             if state is not None:
                 self.after(0, lambda: self._apply_sky_catalog_state(state))
-            # Logged BEFORE calling ensure_catalog_current() (which does the actual, potentially
-            # multi-minute network fetch) specifically so a rebuild isn't silent - previously the
-            # GUI just went quiet until it finished (or failed), which read as "nothing is
-            # happening" during what can be a couple of minutes re-downloading the star catalog.
-            if sky_catalog.needs_rebuild(sky_catalog.CATALOG_PATH):
-                self.after(0, lambda: self._log(
-                    "Sky catalog is outdated - downloading updated star/DSO data in the "
-                    "background (can take a couple minutes); current stars/objects still usable "
-                    "meanwhile, will refresh automatically once done."))
             try:
                 updated = sky_catalog.ensure_catalog_current(sky_catalog.CATALOG_PATH)
             except Exception as e:
@@ -3495,32 +2984,6 @@ class EQMountApp(ctk.CTk):
                     self.after(0, lambda: self._apply_sky_catalog_state(state2))
 
         threading.Thread(target=worker, daemon=True).start()
-
-    def _toggle_telescope_flipped(self):
-        """Requests the opposite of the last CONFIRMED flip state (see self._telescope_flipped) -
-        does NOT optimistically update the button; that only happens once the firmware confirms
-        via POS's "flipped" field or STATUS:FLIP_COMPLETE (see _on_telescope_flipped_confirmed),
-        since the RA axis physically has to rotate ~180° first."""
-        if not self.serial or not self.serial.ser or not self.serial.ser.is_open:
-            self._log("Not connected.")
-            return
-        requested = not self._telescope_flipped
-        self.serial.send_command(f"CMD,SET_FLIPPED,{1 if requested else 0}")
-        self._log(f"Requested telescope flip: {'ON' if requested else 'OFF'} (RA will rotate ~180° - watch for STATUS:FLIP_COMPLETE)")
-
-    def _on_telescope_flipped_confirmed(self, flipped: bool):
-        """Updates self._telescope_flipped and the toggle button to match a CONFIRMED state -
-        called from the POS parser's "flipped" field (so a reconnecting GUI picks up the real
-        state instead of assuming OFF) and from STATUS:FLIP_COMPLETE. A no-op if already showing
-        that state, so it's safe to call on every POS line without extra widget churn."""
-        if flipped == self._telescope_flipped:
-            return
-        self._telescope_flipped = flipped
-        if flipped:
-            self.flipped_toggle_btn.configure(text="Telescope Flipped: ON", fg_color="#8B4500")
-        else:
-            self.flipped_toggle_btn.configure(text="Telescope Flipped: OFF", fg_color="#444444")
-        self._schedule_viz_redraw()  # the meridian-limit shading only draws while not flipped
 
     def _toggle_iss_tracking(self):
         self._iss_enabled = not self._iss_enabled
@@ -3604,33 +3067,6 @@ class EQMountApp(ctk.CTk):
             self.const_toggle_btn.configure(text="Constellations: OFF", fg_color="#444444")
         self._schedule_viz_redraw()
 
-    def _toggle_min_dso_size_filter(self):
-        """See self._min_dso_size_filter_enabled's comment - purely a display filter, no network/
-        catalog reload needed, just a redraw."""
-        self._min_dso_size_filter_enabled = not self._min_dso_size_filter_enabled
-        if self._min_dso_size_filter_enabled:
-            self.min_size_toggle_btn.configure(text="Min Size: ON", fg_color="#006400")
-        else:
-            self.min_size_toggle_btn.configure(text="Min Size: OFF", fg_color="#444444")
-        self._schedule_viz_redraw()
-
-    def _on_min_dso_size_entry_commit(self, event=None):
-        """Applies whatever's typed in min_dso_size_entry - fires on Enter or on the entry losing
-        focus, same commit pattern as cam_rot_entry (_on_cam_rot_entry_commit). Only redraws (has
-        any visible effect) while the filter is actually ON, but the value is accepted/stored
-        either way so turning the filter on afterward uses it immediately without retyping."""
-        try:
-            px = float(self.min_dso_size_var.get())
-            if px < 0:
-                raise ValueError("negative size")
-            self._min_dso_size_px = px
-        except (ValueError, tk.TclError):
-            self._log("Invalid minimum DSO size value.")
-            self.min_dso_size_var.set(self._min_dso_size_px)
-            return
-        if self._min_dso_size_filter_enabled:
-            self._schedule_viz_redraw()
-
     def _solar_system_update_tick(self):
         """Fetches/refreshes Sun, Moon, and the naked-eye planets (Mercury-Saturn) together in one
         background call, since they all come from the same skyfield ephemeris (see
@@ -3653,16 +3089,12 @@ class EQMountApp(ctk.CTk):
         if self._solar_system_skyfield_missing:
             return
         lat, lon = self._get_lat_lon_from_input()
-        # Real time unless a Time Travel preview is active (see _get_effective_utc_now) - computed
-        # here on the main thread (cheap, no I/O) and passed into the worker rather than read
-        # inside it, so the whole background lookup reflects one single consistent instant.
-        at_time = self._get_effective_utc_now()
 
         def worker():
             try:
-                sun_ra, sun_dec, sun_diam = solar_system.get_sun_info(lat, lon, at_time=at_time)
-                moon_ra, moon_dec, moon_diam, illum, phase, waxing = solar_system.get_moon_info(lat, lon, at_time=at_time)
-                planets = solar_system.get_planets_info(lat, lon, at_time=at_time)
+                sun_ra, sun_dec, sun_diam = solar_system.get_sun_info(lat, lon)
+                moon_ra, moon_dec, moon_diam, illum, phase, waxing = solar_system.get_moon_info(lat, lon)
+                planets = solar_system.get_planets_info(lat, lon)
             except ImportError:
                 self.after(0, lambda: self._log(
                     "Sun/Moon/planet display needs the 'skyfield' package - pip install skyfield"))
@@ -4100,22 +3532,12 @@ class EQMountApp(ctk.CTk):
             # Ignore routine ones like TIME_SET, LOCATION_SET, READY, UPDATE_RATE etc.
             # so they don't override tracking/alignment status on the prominent bar.
             # (All still logged in the status text box.)
-            important = ["TRACKING", "ALIGNING", "RESETTING", "WAITING", "STOPPED", "SYNCED", "ERROR", "SLEW",
-                         "FLIPPING", "FLIP_COMPLETE", "AUTO_CALIBRATED"]
+            important = ["TRACKING", "ALIGNING", "RESETTING", "WAITING", "STOPPED", "SYNCED", "ERROR", "SLEW"]
             if any(kw in line for kw in important):
                 # Update big clear status at top
                 status_text = line.replace("STATUS:", "STATUS: ")
                 color = "#00ccff"
-                if "MERIDIAN_LIMIT" in line and "STOPPED" in line:
-                    # More actionable than the generic STOPPED text below - this specific stop
-                    # means the mount can't safely continue without a manual flip (see the .ino's
-                    # pastMeridianLimit()/stopForMeridianLimit()), not just "someone hit Stop".
-                    status_text = "STOPPED - MERIDIAN LIMIT REACHED - flip the telescope in the clamps, then press Telescope Flipped ON to resume"
-                    color = "#ff6666"
-                    self.tracking = False
-                    self._update_tracking_button()
-                    self._align_phase = "IDLE"
-                elif "TRACKING_STARTED" in line or "TRACKING" in line:
+                if "TRACKING_STARTED" in line or "TRACKING" in line:
                     color = "#00ff88"
                     self.tracking = True
                     self._update_tracking_button()
@@ -4128,13 +3550,6 @@ class EQMountApp(ctk.CTk):
                 elif "ALIGNING" in line or "RESETTING" in line or "WAITING" in line:
                     color = "#ffaa00"
                     self._align_phase = "ALIGNING"
-                elif "FLIPPING" in line:
-                    # RA is physically rotating ~180° - see setTelescopeFlipped() in the .ino.
-                    # self._telescope_flipped/the toggle button only update once POS/FLIP_COMPLETE
-                    # confirms the NEW state, not here (this is just "in progress").
-                    color = "#ffaa00"
-                elif "FLIP_COMPLETE" in line:
-                    color = "#00ccff"
                 elif "STOPPED" in line or "ERROR" in line:
                     color = "#ff6666"
                     self.tracking = False
@@ -4219,8 +3634,8 @@ class EQMountApp(ctk.CTk):
         # POS update
         elif line.startswith("POS,"):
             # Positional CSV (see the matching comment above sendPositionUpdate() in the .ino):
-            # POS,skyRA,skyDEC,targetRA,targetDEC,mountRA,mountDEC,mode,tracking,flipped
-            # mode is a single char: S=SIDEREAL, O=SOLAR, L=LUNAR. tracking and flipped are 0/1.
+            # POS,skyRA,skyDEC,targetRA,targetDEC,mountRA,mountDEC,mode,tracking
+            # mode is a single char: S=SIDEREAL, O=SOLAR, L=LUNAR. tracking is 0/1.
             # ERR_RA/ERR_DEC are no longer sent on the wire - reconstructed below as abs(sky-target)
             # to save bytes (message used to blow past the Mega's 64-byte Serial TX buffer).
             fields = line.split(",")
@@ -4280,15 +3695,6 @@ class EQMountApp(ctk.CTk):
                         self.tracking = True
                         self._update_tracking_button()
 
-            if len(fields) > 9:
-                # Lets a reconnecting GUI learn/restore the real flip state instead of always
-                # assuming OFF (which could otherwise cause it to send an erroneous un-flip) -
-                # see _on_telescope_flipped_confirmed.
-                try:
-                    self._on_telescope_flipped_confirmed(fields[9].strip() == "1")
-                except (ValueError, IndexError):
-                    pass
-
             self._update_mode_label()
             # _apply_viz_follow_mode() IS called here (cheap - just updates the two
             # _viz_center_ra/dec floats and clamps them, no drawing) even though the expensive
@@ -4312,7 +3718,6 @@ class EQMountApp(ctk.CTk):
                 self._update_visualization()
                 self._update_labels()  # updates sky + mount positions + error together
                 self._update_live_error()  # error updated together with position (anytime via POS)
-                self._update_meridian_warning()
 
         elif line.startswith("STATUS:SYNCED") or line.startswith("STATUS:TIME_SET"):
             self._log(line)
@@ -4435,60 +3840,6 @@ class EQMountApp(ctk.CTk):
             self._err_dec_history.popleft()
         self._update_tracking_stability()
 
-    def _is_target_risky(self, ra: float, dec: float) -> bool:
-        """Client-side ESTIMATE mirroring the firmware's pastMeridianLimit() (EQMountTracker.ino) -
-        used only to decide whether _confirm_risky_slew() should show a warning dialog before
-        sending; the firmware re-checks this independently and authoritatively regardless of what
-        this returns (a GOTO/START_TRACKING that's actually risky still gets refused there unless
-        the RISK_OK flag this dialog attaches is present). DEC within
-        MERIDIAN_LIMIT_DEC_ALLOWED_MIN/MAX_DEG is exempt regardless of Hour Angle - see that
-        constant's comment in the .ino."""
-        if MERIDIAN_LIMIT_DEC_ALLOWED_MIN_DEG <= dec <= MERIDIAN_LIMIT_DEC_ALLOWED_MAX_DEG:
-            return False
-        lst = self._get_current_lst_deg()
-        ha = (lst - ra + 180.0) % 360.0 - 180.0
-        return (ha <= 0.0) if self._telescope_flipped else (ha >= 0.0)
-
-    def _confirm_risky_slew(self, ra: float, dec: float) -> bool:
-        """Returns True if it's fine to send the GOTO/START_TRACKING - either the target isn't in
-        the meridian danger zone, or the user explicitly confirmed it is and chose to proceed
-        anyway. The actual command still needs ,RISK_OK:1 attached (see SerialHandler.send_goto/
-        send_start_tracking) for the firmware to actually honor an accepted risky slew rather than
-        refusing it - this dialog alone doesn't bypass anything firmware-side."""
-        if not self._is_target_risky(ra, dec):
-            return True
-        return messagebox.askyesno(
-            "Meridian Limit Warning",
-            f"Target RA={ra:.3f}° DEC={dec:.3f}° is past the meridian limit for the "
-            f"mount's current configuration - continuing risks the OTA colliding with the "
-            f"tripod/mount.\n\nProceed anyway?",
-            icon="warning",
-        )
-
-    def _update_meridian_warning(self):
-        """Client-side ESTIMATE of time remaining until the meridian limit stops tracking (see
-        MERIDIAN_LIMIT_MARGIN_DEG/pastMeridianLimit() in the .ino) - purely informational; the
-        firmware enforces the actual stop independently and authoritatively, so this can't itself
-        cause a missed/late stop, only a slightly-off countdown display. Uses target_ra (not
-        current_ra) to match exactly what the firmware's own check is based on. Hidden whenever
-        not relevant: not tracking, already flipped (this session's meridian risk is behind the
-        mount), or comfortably before the limit."""
-        if not self.tracking or self._telescope_flipped or self.mode_var.get() not in ("SIDEREAL", "SOLAR", "LUNAR"):
-            self.meridian_warning_label.configure(text="")
-            return
-        lst = self._get_current_lst_deg()
-        ha = (lst - self.target_ra + 180.0) % 360.0 - 180.0
-        time_to_limit_s = -ha / SIDEREAL_RATE_DEG_S
-        if time_to_limit_s > MERIDIAN_LIMIT_WARNING_S or time_to_limit_s < 0:
-            self.meridian_warning_label.configure(text="")
-            return
-        minutes, seconds = divmod(int(time_to_limit_s), 60)
-        urgent = time_to_limit_s <= MERIDIAN_LIMIT_URGENT_S
-        self.meridian_warning_label.configure(
-            text=f"⚠ MERIDIAN LIMIT IN {minutes}m {seconds:02d}s - flip may be needed",
-            text_color="#ff4444" if urgent else "#ffaa00",
-        )
-
     def _set_stability(self, text: str, color: str):
         """Update the stability badge AND recolor the telescope FOV circle AND the center
         reference circle in the sky viz to match, so the same STABLE/SETTLING/DRIFTING/ALIGNING
@@ -4559,15 +3910,6 @@ class EQMountApp(ctk.CTk):
         self.status_text.configure(state="normal")
         ts = time.strftime("%H:%M:%S")
         self.status_text.insert("end", f"[{ts}] {text}\n")
-        if self._log_file is not None:
-            # Full date+time here (unlike the on-screen box's bare HH:MM:SS) - this file
-            # persists and accumulates across days/relaunches, so the date matters here in a way
-            # it doesn't for the on-screen box (which is always "right now").
-            try:
-                self._log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {text}\n")
-                self._log_file.flush()
-            except OSError:
-                pass  # e.g. disk full - the on-screen box still has it, don't crash the GUI over this
         # Keep the log box from growing forever (important when Arduino debug dump is ON).
         # The line-count index() call is a Tk round-trip, so only check every few calls
         # instead of on every single line - a handful of extra lines before trimming is
@@ -4586,11 +3928,6 @@ class EQMountApp(ctk.CTk):
 
     def on_closing(self):
         self.serial.disconnect()
-        if self._log_file is not None:
-            try:
-                self._log_file.close()
-            except OSError:
-                pass
         self.destroy()
 
 
