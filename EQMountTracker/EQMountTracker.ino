@@ -882,7 +882,20 @@ float OBS_LON_DEG = -0.0005f;   // Positive east
 //            advances in lockstep with real elapsed time either way), but a CMD,SET_TIME jump of
 //            N hours now correctly drifts the RA target by N hours' worth of sidereal rate, and
 //            the mount slews to it, exactly as if that much real time had actually passed.
-#define FIRMWARE_VERSION "1.8.45"
+//   1.8.46 - Performance regression fix for 1.8.45's utcElapsedSeconds(): it recomputed
+//            daysSinceJ2000() (two floor() calls plus several float multiplies) from scratch on
+//            EVERY call, and it's called from updateTrackingModes() on every single loop()
+//            iteration while tracking is active - not just during a Time Travel preview, ALL
+//            continuous tracking (ordinary SIDEREAL/SOLAR/LUNAR included). Reported as "position
+//            updates awfully slow, even for the actively tracked object" - real added per-loop
+//            cost on an 8-bit AVR with no hardware FPU. Fix: currentDaysJ2000/cal_days_j2000 now
+//            maintain the same daysSinceJ2000() value as a running double, paying the expensive
+//            floor()-based computation only at the rare events that actually need it (a fresh
+//            SET_TIME, or a new calibration) - updateTimeFromMillis() advances currentDaysJ2000
+//            every loop() tick with a plain += (no floor()), same cheap pattern it already uses
+//            for currentUtcTime.second. utcElapsedSeconds() is now just one subtraction. No
+//            behavior change - same drift values, just without the redundant recompute.
+#define FIRMWARE_VERSION "1.8.46"
 
 // Sidereal rate (deg/sec on sky for RA axis). Approx 15.041 arcsec/s.
 const float SIDEREAL_RATE_DEG_S = 0.004178f;
@@ -1212,18 +1225,26 @@ double daysSinceJ2000(int year, int month, int day, int hour, int minute, double
   return d0 + dayFraction;  // small + small - no precision collapse, unlike julianDateFull()'s huge + small
 }
 
-// Elapsed time (seconds) between two UTC clock readings, via the continuously-increasing
-// daysSinceJ2000() rather than diffing millis(). This is what lets a CMD,SET_TIME clock jump
-// (tracker_gui.py's Time Travel feature - see its comment) actually translate into RA tracking
-// drift: millis() only ever advances with real elapsed hardware time and has no way to see a
-// SET_TIME jump, but currentUtcTime does (setTimeFromValues() sets it directly), so basing drift
-// on the UTC clock's own elapsed time instead means the mount slews to reflect a simulated
-// future/past time exactly like it would after that much real time actually passed. See
+// Elapsed time (seconds) since cal_* was established, via currentDaysJ2000/cal_days_j2000 -
+// continuously-increasing day counts, NOT a millis() diff. This is what lets a CMD,SET_TIME clock
+// jump (tracker_gui.py's Time Travel feature - see its comment) actually translate into RA
+// tracking drift: millis() only ever advances with real elapsed hardware time and has no way to
+// see a SET_TIME jump, but currentUtcTime (and currentDaysJ2000, its running day-count) does. See
 // computeSkyRA() and updateTrackingModes() for where this replaces the old millis()-based dt.
-double utcElapsedSeconds(const STTime &from, const STTime &to) {
-  double d1 = daysSinceJ2000(from.year, from.month, from.day, from.hour, from.minute, from.second);
-  double d2 = daysSinceJ2000(to.year, to.month, to.day, to.hour, to.minute, to.second);
-  return (d2 - d1) * 86400.0;
+//
+// Deliberately just a subtraction, NOT a daysSinceJ2000() recompute from STTime fields (that was
+// the original 1.8.45 version, and it was a real, measured regression: this runs on EVERY
+// tracking tick - updateTrackingModes(), every loop() iteration while tracking is active,
+// including ordinary continuous SIDEREAL/SOLAR/LUNAR tracking, not just Time Travel - and
+// daysSinceJ2000() has two floor() calls plus several float multiplies, genuinely expensive on
+// an 8-bit AVR with no hardware FPU. Reported as "position updates awfully slow, even for the
+// actively tracked object" - exactly the symptom of adding real per-loop-iteration cost to this
+// hot path. currentDaysJ2000/cal_days_j2000 do the expensive part (daysSinceJ2000() itself) only
+// at the rare events that actually need it (a fresh SET_TIME, or a new calibration) and are kept
+// current the cheap way (a running += for currentDaysJ2000 in updateTimeFromMillis(), literally
+// no cost at all for cal_days_j2000 between calibrations) - see their own comments.
+double utcElapsedSeconds() {
+  return (currentDaysJ2000 - cal_days_j2000) * 86400.0;
 }
 
 // Local Sidereal Time, in degrees (0-360) - standard GMST + observer longitude. Extracted out of
@@ -1362,13 +1383,25 @@ unsigned long cal_time_ms = 0;
 // UTC clock reading at the moment cal_* was established - the RA drift calculation now uses this
 // (via utcElapsedSeconds()) instead of cal_time_ms/millis(), so it follows CMD,SET_TIME jumps.
 // cal_time_ms itself is kept alongside, still used for its own debug/report fields. Set wherever
-// cal_time_ms is set - see autoCalibrateFromHome() and the CMD,SYNC handler.
+// cal_time_ms is set - see autoCalibrateFromHome() and the CMD,SYNC handler. cal_utc_time itself
+// is no longer read by the drift calculation (see cal_days_j2000 below) - kept only because
+// dumpDebugState()/other diagnostics may still want the human-readable Y/M/D/h/m/s.
 STTime cal_utc_time;
-// Forward declaration - the actual definition (and updateTimeFromMillis()/setTimeFromValues(),
-// which keep it current) lives further down with the rest of the time-tracking code, but
-// computeSkyRA() and updateTrackingModes(), both defined before that point, need to reference it
-// for the drift calculation.
+// daysSinceJ2000() equivalent of cal_utc_time, maintained as a plain double alongside it - see
+// currentDaysJ2000's comment for why this exists (avoiding a daysSinceJ2000() recompute, with
+// its floor() calls, on every tracking tick). Set at the exact same points as cal_utc_time.
+double cal_days_j2000 = 0.0;
+// Forward declarations - the actual definitions (and updateTimeFromMillis()/setTimeFromValues(),
+// which keep them current) live further down with the rest of the time-tracking code, but
+// computeSkyRA() and updateTrackingModes(), both defined before that point, need to reference
+// them for the drift calculation.
 extern STTime currentUtcTime;
+// daysSinceJ2000() equivalent of currentUtcTime, updated incrementally in updateTimeFromMillis()
+// (just += elapsed/86400000.0, no floor()) and set exactly once via daysSinceJ2000() itself in
+// setTimeFromValues() (a rare event - connect, the ~60s periodic resync, or a Time Travel
+// preview) - see utcElapsedSeconds()'s comment for why this exists instead of recomputing
+// daysSinceJ2000() from currentUtcTime's Y/M/D/h/m/s fields on every call.
+extern double currentDaysJ2000;
 
 // True once a REAL calibration event (CMD,SYNC, CMD,SYNC_OFFSET, or the mount actually being
 // commanded to move away from home) has happened. Distinct from isCalibrated - isCalibrated just
@@ -1438,6 +1471,7 @@ void autoCalibrateFromHome() {
   if (cal_sky_ra < 0.0f) cal_sky_ra += 360.0f;
   cal_time_ms = millis();
   cal_utc_time = t;
+  cal_days_j2000 = currentDaysJ2000;  // cheap - see its own comment; t IS currentUtcTime here
   isCalibrated = true;
   // The default target should be wherever the telescope is actually pointing at home, not an
   // arbitrary 0/0 that has nothing to do with this mount-relative calibration scheme - see the
@@ -1476,7 +1510,7 @@ float computeSkyRA(float mount_angle, unsigned long t_ms) {
   (void)t_ms;
   if (!isCalibrated) return mount_angle;
   float delta_m = mount_angle - cal_mount_ra;
-  float dt = (float)utcElapsedSeconds(cal_utc_time, currentUtcTime);
+  float dt = (float)utcElapsedSeconds();
   float drift = SIDEREAL_RATE_DEG_S * dt;
   // + drift, not -: with the mount held physically STILL (delta_m=0), the real sky RA under the
   // crosshair INCREASES over time (a stationary equatorial RA axis holds constant Hour Angle,
@@ -1649,6 +1683,11 @@ float slewTargetRA = 0.0;
 float slewTargetDEC = 0.0;
 
 STTime currentUtcTime;
+// daysSinceJ2000() equivalent of currentUtcTime - see the extern declaration's comment (near
+// cal_days_j2000) for why this exists. Set exactly (via daysSinceJ2000() itself) in
+// setTimeFromValues(); advanced cheaply (a plain += , no daysSinceJ2000() call) in
+// updateTimeFromMillis() every loop() tick, mirroring how currentUtcTime.second itself advances.
+double currentDaysJ2000 = 0.0;
 unsigned long lastMillis = 0;
 unsigned long alignStartTime = 0;
 
@@ -1737,6 +1776,9 @@ void setTimeFromValues(int y, int m, int d, int h, int min, int s) {
   currentUtcTime.hour   = h;
   currentUtcTime.minute = min;
   currentUtcTime.second = s;
+  // The one place currentDaysJ2000 actually pays for daysSinceJ2000()'s floor()s - a rare event
+  // (connect, ~60s periodic resync, or a Time Travel preview), not the per-loop-tick hot path.
+  currentDaysJ2000 = daysSinceJ2000(y, m, d, h, min, s);
   timeIsValid = true;
   lastMillis = millis();
 }
@@ -1746,6 +1788,9 @@ void updateTimeFromMillis() {
   unsigned long now = millis();
   unsigned long elapsed = now - lastMillis;
   lastMillis = now;
+
+  // Cheap running update - no floor(), no daysSinceJ2000() call - see currentDaysJ2000's comment.
+  currentDaysJ2000 += elapsed / 86400000.0;  // ms -> days
 
   // Advance time (simple, no DST/leap handling needed for astro approx)
   currentUtcTime.second += elapsed / 1000.0;
@@ -2089,7 +2134,7 @@ void dumpDebugState(const char* trigger) {
   float sDEC = isCalibrated ? computeSkyDEC(mDEC, now) : mDEC;
   // UTC-clock-based, not millis()-based - matches what computeSkyRA()/updateTrackingModes()
   // actually use now, so this debug field reflects real tracking behavior (see their comments).
-  float dt = isCalibrated ? (float)utcElapsedSeconds(cal_utc_time, currentUtcTime) : 0.0f;
+  float dt = isCalibrated ? (float)utcElapsedSeconds() : 0.0f;
   float drift = isCalibrated ? (SIDEREAL_RATE_DEG_S * dt) : 0.0f;
 
   Serial.print("DEBUG:STATE,trigger:");
@@ -2261,6 +2306,7 @@ void parseAndExecuteCommand(char* cmd) {
     cal_sky_dec = dec;
     cal_time_ms = millis();
     cal_utc_time = currentUtcTime;
+    cal_days_j2000 = currentDaysJ2000;  // cheap - see its own comment
     isCalibrated = true;
     calibrationLocked = true;  // a real SYNC - never let autoCalibrateFromHome() overwrite this
 
@@ -2318,8 +2364,10 @@ void parseAndExecuteCommand(char* cmd) {
     // instant for correct future drift.
     unsigned long saved_cal_time = cal_time_ms;
     STTime saved_cal_utc_time = cal_utc_time;
+    double saved_cal_days_j2000 = cal_days_j2000;
     cal_time_ms = millis();
     cal_utc_time = currentUtcTime;
+    cal_days_j2000 = currentDaysJ2000;  // cheap - see its own comment
 
     // Extra debug: what sky value is the immediate POS going to contain?
     float dbg_snap_ra = computeSkyRA(axisRA.getCurrentAngle(), millis());
@@ -2332,6 +2380,7 @@ void parseAndExecuteCommand(char* cmd) {
     sendPositionUpdateNow();
     cal_time_ms = saved_cal_time;
     cal_utc_time = saved_cal_utc_time;
+    cal_days_j2000 = saved_cal_days_j2000;
 
     if (debugVerbose) {
       dumpDebugState("SYNC_SNAP");
@@ -2900,7 +2949,7 @@ void resumeTrackingFromAlign() {
     // UTC-clock-based, not millis()-based - see utcElapsedSeconds()'s comment; same formula as
     // updateTrackingModes(), just priming the first target before that starts ticking, so it
     // needs the same fix to stay consistent with it.
-    float elapsed = (float)utcElapsedSeconds(cal_utc_time, currentUtcTime);
+    float elapsed = (float)utcElapsedSeconds();
     float drift = SIDEREAL_RATE_DEG_S * elapsed;
     // Minus, not plus - see computeSkyRA's comment on the drift sign fix (same formula as
     // updateTrackingModes(), just priming the first target before that starts ticking).
@@ -3085,7 +3134,7 @@ void updateTrackingModes() {
   // (tracker_gui.py's Time Travel feature) by slewing to where the target now needs to be, the
   // same way it would after that much real time had actually passed, instead of requiring real
   // wall-clock time to elapse.
-  float elapsed = (float)utcElapsedSeconds(cal_utc_time, currentUtcTime);
+  float elapsed = (float)utcElapsedSeconds();
   float drift = SIDEREAL_RATE_DEG_S * elapsed;
   // Minus, not plus: this is the core ongoing tracking correction, and its sign was backwards -
   // see computeSkyRA's comment for the full derivation. A stationary RA axis holds constant Hour
