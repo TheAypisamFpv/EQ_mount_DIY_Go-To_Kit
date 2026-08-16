@@ -34,7 +34,7 @@ import json
 import os
 import bisect
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from sky_data import sky_catalog, iss_tracker, solar_system
 
@@ -227,6 +227,13 @@ class SerialHandler:
         self.thread: Optional[threading.Thread] = None
         self.port = ""
         self.last_error = ""
+        # Time Travel: when non-zero, send_time() sends THIS simulated instant to the Arduino
+        # instead of the real current time - the Arduino's own clock (and everything it drives:
+        # Sun/Moon target computation, tracking) then genuinely believes it's that time, so
+        # SOLAR/LUNAR tracking (and the GUI's own sky viz, which uses the same offset - see
+        # EQMountApp._get_effective_utc_now) actually points where the target is at the chosen
+        # time. Set/cleared by EQMountApp's Time Travel controls; zero (real time) by default.
+        self.simulated_utc_offset = timedelta(0)
 
     def list_ports(self):
         ports = serial.tools.list_ports.comports()
@@ -383,7 +390,10 @@ class SerialHandler:
             return False
 
     def send_time(self):
-        now = datetime.now(timezone.utc)
+        # + simulated_utc_offset (zero unless Time Travel is active) - see its comment. The
+        # Arduino has no separate notion of "preview time" vs "real time": whatever gets sent
+        # here simply becomes its clock.
+        now = datetime.now(timezone.utc) + self.simulated_utc_offset
         cmd = (f"CMD,SET_TIME,Y:{now.year},M:{now.month},D:{now.day},"
                f"h:{now.hour},min:{now.minute},s:{now.second}")
         self.send_command(cmd)
@@ -504,6 +514,16 @@ class EQMountApp(ctk.CTk):
         self.system_state = "DISCONNECTED"
         self._last_sent_location = None  # Track last sent location to avoid duplicates
         self._connection_timeout_id = None  # For tracking connection timeout
+
+        # Time Travel: preview where the Sun/Moon/planets/stars/DSOs will be at a chosen date/
+        # time. Deliberately simple - the Arduino has no separate "preview" concept, so this
+        # offset is sent straight to it as the real clock (SerialHandler.simulated_utc_offset,
+        # applied in send_time()): both sides simply believe it's that time and act accordingly
+        # (SOLAR/LUNAR continuous target computation, home calibration, etc.), the same way they
+        # would if that much real time had actually passed. This also means Solar/Lunar tracking
+        # WILL physically slew the mount while a preview is active - see the Time Travel controls
+        # in _build_ui and _apply_time_travel/_reset_time_travel.
+        self._time_travel_offset = timedelta(0)
 
         # Sky viz zoom/pan state. zoom=1.0 shows the full sky (RA 0-360, DEC -90..+90);
         # center is the (RA, DEC) at the middle of the canvas. See _get_viz_view_bounds().
@@ -631,6 +651,7 @@ class EQMountApp(ctk.CTk):
         self._start_time_sync_timer()
         self._start_ground_update_timer()
         self._start_viz_follow_timer()
+        self._start_time_travel_label_timer()
         # Sun/Moon/planets are always on (see the comment near their state above) - kicked off
         # once here, same as the sky catalog/ground timer, rather than needing a toggle press.
         self._solar_system_update_tick()
@@ -719,6 +740,30 @@ class EQMountApp(ctk.CTk):
                     self._set_location_label(f"Loc: {g} (loaded)")
             except Exception:
                 pass
+
+        # Time Travel: preview Sun/Moon/planet/star/DSO positions at a chosen date/time - sent
+        # straight to the Arduino as its real clock (see _time_travel_offset's comment).
+        time_travel_bar = ctk.CTkFrame(self, corner_radius=6, fg_color="transparent")
+        time_travel_bar.pack(fill="x", padx=12, pady=(0, 4))
+
+        ctk.CTkLabel(time_travel_bar, text="\U0001F550 Time Travel:", font=ctk.CTkFont(size=12, weight="bold")).pack(side="left", padx=(10, 6))
+
+        self.time_travel_date_var = ctk.StringVar()
+        self.time_travel_time_var = ctk.StringVar()
+        self._reset_time_travel_inputs_to_now()
+
+        self.time_travel_date_entry = ctk.CTkEntry(time_travel_bar, textvariable=self.time_travel_date_var, width=90, placeholder_text="YYYY-MM-DD")
+        self.time_travel_date_entry.pack(side="left", padx=2)
+        self.time_travel_time_entry = ctk.CTkEntry(time_travel_bar, textvariable=self.time_travel_time_var, width=75, placeholder_text="HH:MM:SS")
+        self.time_travel_time_entry.pack(side="left", padx=2)
+        self.time_travel_date_entry.bind("<Return>", lambda e: self._apply_time_travel())
+        self.time_travel_time_entry.bind("<Return>", lambda e: self._apply_time_travel())
+
+        ctk.CTkButton(time_travel_bar, text="Preview", width=70, command=self._apply_time_travel).pack(side="left", padx=4)
+        ctk.CTkButton(time_travel_bar, text="Now (Real Time)", width=120, fg_color="#555555", command=self._reset_time_travel).pack(side="left", padx=4)
+
+        self.time_travel_label = ctk.CTkLabel(time_travel_bar, text="Showing: real-time sky", font=ctk.CTkFont(size=11), text_color="#8888aa")
+        self.time_travel_label.pack(side="left", padx=10)
 
         # Prominent system status at the very top (clear state)
         status_bar = ctk.CTkFrame(self, corner_radius=6, fg_color="#1a1a2e")
@@ -1159,10 +1204,98 @@ class EQMountApp(ctk.CTk):
 
         # Make sure initial time will be sent on connect (plus periodic)
 
+    def _get_effective_utc_now(self) -> datetime:
+        """The single source of "now" for all GUI-side sky math (LST, Sun/Moon/planet positions):
+        real UTC time, shifted by _time_travel_offset when Time Travel is active. This is
+        deliberately the exact same offset sent to the Arduino as its real clock (see
+        SerialHandler.send_time()), so the GUI display and the physical mount always agree on
+        what time it currently "is" and therefore where things are."""
+        return datetime.now(timezone.utc) + self._time_travel_offset
+
+    def _reset_time_travel_inputs_to_now(self):
+        """Prefills the Time Travel date/time entries with the current local wall-clock time."""
+        local_now = datetime.now().astimezone()
+        self.time_travel_date_var.set(local_now.strftime("%Y-%m-%d"))
+        self.time_travel_time_var.set(local_now.strftime("%H:%M:%S"))
+
+    def _apply_time_travel(self):
+        """Applies the date/time typed into the Time Travel fields (interpreted in the computer's
+        own local timezone) as the simulated "now": sent straight to the Arduino as its real clock
+        (SerialHandler.simulated_utc_offset, applied next time send_time() fires) AND used for the
+        GUI's own sky math (_get_effective_utc_now) - both sides simply believe it's that time, so
+        SOLAR/LUNAR tracking will actually slew the mount to match, the same as if that much real
+        time had passed. Stored as an offset from real time so it keeps ticking forward at 1x from
+        whatever moment was requested, rather than freezing there."""
+        date_str = self.time_travel_date_var.get().strip()
+        time_str = self.time_travel_time_var.get().strip() or "00:00:00"
+        if time_str.count(":") == 1:
+            time_str += ":00"
+        try:
+            naive = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            self._log(f"Time Travel: invalid date/time - use YYYY-MM-DD and HH:MM:SS (got '{date_str} {time_str}')")
+            return
+        local_tz = datetime.now().astimezone().tzinfo
+        target_utc = naive.replace(tzinfo=local_tz).astimezone(timezone.utc)
+        self._time_travel_offset = target_utc - datetime.now(timezone.utc)
+        if hasattr(self, 'serial') and self.serial:
+            self.serial.simulated_utc_offset = self._time_travel_offset
+            self.serial.send_time_if_connected()  # push it to the Arduino right away, not on the next 60s resync
+        self._log(f"Time Travel: previewing sky as of {naive.strftime('%Y-%m-%d %H:%M:%S')} (local) - "
+                   f"Arduino clock set to match")
+        self._update_time_travel_label()
+        self._force_solar_system_refresh()
+        self._schedule_viz_redraw()
+
+    def _reset_time_travel(self):
+        """Cancels any active preview and goes back to real time, on both the GUI and the Arduino."""
+        self._time_travel_offset = timedelta(0)
+        self._reset_time_travel_inputs_to_now()
+        if hasattr(self, 'serial') and self.serial:
+            self.serial.simulated_utc_offset = timedelta(0)
+            self.serial.send_time_if_connected()
+        self._log("Time Travel: back to real time (Arduino clock reset to match)")
+        self._update_time_travel_label()
+        self._force_solar_system_refresh()
+        self._schedule_viz_redraw()
+
+    def _update_time_travel_label(self):
+        if not hasattr(self, 'time_travel_label') or not self.time_travel_label.winfo_exists():
+            return
+        if self._time_travel_offset == timedelta(0):
+            self.time_travel_label.configure(text="Showing: real-time sky", text_color="#8888aa")
+        else:
+            eff_local = self._get_effective_utc_now().astimezone()
+            self.time_travel_label.configure(
+                text=f"Showing sky as of: {eff_local.strftime('%Y-%m-%d %H:%M:%S')} (local)",
+                text_color="#ffdd66")
+
+    def _start_time_travel_label_timer(self):
+        """Keeps the Time Travel status label ticking forward once a second while a preview is
+        active - separate from the 10ms _poll_queue loop (POLL_INTERVAL_MS) since a text label
+        with 1-second resolution doesn't need updating anywhere near that often."""
+        def tick():
+            self._update_time_travel_label()
+            self.after(1000, tick)
+        tick()
+
+    def _force_solar_system_refresh(self):
+        """Re-fetches Sun/Moon/planet positions right away instead of waiting for the next
+        scheduled _solar_system_update_tick (up to 2s away) - used after a Time Travel
+        preview/reset so the jump feels immediate. Must cancel the pending scheduled call first:
+        _solar_system_update_tick reschedules itself via self.after(2000, ...), so calling it
+        again without cancelling would leave two independent recurring loops running forever."""
+        if getattr(self, '_solar_system_update_after_id', None) is not None:
+            try:
+                self.after_cancel(self._solar_system_update_after_id)
+            except Exception:
+                pass
+        self._solar_system_update_tick()
+
     def _get_current_lst_deg(self):
         """Approximate Local Sidereal Time in degrees using system time + longitude."""
         _, lon = self._get_lat_lon_from_input()
-        utc = datetime.now(timezone.utc)
+        utc = self._get_effective_utc_now()
         # Julian date (simplified)
         year, month, day = utc.year, utc.month, utc.day
         hour = utc.hour + utc.minute / 60.0 + utc.second / 3600.0
@@ -3089,12 +3222,14 @@ class EQMountApp(ctk.CTk):
         if self._solar_system_skyfield_missing:
             return
         lat, lon = self._get_lat_lon_from_input()
+        # Real time unless a Time Travel preview is active - see _get_effective_utc_now.
+        at_time = self._get_effective_utc_now()
 
         def worker():
             try:
-                sun_ra, sun_dec, sun_diam = solar_system.get_sun_info(lat, lon)
-                moon_ra, moon_dec, moon_diam, illum, phase, waxing = solar_system.get_moon_info(lat, lon)
-                planets = solar_system.get_planets_info(lat, lon)
+                sun_ra, sun_dec, sun_diam = solar_system.get_sun_info(lat, lon, at_time=at_time)
+                moon_ra, moon_dec, moon_diam, illum, phase, waxing = solar_system.get_moon_info(lat, lon, at_time=at_time)
+                planets = solar_system.get_planets_info(lat, lon, at_time=at_time)
             except ImportError:
                 self.after(0, lambda: self._log(
                     "Sun/Moon/planet display needs the 'skyfield' package - pip install skyfield"))
