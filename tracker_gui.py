@@ -59,7 +59,21 @@ from sky_data import sky_catalog, iss_tracker, solar_system
 #           stars, their RA isn't a fixed J2000 value (it depends on the current LST), so
 #           they're resolved at sync time in _sync_position() using the same Hour Angle
 #           convention as autoCalibrateFromHome() in the .ino (East=LST+90, West=LST-90).
-GUI_VERSION = "1.0.2"
+#   1.0.3 - Two real bugs found testing Time Travel against a known solar eclipse:
+#           (1) Time Travel's date/time fields were interpreted in the computer's LOCAL
+#           timezone before converting to UTC - but published astronomical event times (like
+#           eclipse totality) are always UTC, so typing the real published time in directly got
+#           silently shifted by the local UTC offset (e.g. 2h for CEST). Now interpreted as UTC
+#           directly, no conversion, fields/labels relabeled to say so explicitly.
+#           (2) _schedule_viz_redraw() (the Sun/Moon/DSO marker refresh path) used
+#           self.after_idle(), which only runs once Tk's event queue is genuinely empty - while
+#           actively tracking, continuous POS traffic (~50-100Hz) can keep the queue busy long
+#           enough to starve it indefinitely, so the Sun/Moon dot visibly froze during tracking
+#           even though the underlying position (_solar_system_update_tick, every 2s) was
+#           updating correctly the whole time - only "caught up" once tracking stopped and the
+#           queue finally idled. Switched to self.after(0, ...), which isn't idle-gated.
+#           _on_canvas_resize's after_idle had the same latent risk, fixed the same way.
+GUI_VERSION = "1.0.3"
 
 BAUD_RATE = 250000
 # GUI poll rate for the serial queue. Fast enough to comfortably keep up with the Arduino's 50Hz
@@ -884,7 +898,7 @@ class EQMountApp(ctk.CTk):
         time_travel_bar = ctk.CTkFrame(self, corner_radius=6, fg_color="transparent")
         time_travel_bar.pack(fill="x", padx=12, pady=(0, 4))
 
-        ctk.CTkLabel(time_travel_bar, text="\U0001F550 Time Travel:", font=ctk.CTkFont(size=12, weight="bold")).pack(side="left", padx=(10, 6))
+        ctk.CTkLabel(time_travel_bar, text="\U0001F550 Time Travel (UTC):", font=ctk.CTkFont(size=12, weight="bold")).pack(side="left", padx=(10, 6))
 
         self.time_travel_date_var = ctk.StringVar()
         self.time_travel_time_var = ctk.StringVar()
@@ -892,7 +906,7 @@ class EQMountApp(ctk.CTk):
 
         self.time_travel_date_entry = ctk.CTkEntry(time_travel_bar, textvariable=self.time_travel_date_var, width=90, placeholder_text="YYYY-MM-DD")
         self.time_travel_date_entry.pack(side="left", padx=2)
-        self.time_travel_time_entry = ctk.CTkEntry(time_travel_bar, textvariable=self.time_travel_time_var, width=75, placeholder_text="HH:MM:SS")
+        self.time_travel_time_entry = ctk.CTkEntry(time_travel_bar, textvariable=self.time_travel_time_var, width=75, placeholder_text="HH:MM:SS UTC")
         self.time_travel_time_entry.pack(side="left", padx=2)
         # Enter in either field applies it immediately, same commit pattern as other entries
         # in this GUI (e.g. cam_rot_entry) rather than requiring a mouse click on Preview.
@@ -1404,22 +1418,31 @@ class EQMountApp(ctk.CTk):
         return datetime.now(timezone.utc) + self._time_travel_offset
 
     def _reset_time_travel_inputs_to_now(self):
-        """Prefills the Time Travel date/time entries with the current local wall-clock time."""
-        local_now = datetime.now().astimezone()
-        self.time_travel_date_var.set(local_now.strftime("%Y-%m-%d"))
-        self.time_travel_time_var.set(local_now.strftime("%H:%M:%S"))
+        """Prefills the Time Travel date/time entries with the current UTC time - see
+        _apply_time_travel's comment for why UTC, not local wall-clock."""
+        utc_now = datetime.now(timezone.utc)
+        self.time_travel_date_var.set(utc_now.strftime("%Y-%m-%d"))
+        self.time_travel_time_var.set(utc_now.strftime("%H:%M:%S"))
 
     def _apply_time_travel(self):
-        """Applies the date/time typed into the Time Travel fields (interpreted in the computer's
-        own local timezone, same as the rest of this GUI/OS) by updating _time_travel_offset - the
-        one single piece of state _get_effective_utc_now reads. Nothing else needs telling: every
-        consumer (LST/stars/DSOs, Sun/Moon/planets, ISS, and the Arduino's own clock via
-        SerialHandler.get_time_fn) calls that same function fresh each time it needs "now", so
-        this one assignment is the entire toggle. Stored as an offset from real time (not a frozen
-        instant) so the preview keeps ticking forward at 1x from whatever moment was requested,
-        counting up from the instant it's set, exactly like the real clock does. The Arduino gets
-        an immediate push below rather than waiting for the periodic resync, so its physical
-        pointing/tracking picks up the new time right away too."""
+        """Applies the date/time typed into the Time Travel fields - interpreted as UTC directly,
+        NOT the computer's local timezone - by updating _time_travel_offset, the one single piece
+        of state _get_effective_utc_now reads. UTC, not local: this is the convention every
+        astronomical event (eclipses, transits, occultations - the whole point of a "type in a
+        known moment and check the sky" preview) is published in, and it's what the rest of this
+        app already uses (CMD,SET_TIME is UTC) - converting a typed-in UTC time through the
+        computer's local timezone first (the pre-1.0.3 behavior) silently shifted it by however
+        many hours local time differs from UTC, which is exactly why a solar eclipse typed in as
+        its real published (UTC) totality time looked close but not exact: the actual instant
+        previewed was off by the local UTC offset, e.g. 2 hours for CEST.
+        Nothing else needs telling once _time_travel_offset is set: every consumer (LST/stars/
+        DSOs, Sun/Moon/planets, ISS, and the Arduino's own clock via SerialHandler.get_time_fn)
+        calls that same function fresh each time it needs "now", so this one assignment is the
+        entire toggle. Stored as an offset from real time (not a frozen instant) so the preview
+        keeps ticking forward at 1x from whatever moment was requested, counting up from the
+        instant it's set, exactly like the real clock does. The Arduino gets an immediate push
+        below rather than waiting for the periodic resync, so its physical pointing/tracking picks
+        up the new time right away too."""
         date_str = self.time_travel_date_var.get().strip()
         time_str = self.time_travel_time_var.get().strip() or "00:00:00"
         if time_str.count(":") == 1:
@@ -1427,13 +1450,12 @@ class EQMountApp(ctk.CTk):
         try:
             naive = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S")
         except ValueError:
-            self._log(f"Time Travel: invalid date/time - use YYYY-MM-DD and HH:MM:SS (got '{date_str} {time_str}')")
+            self._log(f"Time Travel: invalid date/time - use YYYY-MM-DD and HH:MM:SS UTC (got '{date_str} {time_str}')")
             return
-        local_tz = datetime.now().astimezone().tzinfo
-        target_utc = naive.replace(tzinfo=local_tz).astimezone(timezone.utc)
+        target_utc = naive.replace(tzinfo=timezone.utc)
         self._time_travel_offset = target_utc - datetime.now(timezone.utc)
         pushed_to_arduino = self.serial.send_time_if_connected()
-        self._log(f"Time Travel: previewing sky as of {naive.strftime('%Y-%m-%d %H:%M:%S')} (local)"
+        self._log(f"Time Travel: previewing sky as of {naive.strftime('%Y-%m-%d %H:%M:%S')} UTC"
                    + (" - Arduino clock synced to it too" if pushed_to_arduino else
                       " - Arduino not connected, will sync on connect"))
         self._update_time_travel_label()
@@ -1458,11 +1480,11 @@ class EQMountApp(ctk.CTk):
         if self._time_travel_offset == timedelta(0):
             self.time_travel_label.configure(text="Showing: real-time sky", text_color="#8888aa")
         else:
-            eff_local = self._get_effective_utc_now().astimezone()
+            eff_utc = self._get_effective_utc_now()
             connected = bool(self.serial and self.serial.ser and self.serial.ser.is_open)
             suffix = "" if connected else " - Arduino not connected"
             self.time_travel_label.configure(
-                text=f"⚠ TIME TRAVEL: {eff_local.strftime('%Y-%m-%d %H:%M:%S')} (local){suffix}",
+                text=f"⚠ TIME TRAVEL: {eff_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC{suffix}",
                 text_color="#ff9944")
 
     def _start_time_travel_label_timer(self):
@@ -1615,17 +1637,28 @@ class EQMountApp(ctk.CTk):
             return "#3a3a4d", 1.0   # minor
 
     def _schedule_viz_redraw(self):
-        """Coalesce rapid-fire zoom/pan events into at most one redraw per idle cycle, instead
+        """Coalesce rapid-fire zoom/pan events into at most one redraw per tick, instead
         of a full redraw (delete("all") + recreate every grid line/label/horizon point) for
         every single wheel tick or mouse-motion event. A trackpad scroll or a drag gesture can
         fire many events per second - without this, each one triggered its own synchronous
         redraw, and since panning around is exactly what you do once zoomed in, that stacked up
         fast enough to feel like ~4fps at high zoom (the redraw work itself wasn't slower at
-        high zoom, there were just far more of them queued up back to back)."""
+        high zoom, there were just far more of them queued up back to back).
+        self.after(0, ...), NOT self.after_idle(...): Tk's "idle" callbacks only run once the
+        event queue is genuinely empty, and while actively tracking, incoming POS lines arrive
+        continuously (up to ~50-100Hz) - the queue can go long stretches without ever reaching
+        that idle state, silently starving after_idle for as long as tracking keeps the queue
+        busy. Reported as "the Sun/Moon dot froze while actively tracking, then jumped to the
+        correct position the moment tracking stopped" - the underlying data (_solar_system_
+        update_tick's background refresh) WAS updating every 2s the whole time, only the redraw
+        that would show it was stuck waiting for an idle moment that heavy POS traffic kept
+        postponing. self.after(0, ...) queues a normal (not idle-gated) event that runs on the
+        next event-loop pass regardless of how busy the queue is - same coalescing behavior
+        (still at most one pending redraw via _viz_redraw_pending), just not starvable."""
         if self._viz_redraw_pending:
             return
         self._viz_redraw_pending = True
-        self.after_idle(self._flush_viz_redraw)
+        self.after(0, self._flush_viz_redraw)
 
     def _flush_viz_redraw(self):
         self._viz_redraw_pending = False
@@ -2582,8 +2615,10 @@ class EQMountApp(ctk.CTk):
 
     def _on_canvas_resize(self, event=None):
         """Redraw the visualization when the canvas size changes (both width and height)."""
-        # Use after_idle to avoid too many redraws during rapid resizing
-        self.after_idle(self._redraw_viz)
+        # self.after(0, ...), not after_idle() - same starvation risk under heavy POS traffic
+        # while tracking as _schedule_viz_redraw's (see its comment); coalescing isn't needed
+        # here (no pending-flag guard), just avoiding the idle-only gate.
+        self.after(0, self._redraw_viz)
 
     def _redraw_viz(self):
         """Helper that redraws both grid and current position."""
