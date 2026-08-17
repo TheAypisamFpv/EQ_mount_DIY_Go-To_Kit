@@ -1458,6 +1458,18 @@ STTime cal_utc_time;
 // precision "double" (really 32-bit float on this AVR) actually has - unlike the 1.8.46-1.8.48
 // currentDaysJ2000 running total this replaces, which grew to epoch-scale (~9700) magnitude and
 // silently lost precision on every small per-loop increment.
+//
+// KNOWN LIMITATION, quantified (not silent): float32 has ~7 significant decimal digits, so
+// absolute precision at magnitude M is roughly M * 1.19e-7 seconds. Re-deriving the tolerance
+// SIDEREAL_RATE_DEG_S needs: for sub-arcsecond (<0.000278 deg) drift error, dt error must stay
+// under ~0.067s, safe up to M ~= 560,000s (~6.5 days); for sub-arcminute (<0.0167 deg, comfortably
+// inside this mount's own manual-homing precision - see daysSinceJ2000()'s comment), safe up to
+// M ~= 34,000,000s (~390 days). A single Time Travel session that jumps FAR into the future/past
+// (many months+) and is then left tracking there for an extended real-time session WITHOUT a
+// fresh calibration in between could see this degrade - recalibrating (a real CMD,SYNC) resets it
+// to 0 and restores full precision. Not a concern for this feature's actual purpose (previewing
+// where something will be at a given time), which doesn't hold a multi-month simulated instant
+// under continuous live tracking.
 double manualTimeJumpOffsetSec = 0.0;
 // Forward declaration - the actual definition (and updateTimeFromMillis()/setTimeFromValues(),
 // which keep it current) lives further down with the rest of the time-tracking code, but
