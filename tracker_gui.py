@@ -23,6 +23,7 @@ Run:
 import customtkinter as ctk
 import tkinter as tk  # only for widgets customtkinter doesn't provide (Listbox, for sky search results)
 from tkinter import messagebox  # solar tracking safety confirmation - see _toggle_tracking
+from PIL import Image, ImageDraw, ImageFont, ImageTk, ImageColor  # sky viz raster background - see _RasterCanvas
 import serial
 import serial.tools.list_ports
 import threading
@@ -73,7 +74,24 @@ from sky_data import sky_catalog, iss_tracker, solar_system
 #           updating correctly the whole time - only "caught up" once tracking stopped and the
 #           queue finally idled. Switched to self.after(0, ...), which isn't idle-gated.
 #           _on_canvas_resize's after_idle had the same latent risk, fixed the same way.
-GUI_VERSION = "1.0.3"
+#   1.0.4 - Sky viz canvas was laggy enough while zooming/panning to make the whole GUI look like
+#           it froze/reloaded - every zoom/pan/follow tick rebuilt the ENTIRE background (grid,
+#           Milky Way, horizon, meridian-limit shading, up to tens of thousands of catalog
+#           stars/DSOs) as that many individual real Tk canvas items via delete("all") + a
+#           create_line/create_oval/create_polygon/create_text per item, each one its own Tcl
+#           call - the actual bottleneck, not the drawing math itself. That background is now
+#           rasterized into a single Pillow image and blitted as ONE Tk canvas item per redraw
+#           (see the new _RasterCanvas class) - the handful of items that genuinely need cheap
+#           per-tick movement (camera FOV rect/marker, target reticle - see
+#           _update_visualization) are unaffected, still real Tk items moved via c.coords().
+#           Two more redraw-cost fixes found profiling this: (1) DSOs were always drawn via a
+#           28-point rotated-ellipse polygon even when clamped to their ~3-4px on-screen minimum
+#           size (the overwhelmingly common case at low zoom, where a rotated/dashed outline is
+#           indistinguishable from a plain dot anyway) - now a plain dot below 6px. (2) Pillow was
+#           re-parsing the same handful of hex color strings via a regex-based parser on every
+#           single one of tens of thousands of draw calls - now cached (_pil_ink). New dependency:
+#           Pillow (added to requirements.txt).
+GUI_VERSION = "1.0.4"
 
 BAUD_RATE = 250000
 # GUI poll rate for the serial queue. Fast enough to comfortably keep up with the Arduino's 50Hz
@@ -315,6 +333,175 @@ TRACKING_STABILITY_WINDOW_S = 2.0       # trend-averaging window - smooths per-u
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
+
+# ============================================================
+# SKY VIZ RASTER BACKGROUND (see _RasterCanvas)
+# ============================================================
+# Cache of loaded Pillow fonts, keyed by (size, bold) - see _get_viz_pil_font. Avoids hitting the
+# filesystem/FreeType to rebuild the same font object for every single label drawn on every redraw.
+_VIZ_FONT_CACHE = {}
+
+# Cache of hex-string -> RGB-tuple color conversions - see _RasterCanvas._clean. A full-sky redraw
+# makes tens of thousands of draw calls (mostly tiny star dots), and Pillow's ImageDraw re-parses
+# a plain hex string (via ImageColor.getcolor, a small regex-based parser) on every single one of
+# them - profiling showed that alone as the single biggest cost of a redraw, well above the actual
+# pixel drawing. The color vocabulary here is small and fixed (grid lines, DSO type colors, star
+# B-V colors, etc.), so caching the parsed tuple the first time a given hex string is seen and
+# reusing it skips that re-parsing entirely on every later draw call with the same color.
+_VIZ_COLOR_CACHE = {}
+
+
+def _pil_ink(color):
+    ink = _VIZ_COLOR_CACHE.get(color)
+    if ink is None:
+        ink = ImageColor.getrgb(color)
+        _VIZ_COLOR_CACHE[color] = ink
+    return ink
+
+
+def _get_viz_pil_font(size, bold=False):
+    """Loads (and caches) the Consolas font used for viz canvas labels, matching the
+    ("Consolas", size[, "bold"]) tuples the drawing code already passes to create_text.
+    Falls back to Pillow's built-in bitmap font if Consolas isn't installed (e.g. non-Windows) -
+    labels will look plainer but the canvas still renders instead of raising."""
+    key = (size, bold)
+    font = _VIZ_FONT_CACHE.get(key)
+    if font is not None:
+        return font
+    windir = os.environ.get("WINDIR", "C:\\Windows")
+    names = ("consolab.ttf",) if bold else ("consola.ttf",)
+    font = None
+    for name in names:
+        try:
+            font = ImageFont.truetype(os.path.join(windir, "Fonts", name), size)
+            break
+        except Exception:
+            continue
+    if font is None:
+        try:
+            font = ImageFont.load_default(size)  # Pillow >=10.1 - scalable default font
+        except TypeError:
+            font = ImageFont.load_default()
+    _VIZ_FONT_CACHE[key] = font
+    return font
+
+
+class _RasterCanvas:
+    """Minimal Tkinter-Canvas-shaped adapter that draws into a Pillow image instead of creating
+    real Tk canvas items - a drop-in stand-in for the `c` parameter the viz drawing helpers
+    (_draw_horizon, _draw_milky_way, _draw_meridian_limit_zone, _draw_sky_objects,
+    _draw_illuminated_disc, and the grid/ISS/Sun/Moon/planet/label code inline in
+    _draw_viz_grid) already take, only implementing the handful of create_* calls they actually
+    use - not a general Canvas replacement.
+
+    Why: the viz canvas's static background (grid lines, Milky Way band, horizon shading, up to
+    thousands of catalog stars/DSOs) used to be rebuilt as that many individual REAL Tk canvas
+    items via c.delete("all") + create_line/create_oval/create_polygon/create_text, on every
+    single zoom/pan/follow tick. Each of those is its own Tcl call - fine for the handful of
+    interactive overlay items (camera FOV rect, target reticle - those still use the real
+    Tkinter Canvas, see _draw_viz_grid), but the dominant cost, and the actual cause of zoom/pan
+    feeling like ~1-4fps (and heavy POS serial traffic on top of it stalling the whole Tk event
+    loop long enough to look like the GUI froze/reloaded), once it's thousands of them rebuilt
+    every frame. Rasterizing all of that into one Pillow image and blitting it as a SINGLE Tk
+    canvas image item turns "thousands of Tcl calls" into "one", regardless of how much content
+    is actually on screen.
+
+    tags= is accepted everywhere and ignored: it only ever existed so _safe_tag_raise could fix
+    up draw order after the fact - unnecessary here since these calls already happen in the
+    correct back-to-front order and painting into an image bakes that order in directly."""
+
+    def __init__(self, w, h, bg):
+        self.image = Image.new("RGB", (max(1, int(w)), max(1, int(h))), bg)
+        self.draw = ImageDraw.Draw(self.image)
+
+    @staticmethod
+    def _clean(color):
+        return _pil_ink(color) if color else None
+
+    @staticmethod
+    def _flatten(args):
+        flat = list(args[0]) if len(args) == 1 else list(args)
+        return [(flat[i], flat[i + 1]) for i in range(0, len(flat) - 1, 2)]
+
+    def create_line(self, *args, fill=None, width=1, dash=None, tags=None, **kw):
+        pts = self._flatten(args)
+        lw = max(1, round(width))
+        color = self._clean(fill) or "#000000"
+        if dash and len(pts) == 2:
+            self._draw_dashed_segment(pts[0], pts[1], color, lw, dash)
+        else:
+            self.draw.line(pts, fill=color, width=lw)
+
+    def _draw_dashed_segment(self, p0, p1, color, width, dash):
+        on = dash[0]
+        off = dash[1] if len(dash) > 1 else dash[0]
+        x0, y0 = p0
+        x1, y1 = p1
+        length = math.hypot(x1 - x0, y1 - y0)
+        if length < 1e-6:
+            return
+        ux, uy = (x1 - x0) / length, (y1 - y0) / length
+        pos, drawing = 0.0, True
+        while pos < length:
+            seg = on if drawing else off
+            end = min(pos + seg, length)
+            if drawing:
+                self.draw.line([(x0 + ux * pos, y0 + uy * pos), (x0 + ux * end, y0 + uy * end)],
+                                fill=color, width=width)
+            pos = end
+            drawing = not drawing
+
+    def create_oval(self, x0, y0, x1, y1, fill=None, outline=None, width=1, dash=None, tags=None, **kw):
+        outline_c = self._clean(outline)
+        self.draw.ellipse([x0, y0, x1, y1], fill=self._clean(fill), outline=outline_c,
+                          width=max(1, round(width)) if outline_c else 1)
+
+    def create_rectangle(self, x0, y0, x1, y1, fill=None, outline=None, width=1, tags=None, **kw):
+        outline_c = self._clean(outline)
+        self.draw.rectangle([x0, y0, x1, y1], fill=self._clean(fill), outline=outline_c,
+                            width=max(1, round(width)) if outline_c else 1)
+
+    def create_polygon(self, *args, fill=None, outline=None, width=1, dash=None, tags=None, **kw):
+        pts = self._flatten(args)
+        if len(pts) < 3:
+            return
+        outline_c = self._clean(outline)
+        self.draw.polygon(pts, fill=self._clean(fill), outline=outline_c)
+        if outline_c and width and width > 1:
+            # Pillow's polygon() outline is always ~1px regardless of width - go over the
+            # (already-closed, since polygon() implicitly closes back to the first point) edge
+            # again as an explicit line for anything thicker.
+            self.draw.line(pts + [pts[0]], fill=outline_c, width=max(1, round(width)))
+
+    def create_arc(self, x0, y0, x1, y1, start=0, extent=180, style="chord",
+                   fill=None, outline=None, width=1, tags=None, **kw):
+        # Only style="chord" is used anywhere in this file. Sampled manually (rather than
+        # delegated to Pillow's own arc/chord primitives) to guarantee it matches Tk's own angle
+        # convention exactly: 0 deg = 3 o'clock, increasing counter-clockwise in real space,
+        # i.e. y = cy - r*sin(theta) since screen y grows downward - same convention the
+        # docstring on _draw_illuminated_disc's create_arc call already relies on.
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        rx, ry = abs(x1 - x0) / 2.0, abs(y1 - y0) / 2.0
+        n = 24
+        pts = []
+        for i in range(n + 1):
+            theta = math.radians(start + extent * i / n)
+            pts.append((cx + rx * math.cos(theta), cy - ry * math.sin(theta)))
+        # polygon() auto-closes the last point back to the first, which for a partial arc IS
+        # exactly the "chord" style (a straight line connecting the two open ends) - no separate
+        # center point needed the way "pieslice" style would require.
+        self.draw.polygon(pts, fill=self._clean(fill), outline=self._clean(outline))
+
+    def create_text(self, x, y, text="", fill=None, font=None, anchor=None, tags=None, **kw):
+        size = font[1] if font and len(font) > 1 else 10
+        bold = bool(font and len(font) > 2 and "bold" in font[2])
+        pil_anchor = {"w": "lm", "e": "rm"}.get(anchor, "mm")  # Tk default anchor is "center"
+        self.draw.text((x, y), text, fill=self._clean(fill) or "#ffffff",
+                       font=_get_viz_pil_font(size, bold), anchor=pil_anchor)
+
+    def to_photoimage(self):
+        return ImageTk.PhotoImage(self.image)
+
 
 # ============================================================
 # SERIAL HANDLER (background thread)
@@ -2202,6 +2389,16 @@ class EQMountApp(ctk.CTk):
             elif shape == "ring":
                 c.create_oval(x - half_w, y - half_h, x + half_w, y + half_h,
                               outline=color, width=1.5, fill="", tags="sky_obj")
+            elif half_w < 6.0 and half_h < 6.0:
+                # Below ~6px on-screen, a rotated/dashed ellipse outline reads as nothing more
+                # than a small dot anyway - skip the expensive 28-point rotated-ellipse polygon
+                # computation (_rotated_ellipse_points) and just draw a plain filled dot. This is
+                # the common case at low zoom: half_w/half_h are clamped to a 3-4px minimum (see
+                # above), so at full-sky zoom essentially every one of the catalog's thousands of
+                # DSOs was hitting the expensive path just to render a few-pixel dot - by far the
+                # dominant cost of a full-sky redraw (confirmed via profiling).
+                c.create_oval(x - half_w, y - half_h, x + half_w, y + half_h,
+                              fill=color, outline="", tags="sky_obj")
             else:
                 # Rotated by the object's real position angle instead of always axis-aligned,
                 # and a dashed perimeter only (no fill) rather than a solid/stippled ellipse -
@@ -2270,26 +2467,6 @@ class EQMountApp(ctk.CTk):
         r_e, r_n = self._rotate_ne(half_h, 6, pos_ang_deg)
         return [cx - tip_e, cy - tip_n, cx - l_e, cy - l_n, cx - r_e, cy - r_n]
 
-    def _safe_tag_raise(self, c, tag, above):
-        """tag_raise(tag, above) but tolerant of either tag matching zero current canvas items -
-        plain Tk raises a bare TclError ("tagOrId ... doesn't match any items") in that case,
-        which crashes the whole redraw. This is a real, expected situation now (not just a
-        theoretical edge case): _draw_meridian_limit_zone can legitimately draw nothing when the
-        visible Dec range falls entirely inside the allowed-DEC exemption band, and
-        _draw_milky_way can draw nothing at extreme zoom levels where no band segment overlaps
-        the visible window - both now var y with the view instead of always drawing at least one
-        shape the way they used to. If `tag` itself has nothing, there's nothing to raise - skip.
-        If `above` has nothing (e.g. the previous layer in the chain was itself empty), fall back
-        to "viz_bg", which is always drawn unconditionally and unconditionally first."""
-        if not c.find_withtag(tag):
-            return
-        if not c.find_withtag(above):
-            above = "viz_bg"
-        try:
-            c.tag_raise(tag, above)
-        except tk.TclError:
-            pass
-
     def _draw_viz_grid(self):
         """Draw a larger, clearer reticle / position visualization. Grid density adapts to
         the current zoom level: as you zoom in, coarse ~10 deg lines give way to 5, 1, 0.1 deg
@@ -2306,34 +2483,35 @@ class EQMountApp(ctk.CTk):
         ra_min, ra_max, dec_min, dec_max = self._get_viz_view_bounds()
         ra_span, dec_span = ra_max - ra_min, dec_max - dec_min
 
-        # Background
-        c.create_rectangle(8, 8, w-8, h-8, outline="#222233", width=2, fill="#111118", tags="viz_bg")
+        # Everything below down through the RA/zoom labels (background, horizon, Milky Way,
+        # meridian-limit shading, grid lines, stars/DSOs, ISS/Sun/Moon/planets, crosshairs,
+        # cardinal lines, corner labels) is rasterized into one Pillow image and blitted as a
+        # SINGLE Tk canvas item (rc.to_photoimage() below) instead of being built as
+        # hundreds/thousands of individual real Tk canvas items - see _RasterCanvas's docstring
+        # for why. Draw order below IS paint/stacking order (no tag_raise needed - painting into
+        # an image bakes the order in directly, unlike stacked Tk canvas items).
+        # bg matches the canvas widget's own bg="#0a0a0f" (see viz_canvas's creation) - it shows
+        # through as the outer 8px border around the "#111118" panel rectangle drawn next.
+        rc = _RasterCanvas(w, h, "#0a0a0f")
+        rc.create_rectangle(8, 8, w-8, h-8, outline="#222233", width=2, fill="#111118")
 
         # Horizon shading (below horizon gets darker color) - the absolute furthest-back layer of
         # the three below, right above the plain background rectangle: "below the horizon" means
         # physically unreachable regardless of what else is there, so the ground should mute/sit
         # behind the Milky Way band and the meridian danger zone wherever they overlap it, not
-        # paint over and hide them - previously drawn LAST (on top of both), which had it doing
-        # exactly the opposite of that.
-        # tag_raise explicitly pins "horizon"-tagged items directly above "viz_bg" rather than
-        # relying only on creation order - reported as still covering the grid even after
-        # restarting with the creation-order fix in place, so this makes the stacking explicit
-        # and unambiguous instead of depending on it falling out naturally from draw order.
-        self._draw_horizon(c, w, h, margin, ra_min, ra_max, dec_min, dec_max)
-        self._safe_tag_raise(c, "horizon", "viz_bg")
+        # paint over and hide them.
+        self._draw_horizon(rc, w, h, margin, ra_min, ra_max, dec_min, dec_max)
 
         # Milky Way band - fixed in equatorial coordinates (doesn't depend on time/location the
         # way horizon/meridian-limit do), drawn above the ground shading so it stays visible even
         # across the horizon - see _draw_milky_way's docstring.
-        self._draw_milky_way(c, w, h, margin, ra_min, ra_max, dec_min, dec_max)
-        self._safe_tag_raise(c, "milky_way", "horizon")
+        self._draw_milky_way(rc, w, h, margin, ra_min, ra_max, dec_min, dec_max)
 
         # Meridian-limit danger zone (red/orange) - drawn last of these three so it stays visible
         # on top of both the ground shading and the Milky Way band wherever they overlap. Drawn
         # regardless of flip state - the zone mirrors to the other half of RA once flipped rather
         # than disappearing, see _draw_meridian_limit_zone's docstring.
-        self._draw_meridian_limit_zone(c, w, h, margin, ra_min, ra_max, dec_min, dec_max)
-        self._safe_tag_raise(c, "meridian_limit", "milky_way")
+        self._draw_meridian_limit_zone(rc, w, h, margin, ra_min, ra_max, dec_min, dec_max)
 
         # DEC lines (horizontal), spacing adaptive to zoom
         dec_step = self._pick_grid_step(dec_span)
@@ -2341,7 +2519,7 @@ class EQMountApp(ctk.CTk):
         while d <= dec_max + 1e-9:
             y = self._viz_dec_to_y(d, h, margin, dec_min, dec_span)
             col, wd = self._grid_line_style(d, dec_step)
-            c.create_line(8, y, w-8, y, fill=col, width=wd)
+            rc.create_line(8, y, w-8, y, fill=col, width=wd)
             d += dec_step
 
         # RA lines (vertical), spacing adaptive to zoom
@@ -2350,12 +2528,12 @@ class EQMountApp(ctk.CTk):
         while r <= ra_max + 1e-9:
             x = self._viz_ra_to_x(r, w, margin, ra_min, ra_span)
             col, wd = self._grid_line_style(r, ra_step)
-            c.create_line(x, 8, x, h-8, fill=col, width=wd)
+            rc.create_line(x, 8, x, h-8, fill=col, width=wd)
             r += ra_step
 
         # Stars + Messier DSOs from the bundled catalog (see sky_catalog.py) - drawn on top of
         # the grid but below the crosshairs/labels/camera overlay so those stay legible.
-        self._draw_sky_objects(c, w, h, margin, ra_min, ra_max, dec_min, dec_max)
+        self._draw_sky_objects(rc, w, h, margin, ra_min, ra_max, dec_min, dec_max)
 
         # Real-time ISS marker (see iss_tracker.py / _iss_update_tick) - a distinct marker since
         # it's a fast-moving, ephemeral position rather than a fixed catalog object. Drawn even
@@ -2366,10 +2544,10 @@ class EQMountApp(ctk.CTk):
             iy = self._viz_dec_to_y(self._iss_dec, h, margin, dec_min, dec_span)
             iss_color = "#00ffaa" if self._iss_above_horizon else "#336655"
             r = 4
-            c.create_line(ix - r, iy, ix + r, iy, fill=iss_color, width=1.5, tags="sky_obj")
-            c.create_line(ix, iy - r, ix, iy + r, fill=iss_color, width=1.5, tags="sky_obj")
-            c.create_oval(ix - r, iy - r, ix + r, iy + r, outline=iss_color, width=1.5, tags="sky_obj")
-            c.create_text(ix, iy - r - 8, text="ISS", fill=iss_color, font=("Consolas", 8, "bold"), tags="sky_obj")
+            rc.create_line(ix - r, iy, ix + r, iy, fill=iss_color, width=1.5)
+            rc.create_line(ix, iy - r, ix, iy + r, fill=iss_color, width=1.5)
+            rc.create_oval(ix - r, iy - r, ix + r, iy + r, outline=iss_color, width=1.5)
+            rc.create_text(ix, iy - r - 8, text="ISS", fill=iss_color, font=("Consolas", 8, "bold"))
             self._visible_object_hits.append({
                 "x": ix, "y": iy, "ra": self._iss_ra, "dec": self._iss_dec, "radius": 12.0,
                 "name": "ISS", "extra": "above horizon" if self._iss_above_horizon else "below horizon",
@@ -2385,9 +2563,8 @@ class EQMountApp(ctk.CTk):
             sx = self._viz_ra_to_x(self._sun_ra, w, margin, ra_min, ra_span)
             sy = self._viz_dec_to_y(self._sun_dec, h, margin, dec_min, dec_span)
             sr = max(4.0, (self._sun_ang_diam_deg / 2.0) * pixels_per_deg_sm)
-            c.create_oval(sx - sr, sy - sr, sx + sr, sy + sr, fill="#ffcc33", outline="#aa7700",
-                         width=1, tags="sky_obj")
-            c.create_text(sx, sy - sr - 8, text="Sun", fill="#ffcc33", font=("Consolas", 8, "bold"), tags="sky_obj")
+            rc.create_oval(sx - sr, sy - sr, sx + sr, sy + sr, fill="#ffcc33", outline="#aa7700", width=1)
+            rc.create_text(sx, sy - sr - 8, text="Sun", fill="#ffcc33", font=("Consolas", 8, "bold"))
             self._visible_object_hits.append({
                 "x": sx, "y": sy, "ra": self._sun_ra, "dec": self._sun_dec, "radius": max(12.0, sr),
                 "name": "Sun", "extra": f"diam {self._sun_ang_diam_deg*60:.1f}'",
@@ -2398,9 +2575,9 @@ class EQMountApp(ctk.CTk):
             my = self._viz_dec_to_y(self._moon_dec, h, margin, dec_min, dec_span)
             mr = max(4.0, (self._moon_ang_diam_deg / 2.0) * pixels_per_deg_sm)
             bearing_deg = self._bearing_to_sun(self._moon_ra, self._moon_dec)
-            self._draw_moon_disc(c, mx, my, mr, bearing_deg)
-            c.create_text(mx, my - mr - 8, text=f"Moon ({self._moon_illum_fraction*100:.0f}%)",
-                         fill="#cccccc", font=("Consolas", 8, "bold"), tags="sky_obj")
+            self._draw_moon_disc(rc, mx, my, mr, bearing_deg)
+            rc.create_text(mx, my - mr - 8, text=f"Moon ({self._moon_illum_fraction*100:.0f}%)",
+                          fill="#cccccc", font=("Consolas", 8, "bold"))
             waxwane = "waxing" if self._moon_waxing else "waning"
             self._visible_object_hits.append({
                 "x": mx, "y": my, "ra": self._moon_ra, "dec": self._moon_dec, "radius": max(12.0, mr),
@@ -2436,17 +2613,15 @@ class EQMountApp(ctk.CTk):
             prr = 0.0
             if pname == "Saturn" and pring_ang_diam:
                 prr = max(pr + 1.5, (pring_ang_diam / 2.0) * pixels_per_deg_sm)
-                c.create_oval(px - prr, py - prr * 0.45, px + prr, py + prr * 0.45,
-                             outline=pcolor, width=max(1.0, prr * 0.12), tags="sky_obj")
+                rc.create_oval(px - prr, py - prr * 0.45, px + prr, py + prr * 0.45,
+                              outline=pcolor, width=max(1.0, prr * 0.12))
             if pr >= _PLANET_PHASE_RADIUS_PX:
                 bearing_deg = self._bearing_to_sun(pra, pdec)
-                self._draw_illuminated_disc(c, px, py, pr, bearing_deg, pillum,
+                self._draw_illuminated_disc(rc, px, py, pr, bearing_deg, pillum,
                                             pcolor, self._darken_hex_color(pcolor), pcolor)
             else:
-                c.create_oval(px - pr, py - pr, px + pr, py + pr, fill=pcolor, outline="#000000",
-                             width=0.5, tags="sky_obj")
-            c.create_text(px, py - pr - 8, text=pname, fill=pcolor, font=("Consolas", 8, "bold"),
-                         tags="sky_obj")
+                rc.create_oval(px - pr, py - pr, px + pr, py + pr, fill=pcolor, outline="#000000", width=0.5)
+            rc.create_text(px, py - pr - 8, text=pname, fill=pcolor, font=("Consolas", 8, "bold"))
             self._visible_object_hits.append({
                 "x": px, "y": py, "ra": pra, "dec": pdec, "radius": max(12.0, pr, prr),
                 "name": pname, "extra": f"planet, {pillum*100:.0f}% illuminated",
@@ -2456,10 +2631,10 @@ class EQMountApp(ctk.CTk):
         # Cross hairs (center 0/0), only drawn if within the visible window
         if dec_min <= 0.0 <= dec_max:
             cy0 = self._viz_dec_to_y(0.0, h, margin, dec_min, dec_span)
-            c.create_line(8, cy0, w-8, cy0, fill="#555566", width=1)
+            rc.create_line(8, cy0, w-8, cy0, fill="#555566", width=1)
         if ra_min <= 180.0 <= ra_max:
             cx0 = self._viz_ra_to_x(180.0, w, margin, ra_min, ra_span)
-            c.create_line(cx0, 8, cx0, h-8, fill="#555566", width=1)
+            rc.create_line(cx0, 8, cx0, h-8, fill="#555566", width=1)
 
         # Cardinal direction reference lines (N/S/E/W). These mark RA, not a fixed sky location -
         # they shift as sidereal time advances, same as the horizon curve. N and S are exactly
@@ -2482,21 +2657,27 @@ class EQMountApp(ctk.CTk):
                 # variables aren't scoped to the loop, reusing it here was overwriting that outer
                 # value with whichever cardinal line happened to be drawn last.
                 line_x = self._viz_ra_to_x(cra, w, margin, ra_min, ra_span)
-                c.create_line(line_x, 8, line_x, h-8, fill="#aa8844", width=1, dash=(5, 3))
-                c.create_text(line_x, 20, text=label, fill="#ddaa55", font=("Consolas", 10, "bold"))
+                rc.create_line(line_x, 8, line_x, h-8, fill="#aa8844", width=1, dash=(5, 3))
+                rc.create_text(line_x, 20, text=label, fill="#ddaa55", font=("Consolas", 10, "bold"))
 
         # Labels - show the actual visible bounds + zoom level (updates as you zoom/pan)
-        c.create_text(18, 18, text=f"{dec_max:+.2f}°", fill="#8888aa", font=("Consolas", 10), anchor="w")
-        c.create_text(18, h-16, text=f"{dec_min:+.2f}°", fill="#8888aa", font=("Consolas", 10), anchor="w")
+        rc.create_text(18, 18, text=f"{dec_max:+.2f}°", fill="#8888aa", font=("Consolas", 10), anchor="w")
+        rc.create_text(18, h-16, text=f"{dec_min:+.2f}°", fill="#8888aa", font=("Consolas", 10), anchor="w")
         # ra_max first, then ra_min - RA now increases leftward on screen (see _viz_ra_to_x), so
         # this reads in the same left-to-right order the values actually appear on screen, with
         # the arrow pointing towards this label's own right-edge anchor (where ra_min sits).
-        c.create_text(w-16, cy - 12, text=f"RA {ra_max:.2f}° → {ra_min:.2f}°", fill="#8888aa", font=("Consolas", 10), anchor="e")
-        c.create_text(cx, 18, text="DEC", fill="#aaaacc", font=("Consolas", 11))
+        rc.create_text(w-16, cy - 12, text=f"RA {ra_max:.2f}° → {ra_min:.2f}°", fill="#8888aa", font=("Consolas", 10), anchor="e")
+        rc.create_text(cx, 18, text="DEC", fill="#aaaacc", font=("Consolas", 11))
         zoom_hint = "scroll/pinch to zoom, drag to pan, middle-click to reset, double-click to set target" \
             if self._viz_zoom <= VIZ_ZOOM_MIN + 1e-6 \
             else f"zoom {self._viz_zoom:.1f}x - drag to pan, middle-click to reset, double-click to set target"
-        c.create_text(cx, h-16, text=zoom_hint, fill="#666688", font=("Consolas", 9))
+        rc.create_text(cx, h-16, text=zoom_hint, fill="#666688", font=("Consolas", 9))
+
+        # Blit the whole rasterized background as a SINGLE Tk canvas item - see _RasterCanvas's
+        # docstring. Kept referenced on self (not just a local) so Tk doesn't garbage-collect the
+        # backing PhotoImage out from under the canvas the moment this function returns.
+        self._viz_bg_photo = rc.to_photoimage()
+        c.create_image(0, 0, image=self._viz_bg_photo, anchor="nw")
 
         # Camera sensor framing: real measured camera FOV (see CAMERA_FOV_W_DEG). Uses a single
         # isotropic px/deg scale (the DEC-axis one) for both width and height so the rectangle
