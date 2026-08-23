@@ -1134,12 +1134,16 @@ class MainWindow(QMainWindow):
         self.time_travel_label_timer.timeout.connect(self._update_time_travel_label)
         self.time_travel_label_timer.start(1000)
 
-        # Ticks fast enough (5x/sec) for a crisp on/off blink edge, but derives the actual on/off
-        # phase from wall-clock time.time() (not elapsed timer ticks) so the blink is genuinely
-        # synced to real seconds regardless of exactly when this timer started.
+        # Self-rescheduling (see _update_realtime_dot) rather than a fixed-interval repeating
+        # timer - a 200ms poll could be showing a stale state for up to 200ms after an actual
+        # second/half-second boundary passed, which read as "not quite in sync with the computer
+        # clock". Scheduling each update to land AT the next boundary keeps the visible lag down
+        # to whatever the OS's own timer/scheduler jitter is (typically low single-digit ms).
         self.blink_timer = QTimer(self)
+        self.blink_timer.setSingleShot(True)
+        self.blink_timer.setTimerType(Qt.PreciseTimer)
         self.blink_timer.timeout.connect(self._update_realtime_dot)
-        self.blink_timer.start(200)
+        self._update_realtime_dot()
 
         self._load_catalog()
         self._refresh_ports()
@@ -1709,18 +1713,21 @@ class MainWindow(QMainWindow):
     def _update_realtime_dot(self):
         """Blinks once per real (wall-clock) second - LIT the instant each second starts, OFF
         from the half-second mark until the next second rolls over - green while showing the
-        real-time sky, orange while a Time Travel preview is active. Derived from time.time(),
-        not elapsed timer ticks, so the on/off phase is synced to actual second boundaries
-        regardless of when blink_timer started.
+        real-time sky, orange while a Time Travel preview is active.
 
-        NOTE: `frac >= 0.5` (not `< 0.5`) is what actually lands "lit" on the start of the
-        second - confirmed against the running app after the mathematically-obvious `< 0.5`
-        version turned out empirically inverted (reported as off-at-start/on-0.5s-later)."""
+        Self-rescheduling (via blink_timer, a single-shot PreciseTimer) rather than a fixed-
+        interval repeating poll: computes the current phase from time.time() itself (so it's
+        correct regardless of drift/jitter since the last call), then schedules the NEXT call to
+        land as close as possible to the next actual 0.0/0.5-second boundary, instead of polling
+        every N ms and potentially showing a stale state for up to N ms after a boundary passed
+        (reported as "not always well in sync with the computer time")."""
         frac = time.time() % 1.0
-        lit = frac >= 0.5
+        lit = frac < 0.5
         base_color = "#33ff88" if self._time_travel_offset == timedelta(0) else "#ffaa44"
         self.realtime_dot.setStyleSheet(
             f"color: {base_color if lit else '#333340'}; font-size: 15px; font-weight: bold;")
+        next_boundary = 0.5 if lit else 1.0
+        self.blink_timer.start(max(1, round((next_boundary - frac) * 1000)))
 
     # ---------------- catalog ----------------
     def _start_worker(self, worker, *connections):
