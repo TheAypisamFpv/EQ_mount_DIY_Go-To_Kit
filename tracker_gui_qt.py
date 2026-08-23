@@ -38,7 +38,7 @@ from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, Signal, QObject
+from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, Signal, QObject, QEvent
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont, QPolygonF, QPainterPath, QFontMetrics,
 )
@@ -1470,6 +1470,11 @@ class MainWindow(QMainWindow):
         self.find_edit.setPlaceholderText("Find: star/DSO/Sun/Moon/ISS/planet name...")
         self.find_edit.textChanged.connect(self._update_sky_search_results)
         self.find_edit.returnPressed.connect(self._select_first_sky_search_result)
+        # Down from the search box -> jump into the results list, top item selected; Up from
+        # the list's top item -> back to the search box to keep editing the query. Handled via
+        # an event filter (see eventFilter below) since neither QLineEdit nor QListWidget has a
+        # per-key signal the way Tk's bind() does.
+        self.find_edit.installEventFilter(self)
         toolbar.addWidget(self.view_mode_btn)
         toolbar.addWidget(self.iss_btn)
         toolbar.addWidget(self.const_btn)
@@ -1488,6 +1493,7 @@ class MainWindow(QMainWindow):
         self.sky_search_results.setMaximumHeight(110)
         self.sky_search_results.itemActivated.connect(self._on_sky_search_result_chosen)
         self.sky_search_results.hide()
+        self.sky_search_results.installEventFilter(self)
         left.addWidget(self.sky_search_results)
 
         left.addWidget(self.viz, stretch=1)
@@ -2752,6 +2758,26 @@ class MainWindow(QMainWindow):
 
         if "LOCATION_SET" in line or "SYNCED" in line or "TIME_SET" in line:
             self._log(line)
+
+    def eventFilter(self, obj, event):
+        """Find-box <-> results-list keyboard navigation (installed on both widgets in
+        _build_ui): Down in the search box jumps into the results list with the top item
+        selected; Up on the list's top item jumps back to the search box (cursor at the end, so
+        typing continues naturally) instead of just doing nothing the way a plain QListWidget
+        would at row 0. Down within the list otherwise still gets Qt's normal list navigation -
+        only Up-at-the-top and Down-from-the-box are intercepted here."""
+        if event.type() == QEvent.KeyPress:
+            if obj is self.find_edit and event.key() == Qt.Key_Down:
+                if self.sky_search_results.count() > 0:
+                    self.sky_search_results.setFocus()
+                    self.sky_search_results.setCurrentRow(0)
+                    return True
+            elif obj is self.sky_search_results and event.key() == Qt.Key_Up:
+                if self.sky_search_results.currentRow() <= 0:
+                    self.find_edit.setFocus()
+                    self.find_edit.setCursorPosition(len(self.find_edit.text()))
+                    return True
+        return super().eventFilter(obj, event)
 
     # ---------------- keyboard shortcuts (ported from EQMountApp) ----------------
     def keyPressEvent(self, event):
