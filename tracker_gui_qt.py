@@ -113,6 +113,18 @@ _PALETTE_HUES = {
 }
 PALETTE = {name: _oklch_to_hex(_PALETTE_L, _PALETTE_C, hue) for name, hue in _PALETTE_HUES.items()}
 
+# Two deliberately lower-chroma reds, both still generated via OKLCH (same hue as PALETTE["red"])
+# rather than hand-picked hex, for the two stop-related controls specifically:
+#   - STOP_RED: the ISO 13850 emergency-stop actuator (see its own comment - normally this
+#     convention wants a fully saturated safety red; toned down from that here, still well above
+#     PALETTE's own chroma so it stays clearly the more urgent of the two).
+#   - TRACKING_STOP_RED: the Start/Stop Tracking toggle's "Stop" state - even less saturated,
+#     at PALETTE's own lightness, so it reads as related to but calmer than the actuator.
+STOP_RED = _oklch_to_hex(0.55, 0.16, _PALETTE_HUES["red"])
+STOP_RED_HOVER = _oklch_to_hex(0.60, 0.16, _PALETTE_HUES["red"])
+STOP_RED_PRESSED = _oklch_to_hex(0.45, 0.16, _PALETTE_HUES["red"])
+TRACKING_STOP_RED = _oklch_to_hex(_PALETTE_L, 0.07, _PALETTE_HUES["red"])
+
 
 # ============================================================
 # PURE GEOMETRY/STYLE HELPERS
@@ -1577,25 +1589,26 @@ class MainWindow(QMainWindow):
 
         # Styled per ISO 13850 (emergency stop function) actuator convention - RED actuator on a
         # YELLOW background, the one color pairing that standard exists specifically to make
-        # unambiguous - deliberately NOT drawn from PALETTE (see its module docstring): a muted
-        # OKLCH-derived red would undercut the exact thing this convention is for, which is
-        # being instantly recognizable as "the emergency stop" at a glance, not visually
-        # consistent with the rest of the app. Actuation itself already matches the standard's
-        # intent too - one click, immediate (_stop -> _request_tracking_action), no confirmation
-        # dialog in the way, same as every other STOP path in this app (Delete key, panic byte).
+        # unambiguous - deliberately NOT drawn from PALETTE (see its module docstring): even
+        # STOP_RED (a bit less saturated than a fully-saturated safety red, but still generated
+        # via OKLCH, not a hand-picked hex) stays well above PALETTE's own muted chroma, so it's
+        # still clearly the more urgent of the two stop-related controls. Actuation itself
+        # already matches the standard's intent too - one click, immediate (_stop ->
+        # _request_tracking_action), no confirmation dialog in the way, same as every other STOP
+        # path in this app (Delete key, panic byte).
         stop_btn = QPushButton("⏹  STOP")
-        stop_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #CC0000;
+        stop_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {STOP_RED};
                 color: white;
-                border: 4px solid #FFD500;
+                border: 2px solid #FFD500;
                 border-radius: 6px;
                 font-weight: bold;
                 font-size: 15px;
                 padding: 10px;
-            }
-            QPushButton:hover { background-color: #E00000; }
-            QPushButton:pressed { background-color: #990000; }
+            }}
+            QPushButton:hover {{ background-color: {STOP_RED_HOVER}; }}
+            QPushButton:pressed {{ background-color: {STOP_RED_PRESSED}; }}
         """)
         stop_btn.setToolTip("Immediately stops tracking/slewing - single action, no confirmation (ISO 13850 emergency stop convention).")
         stop_btn.clicked.connect(self._stop)
@@ -2032,8 +2045,10 @@ class MainWindow(QMainWindow):
         state change already funnels through."""
         if self.tracking:
             self.tracking_btn.setText("■ Stop Tracking")
+            # TRACKING_STOP_RED, not PALETTE["red"] - a bit less saturated than even the rest of
+            # the palette's own red, at the user's request, for this specific button.
             self.tracking_btn.setStyleSheet(
-                f"background-color: {PALETTE['red']}; color: black; font-weight: bold; padding: 8px;")
+                f"background-color: {TRACKING_STOP_RED}; color: black; font-weight: bold; padding: 8px;")
         else:
             self.tracking_btn.setText("▶ Start Tracking")
             self.tracking_btn.setStyleSheet(
