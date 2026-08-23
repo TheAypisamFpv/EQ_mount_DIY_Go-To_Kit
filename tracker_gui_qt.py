@@ -33,6 +33,7 @@ import json
 import bisect
 import threading
 import queue
+from collections import deque
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -43,7 +44,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QComboBox, QLabel, QLineEdit, QTextEdit, QRadioButton, QButtonGroup,
-    QGroupBox, QSizePolicy, QMessageBox,
+    QGroupBox,
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
@@ -59,7 +60,8 @@ from tracker_gui import (
     MERIDIAN_LIMIT_DEC_ALLOWED_MIN_DEG, MERIDIAN_LIMIT_DEC_ALLOWED_MAX_DEG,
     MILKY_WAY_BAND_HALF_WIDTHS_DEG, MILKY_WAY_BAND_COLORS, MILKY_WAY_L_STEP_DEG,
     VIZ_ZOOM_MIN, VIZ_ZOOM_MAX, VIZ_ZOOM_STEP_BASE, VIZ_GRID_TARGET_LINES,
-    STAR_LOD_TIER_MAG_CUTOFFS, _galactic_to_radec,
+    STAR_LOD_TIER_MAG_CUTOFFS, _galactic_to_radec, TRACKING_STABLE_ERR_DEG,
+    POS_UPDATE_RATE_MS,
 )
 from sky_data import sky_catalog, iss_tracker, solar_system
 
@@ -250,6 +252,11 @@ class SkyViewWidget(QOpenGLWidget):
         self.const_line_segments = []
         self.star_by_hip = {}
         self.constellations_enabled = True
+        # See EQMountApp._min_dso_size_filter_enabled's comment - real major-axis size projected
+        # onto the actual camera sensor (CAMERA_FOV_DEG_PER_PIXEL), not on-screen pixel size.
+        self.min_dso_size_filter_enabled = False
+        self.min_dso_size_px = 100.0
+        self.iss_enabled = False  # gates the ISS marker; background fetch runs regardless (cheap)
 
         # Real-time bodies - populated by MainWindow's background update timers
         self.iss_ra = self.iss_dec = None
@@ -596,6 +603,10 @@ class SkyViewWidget(QOpenGLWidget):
             shape, color = _dso_render_style(d["type"])
             maj = d.get("size_maj_arcmin")
             min_ax = d.get("size_min_arcmin") or maj
+            if self.min_dso_size_filter_enabled:
+                sensor_px = (maj / 60.0 / CAMERA_FOV_DEG_PER_PIXEL) if maj else 0.0
+                if sensor_px < self.min_dso_size_px:
+                    continue
             if maj:
                 half_w = max(3.0, (maj / 60.0 / 2.0) * pixels_per_deg)
                 half_h = max(3.0, ((min_ax or maj) / 60.0 / 2.0) * pixels_per_deg)
@@ -632,7 +643,7 @@ class SkyViewWidget(QOpenGLWidget):
 
     def _draw_realtime_bodies(self, p, w, h, margin, ra_min, ra_max, dec_min, dec_max, pixels_per_deg):
         ra_span, dec_span = ra_max - ra_min, dec_max - dec_min
-        if self.iss_ra is not None and ra_min <= self.iss_ra <= ra_max and dec_min <= self.iss_dec <= dec_max:
+        if self.iss_enabled and self.iss_ra is not None and ra_min <= self.iss_ra <= ra_max and dec_min <= self.iss_dec <= dec_max:
             ix = self.ra_to_x(self.iss_ra, w, margin, ra_min, ra_span)
             iy = self.dec_to_y(self.iss_dec, h, margin, dec_min, dec_span)
             iss_color = QColor("#00ffaa" if self.iss_above else "#336655")
@@ -997,22 +1008,47 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("EQ Mount DIY Go-To Kit - Qt Controller (experimental)")
-        self.resize(1280, 800)
+        self.resize(1440, 900)
 
         self.msg_queue = queue.Queue()
         self.serial = SerialHandler(self.msg_queue, get_time_fn=lambda: datetime.now(timezone.utc))
 
         self.current_ra = self.current_dec = 0.0
         self.target_ra = self.target_dec = 0.0
+        self.mount_ra_angle = self.mount_dec_angle = 0.0
+        self.speed_ra = self.speed_dec = 0.0
+        self.err_ra = self.err_dec = 0.0
+        self.ra_pos_history = deque()
+        self.dec_pos_history = deque()
+        self.ra_offset = 0.0
+        self.dec_offset = 0.0
         self.tracking = False
+        self.arduino_debug_enabled = False
         self._last_pos_ui_update = 0.0
         self._workers = []  # keeps background QObjects referenced while their thread runs
+        self._search_index = []  # built alongside the catalog - see _on_catalog_loaded
+
+        # Named calibration points/stars for the Sync dropdown - same values/HIP numbers as
+        # EQMountApp.cal_stars/_cal_star_hip; "East"/"West" resolve from LST at sync time (see
+        # _sync), named stars prefer the exact catalog RA/DEC (via viz.star_by_hip) once loaded.
+        self.cal_stars = {
+            "East (horizon, DEC=0)": "EAST",
+            "West (horizon, DEC=0)": "WEST",
+            "Vega (alpha Lyrae)": (279.234, 38.784),
+            "Arcturus (alpha Bootis)": (213.915, 19.182),
+            "Altair (alpha Aquilae)": (297.696, 8.868),
+            "Custom (use fields below)": None,
+        }
+        self.cal_star_hip = {
+            "Vega (alpha Lyrae)": 91262, "Arcturus (alpha Bootis)": 69673, "Altair (alpha Aquilae)": 97649,
+        }
 
         self.viz = SkyViewWidget()
         self.viz.targetPicked.connect(self._on_target_picked)
         self.viz.hoverInfoChanged.connect(self._on_hover_info)
 
         self._build_ui()
+        self._set_arduino_controls_enabled(False)
 
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._poll_serial_queue)
@@ -1038,21 +1074,17 @@ class MainWindow(QMainWindow):
     # ---------------- UI ----------------
     def _build_ui(self):
         central = QWidget()
-        layout = QHBoxLayout(central)
+        outer = QHBoxLayout(central)
         self.setCentralWidget(central)
 
         left = QVBoxLayout()
-        left.addWidget(self.viz, stretch=1)
-        self.hover_label = QLabel("Cursor: -")
-        self.hover_label.setStyleSheet("color: #9aa; font-family: Consolas;")
-        left.addWidget(self.hover_label)
-        layout.addLayout(left, stretch=3)
-
+        outer.addLayout(left, stretch=3)
         right = QVBoxLayout()
         right.setSpacing(8)
-        layout.addLayout(right, stretch=1)
+        outer.addLayout(right, stretch=1)
 
-        # Connection
+        # ---- top row: connection + location (left column, above the status bar) ----
+        top_row = QHBoxLayout()
         conn_box = QGroupBox("Connection")
         conn_l = QGridLayout(conn_box)
         self.port_combo = QComboBox()
@@ -1069,26 +1101,157 @@ class MainWindow(QMainWindow):
         conn_l.addWidget(refresh_btn, 0, 2)
         conn_l.addWidget(self.connect_btn, 1, 0)
         conn_l.addWidget(self.disconnect_btn, 1, 1)
-        conn_l.addWidget(self.conn_status, 2, 0, 1, 3)
-        right.addWidget(conn_box)
+        conn_l.addWidget(self.conn_status, 1, 2)
+        top_row.addWidget(conn_box, stretch=2)
 
-        # Location
         loc_box = QGroupBox("Location")
         loc_l = QGridLayout(loc_box)
         self.lat_edit = QLineEdit("0.0")
         self.lon_edit = QLineEdit("0.0")
-        set_loc_btn = QPushButton("Set Location")
+        set_loc_btn = QPushButton("Set")
         set_loc_btn.clicked.connect(self._set_location)
         loc_l.addWidget(QLabel("Lat:"), 0, 0)
         loc_l.addWidget(self.lat_edit, 0, 1)
-        loc_l.addWidget(QLabel("Lon:"), 1, 0)
-        loc_l.addWidget(self.lon_edit, 1, 1)
-        loc_l.addWidget(set_loc_btn, 2, 0, 1, 2)
-        right.addWidget(loc_box)
+        loc_l.addWidget(QLabel("Lon:"), 0, 2)
+        loc_l.addWidget(self.lon_edit, 0, 3)
+        loc_l.addWidget(set_loc_btn, 0, 4)
+        top_row.addWidget(loc_box, stretch=2)
+        left.addLayout(top_row)
 
-        # Mode
-        mode_box = QGroupBox("Mode")
-        mode_l = QHBoxLayout(mode_box)
+        # ---- prominent status bar ----
+        self.status_display = QLabel("DISCONNECTED - Select COM port and click Connect")
+        self.status_display.setAlignment(Qt.AlignCenter)
+        self.status_display.setStyleSheet(
+            "background-color: #1a1a2e; color: #ffaa00; font-weight: bold; font-size: 14px; padding: 6px;")
+        left.addWidget(self.status_display)
+
+        # ---- position readout panel ----
+        pos_box = QGroupBox("Telescope Position (Sky)")
+        pos_l = QGridLayout(pos_box)
+        mono = "font-family: Consolas;"
+        self.sky_ra_label = QLabel("000.0000°")
+        self.sky_ra_label.setStyleSheet(mono + "color: #33ffaa; font-size: 16px; font-weight: bold;")
+        self.sky_dec_label = QLabel("+00.0000°")
+        self.sky_dec_label.setStyleSheet(mono + "color: #33ffaa; font-size: 16px; font-weight: bold;")
+        self.mount_ra_label = QLabel("0.0000°")
+        self.mount_dec_label = QLabel("0.0000°")
+        self.speed_ra_label = QLabel("0.000000 °/s")
+        self.speed_dec_label = QLabel("0.000000 °/s")
+        for lbl in (self.mount_ra_label, self.mount_dec_label, self.speed_ra_label, self.speed_dec_label):
+            lbl.setStyleSheet(mono + "color: #aaaacc;")
+
+        self.ra_offset_edit = QLineEdit("0.0")
+        self.ra_offset_edit.setFixedWidth(60)
+        self.dec_offset_edit = QLineEdit("0.0")
+        self.dec_offset_edit.setFixedWidth(60)
+        ra_off_minus = QPushButton("-")
+        ra_off_plus = QPushButton("+")
+        dec_off_minus = QPushButton("-")
+        dec_off_plus = QPushButton("+")
+        ra_off_minus.clicked.connect(lambda: self._adjust_offset(-1, 0))
+        ra_off_plus.clicked.connect(lambda: self._adjust_offset(1, 0))
+        dec_off_minus.clicked.connect(lambda: self._adjust_offset(0, -1))
+        dec_off_plus.clicked.connect(lambda: self._adjust_offset(0, 1))
+        for b in (ra_off_minus, ra_off_plus, dec_off_minus, dec_off_plus):
+            b.setFixedWidth(28)
+
+        pos_l.addWidget(QLabel("Sky RA:"), 0, 0)
+        pos_l.addWidget(self.sky_ra_label, 0, 1)
+        pos_l.addWidget(QLabel("Mount:"), 0, 2)
+        pos_l.addWidget(self.mount_ra_label, 0, 3)
+        pos_l.addWidget(QLabel("Speed:"), 0, 4)
+        pos_l.addWidget(self.speed_ra_label, 0, 5)
+        pos_l.addWidget(QLabel("Offset:"), 0, 6)
+        pos_l.addWidget(ra_off_minus, 0, 7)
+        pos_l.addWidget(self.ra_offset_edit, 0, 8)
+        pos_l.addWidget(ra_off_plus, 0, 9)
+
+        pos_l.addWidget(QLabel("Sky DEC:"), 1, 0)
+        pos_l.addWidget(self.sky_dec_label, 1, 1)
+        pos_l.addWidget(QLabel("Mount:"), 1, 2)
+        pos_l.addWidget(self.mount_dec_label, 1, 3)
+        pos_l.addWidget(QLabel("Speed:"), 1, 4)
+        pos_l.addWidget(self.speed_dec_label, 1, 5)
+        pos_l.addWidget(QLabel("Offset:"), 1, 6)
+        pos_l.addWidget(dec_off_minus, 1, 7)
+        pos_l.addWidget(self.dec_offset_edit, 1, 8)
+        pos_l.addWidget(dec_off_plus, 1, 9)
+
+        self.offset_inc_edit = QLineEdit("0.01")
+        self.offset_inc_edit.setFixedWidth(60)
+        pos_l.addWidget(QLabel("Offset increment:"), 2, 0, 1, 2)
+        pos_l.addWidget(self.offset_inc_edit, 2, 2)
+
+        self.error_label = QLabel("Error: RA 0.0000°  DEC 0.0000°")
+        self.error_label.setStyleSheet("color: #ffaa00;")
+        pos_l.addWidget(self.error_label, 3, 0, 1, 5)
+        self.tracking_status_label = QLabel("TRACKING: OFF")
+        self.tracking_status_label.setAlignment(Qt.AlignCenter)
+        self.tracking_status_label.setStyleSheet(
+            "background-color: #333344; color: #ccc; font-weight: bold; padding: 4px;")
+        pos_l.addWidget(self.tracking_status_label, 3, 5, 1, 5)
+        left.addWidget(pos_box)
+
+        # ---- toolbar row above the sky viz ----
+        toolbar = QHBoxLayout()
+        self.view_mode_btn = QPushButton("View: Free")
+        self.view_mode_btn.clicked.connect(self._cycle_view_mode)
+        self.iss_btn = QPushButton("ISS: OFF")
+        self.iss_btn.clicked.connect(self._toggle_iss)
+        self.const_btn = QPushButton("Constellations: ON")
+        self.const_btn.clicked.connect(self._toggle_constellations)
+        self.min_size_btn = QPushButton("Min Size: OFF")
+        self.min_size_btn.clicked.connect(self._toggle_min_size_filter)
+        self.min_size_edit = QLineEdit("100.0")
+        self.min_size_edit.setFixedWidth(50)
+        self.min_size_edit.editingFinished.connect(self._on_min_size_commit)
+        cam_minus = QPushButton("◄")
+        cam_plus = QPushButton("►")
+        cam_minus.setFixedWidth(28)
+        cam_plus.setFixedWidth(28)
+        cam_minus.clicked.connect(lambda: self._adjust_camera_orientation(-5.0))
+        cam_plus.clicked.connect(lambda: self._adjust_camera_orientation(5.0))
+        self.cam_rot_edit = QLineEdit("0.0")
+        self.cam_rot_edit.setFixedWidth(50)
+        self.cam_rot_edit.editingFinished.connect(self._on_cam_rot_commit)
+        self.find_edit = QLineEdit()
+        self.find_edit.setPlaceholderText("Find: star/DSO/Sun/Moon/ISS/planet name, Enter to target")
+        self.find_edit.returnPressed.connect(self._on_find_enter)
+        toolbar.addWidget(self.view_mode_btn)
+        toolbar.addWidget(self.iss_btn)
+        toolbar.addWidget(self.const_btn)
+        toolbar.addWidget(self.min_size_btn)
+        toolbar.addWidget(self.min_size_edit)
+        toolbar.addWidget(QLabel("Cam Rot:"))
+        toolbar.addWidget(cam_minus)
+        toolbar.addWidget(self.cam_rot_edit)
+        toolbar.addWidget(cam_plus)
+        toolbar.addWidget(self.find_edit, stretch=1)
+        left.addLayout(toolbar)
+
+        left.addWidget(self.viz, stretch=1)
+        self.hover_label = QLabel("Cursor: -")
+        self.hover_label.setStyleSheet("color: #9aa; font-family: Consolas;")
+        left.addWidget(self.hover_label)
+
+        # ---- bottom bar ----
+        bottom = QHBoxLayout()
+        self.mode_tracking_label = QLabel("MODE: SIDEREAL  |  TRACKING: OFF")
+        self.live_error_label = QLabel("Live Error: RA 0.0000°  DEC 0.0000°")
+        self.live_error_label.setStyleSheet("color: #ffaa00;")
+        bottom.addWidget(self.mode_tracking_label)
+        bottom.addStretch(1)
+        bottom.addWidget(self.live_error_label)
+        left.addLayout(bottom)
+
+        # ==================== RIGHT SIDEBAR ====================
+        title = QLabel("Tracking Controls")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-size: 15px; font-weight: bold;")
+        right.addWidget(title)
+
+        mode_box = QGroupBox("Tracking Mode")
+        mode_l = QVBoxLayout(mode_box)
         self.mode_group = QButtonGroup(self)
         for i, name in enumerate(("SIDEREAL", "SOLAR", "LUNAR")):
             rb = QRadioButton(name)
@@ -1099,56 +1262,78 @@ class MainWindow(QMainWindow):
         self.mode_group.idClicked.connect(self._on_mode_changed)
         right.addWidget(mode_box)
 
-        # Target / Goto / Sync
-        target_box = QGroupBox("Target (decimal degrees)")
+        self.tracking_btn = QPushButton("▶ Start Tracking")
+        self.tracking_btn.setStyleSheet("background-color: #006400; color: white; font-weight: bold; padding: 8px;")
+        self.tracking_btn.clicked.connect(self._toggle_tracking)
+        right.addWidget(self.tracking_btn)
+
+        self.safe_target_btn = QPushButton("Safe Target (DEC to 0°)")
+        self.safe_target_btn.clicked.connect(self._safe_target)
+        right.addWidget(self.safe_target_btn)
+        self.home_axes_btn = QPushButton("Home Axes (RA/DEC to 0°)")
+        self.home_axes_btn.clicked.connect(self._home_axes)
+        right.addWidget(self.home_axes_btn)
+
+        self.flipped_label = QLabel("Telescope Flipped: OFF")
+        self.flipped_label.setAlignment(Qt.AlignCenter)
+        right.addWidget(self.flipped_label)
+
+        sync_box = QGroupBox("Sync / Calibrate (choose star)")
+        sync_l = QVBoxLayout(sync_box)
+        self.sync_combo = QComboBox()
+        self.sync_combo.addItems(list(self.cal_stars.keys()))
+        self.sync_combo.setCurrentText("Vega (alpha Lyrae)")
+        sync_l.addWidget(self.sync_combo)
+        sync_btn = QPushButton("Sync Position (send to Arduino)")
+        sync_btn.clicked.connect(self._sync)
+        sync_l.addWidget(sync_btn)
+        right.addWidget(sync_box)
+
+        target_box = QGroupBox("Sidereal Target (degrees) - used by Start Tracking / Goto")
         target_l = QGridLayout(target_box)
         self.ra_edit = QLineEdit("0.0")
         self.dec_edit = QLineEdit("0.0")
         goto_btn = QPushButton("Goto")
         goto_btn.clicked.connect(self._goto)
-        sync_btn = QPushButton("Sync (calibrate here)")
-        sync_btn.clicked.connect(self._sync)
         target_l.addWidget(QLabel("RA:"), 0, 0)
         target_l.addWidget(self.ra_edit, 0, 1)
         target_l.addWidget(QLabel("DEC:"), 1, 0)
         target_l.addWidget(self.dec_edit, 1, 1)
-        target_l.addWidget(goto_btn, 2, 0)
-        target_l.addWidget(sync_btn, 2, 1)
+        target_l.addWidget(goto_btn, 2, 0, 1, 2)
         right.addWidget(target_box)
 
-        # Tracking
-        track_box = QGroupBox("Tracking")
-        track_l = QHBoxLayout(track_box)
-        self.tracking_btn = QPushButton("Start Tracking")
-        self.tracking_btn.clicked.connect(self._toggle_tracking)
+        resync_btn = QPushButton("Resync Arduino Time to Laptop")
+        resync_btn.clicked.connect(lambda: self._manual_resync())
+        right.addWidget(resync_btn)
+
+        debug_box = QGroupBox("Arduino Debug (verbose var dump)")
+        debug_l = QHBoxLayout(debug_box)
+        self.debug_toggle_btn = QPushButton("Verbose Debug: OFF")
+        self.debug_toggle_btn.clicked.connect(self._toggle_arduino_debug)
+        dump_btn = QPushButton("Force Dump")
+        dump_btn.clicked.connect(lambda: self.serial.request_debug_dump())
+        debug_l.addWidget(self.debug_toggle_btn)
+        debug_l.addWidget(dump_btn)
+        right.addWidget(debug_box)
+
         stop_btn = QPushButton("STOP (panic)")
-        stop_btn.setStyleSheet("background-color: #661111; color: white; font-weight: bold;")
+        stop_btn.setStyleSheet("background-color: #661111; color: white; font-weight: bold; padding: 6px;")
         stop_btn.clicked.connect(self._stop)
-        track_l.addWidget(self.tracking_btn)
-        track_l.addWidget(stop_btn)
-        right.addWidget(track_box)
+        right.addWidget(stop_btn)
 
-        # View follow mode
-        view_box = QGroupBox("Sky Viz Follow")
-        view_l = QHBoxLayout(view_box)
-        self.view_mode_group = QButtonGroup(self)
-        for i, name in enumerate(("Free", "Telescope", "Target")):
-            rb = QRadioButton(name)
-            if i == 0:
-                rb.setChecked(True)
-            self.view_mode_group.addButton(rb, i)
-            view_l.addWidget(rb)
-        self.view_mode_group.idClicked.connect(self._on_view_mode_changed)
-        right.addWidget(view_box)
-
-        # Log
-        log_box = QGroupBox("Log")
+        log_box = QGroupBox("Status / Messages")
         log_l = QVBoxLayout(log_box)
         self.log_edit = QTextEdit()
         self.log_edit.setReadOnly(True)
         self.log_edit.setStyleSheet("background-color: #111; color: #ccc; font-family: Consolas;")
         log_l.addWidget(self.log_edit)
         right.addWidget(log_box, stretch=1)
+
+        self._arduino_widgets = [
+            self.safe_target_btn, self.home_axes_btn, sync_btn, goto_btn,
+            self.tracking_btn, self.debug_toggle_btn, dump_btn,
+            ra_off_minus, ra_off_plus, dec_off_minus, dec_off_plus,
+        ]
 
     def _log(self, msg):
         self.log_edit.append(msg)
@@ -1207,6 +1392,32 @@ class MainWindow(QMainWindow):
         self.viz.update()
         self._log(f"Sky catalog loaded: {state['n_stars']} stars, {state['n_dso']} DSOs.")
 
+        # Search index for the Find box - named stars + all DSOs (by designation/name), same
+        # substring-match source EQMountApp._build_sky_catalog_state builds, minus the live
+        # Sun/Moon/ISS/planet entries (handled separately in _on_find_enter, since their RA/DEC
+        # come from self.viz.*_ra/_dec instead of a fixed catalog value).
+        index = []
+        for s in self.viz.sky_stars_by_ra:
+            if not s.get("name"):
+                continue
+            index.append((s["name"].lower(), s["name"], s["ra"], s["dec"]))
+        for d in self.viz.sky_dso:
+            display = f"{d['designation']} ({d['name']})" if d.get("name") else d["designation"]
+            index.append((display.lower(), display, d["ra"], d["dec"]))
+        self._search_index = index
+
+    def _resolve_live_body(self, name_lower):
+        if name_lower == "sun" and self.viz.sun_ra is not None:
+            return self.viz.sun_ra, self.viz.sun_dec
+        if name_lower == "moon" and self.viz.moon_ra is not None:
+            return self.viz.moon_ra, self.viz.moon_dec
+        if name_lower == "iss" and self.viz.iss_ra is not None:
+            return self.viz.iss_ra, self.viz.iss_dec
+        for pname, pos in self.viz.planet_positions.items():
+            if pname.lower() == name_lower:
+                return pos[0], pos[1]
+        return None
+
     # ---------------- solar system / ISS ----------------
     def _trigger_solar_system_update(self):
         worker = _SolarSystemWorker(self._get_lat_lon)
@@ -1248,11 +1459,23 @@ class MainWindow(QMainWindow):
         if self.serial.connect(port):
             self.connect_btn.setEnabled(False)
             self.disconnect_btn.setEnabled(True)
+            self._set_arduino_controls_enabled(True)
+            self._set_location()
+            self._send_current_offsets()
+            self.serial.send_pos_update_rate(POS_UPDATE_RATE_MS)
 
     def _disconnect(self):
         self.serial.disconnect()
         self.connect_btn.setEnabled(True)
         self.disconnect_btn.setEnabled(False)
+        self._set_arduino_controls_enabled(False)
+
+    def _set_arduino_controls_enabled(self, enabled: bool):
+        """Mirrors EQMountApp._set_arduino_controls_enabled - only controls that actually send
+        something to the Arduino are gated; viz zoom/pan/follow/ISS/Constellations/search etc.
+        all work fine offline."""
+        for w in getattr(self, "_arduino_widgets", []):
+            w.setEnabled(enabled)
 
     # ---------------- commands ----------------
     def _on_mode_changed(self, idx):
@@ -1260,9 +1483,78 @@ class MainWindow(QMainWindow):
         if self.serial.ser and self.serial.ser.is_open:
             self.serial.send_mode("SIDEREAL")  # wire protocol is always SIDEREAL - see tracker_gui.py's _on_mode_changed
         self._log(f"Mode changed to {mode}")
+        self._update_mode_tracking_label()
 
-    def _on_view_mode_changed(self, idx):
-        self.viz.view_mode = self.view_mode_group.button(idx).text().upper()
+    def _update_mode_tracking_label(self):
+        mode = self.mode_group.checkedButton().text() if self.mode_group.checkedButton() else "SIDEREAL"
+        state = "ON" if self.tracking else "OFF"
+        self.mode_tracking_label.setText(f"MODE: {mode}  |  TRACKING: {state}")
+        self.tracking_status_label.setText(f"TRACKING: {state}")
+        self.tracking_status_label.setStyleSheet(
+            ("background-color: #006400;" if self.tracking else "background-color: #333344;")
+            + " color: white; font-weight: bold; padding: 4px;")
+
+    def _cycle_view_mode(self):
+        order = ["FREE", "TELESCOPE", "TARGET"]
+        self.viz.view_mode = order[(order.index(self.viz.view_mode) + 1) % len(order)]
+        self.view_mode_btn.setText(f"View: {self.viz.view_mode.title()}")
+
+    def _toggle_iss(self):
+        self.viz.iss_enabled = not self.viz.iss_enabled
+        self.iss_btn.setText(f"ISS: {'ON' if self.viz.iss_enabled else 'OFF'}")
+        self.viz.update()
+
+    def _toggle_constellations(self):
+        self.viz.constellations_enabled = not self.viz.constellations_enabled
+        self.const_btn.setText(f"Constellations: {'ON' if self.viz.constellations_enabled else 'OFF'}")
+        self.viz.update()
+
+    def _toggle_min_size_filter(self):
+        self.viz.min_dso_size_filter_enabled = not self.viz.min_dso_size_filter_enabled
+        self.min_size_btn.setText(f"Min Size: {'ON' if self.viz.min_dso_size_filter_enabled else 'OFF'}")
+        self.viz.update()
+
+    def _on_min_size_commit(self):
+        try:
+            self.viz.min_dso_size_px = float(self.min_size_edit.text())
+            self.viz.update()
+        except ValueError:
+            self._log("Invalid min DSO size value.")
+
+    def _adjust_camera_orientation(self, delta_deg):
+        self._set_camera_orientation(self.viz.camera_orientation_deg + delta_deg)
+
+    def _on_cam_rot_commit(self):
+        try:
+            self._set_camera_orientation(float(self.cam_rot_edit.text()))
+        except ValueError:
+            self._log("Invalid camera rotation value.")
+            self.cam_rot_edit.setText(f"{self.viz.camera_orientation_deg:.1f}")
+
+    def _set_camera_orientation(self, angle_deg):
+        self.viz.camera_orientation_deg = (angle_deg + 180.0) % 360.0 - 180.0
+        self.cam_rot_edit.setText(f"{self.viz.camera_orientation_deg:.1f}")
+        self.viz.update()
+
+    def _on_find_enter(self):
+        """Simplified version of EQMountApp's sky-search box: substring match against the index
+        built in _on_catalog_loaded (or the live Sun/Moon/ISS/planets), targets the first hit -
+        not the multi-result picker list the Tk version has."""
+        query = self.find_edit.text().strip().lower()
+        if not query:
+            return
+        live = self._resolve_live_body(query)
+        if live is not None:
+            ra, dec = live
+            self._on_target_picked(ra, dec)
+            self._log(f"Found: {query} -> RA {ra:.4f} DEC {dec:.4f}")
+            return
+        for blob, display, ra, dec in self._search_index:
+            if query in blob:
+                self._on_target_picked(ra, dec)
+                self._log(f"Found: {display} -> RA {ra:.4f} DEC {dec:.4f}")
+                return
+        self._log(f"No match for '{query}'.")
 
     def _parse_target_inputs(self):
         try:
@@ -1286,15 +1578,95 @@ class MainWindow(QMainWindow):
             self._log("Not connected.")
 
     def _sync(self):
-        parsed = self._parse_target_inputs()
-        if parsed is None:
-            return
-        ra, dec = parsed
+        """Mirrors EQMountApp._sync_position: resolves the chosen calibration point (named star
+        via the catalog's own RA/DEC when loaded, horizon East/West via current LST, or the
+        RA/DEC fields for "Custom") and sends it as the calibration position."""
+        star_name = self.sync_combo.currentText()
+        star_pos = self.cal_stars.get(star_name)
+        if star_pos in ("EAST", "WEST"):
+            lst = self.viz.current_lst_deg()
+            ra = (lst + 90.0) % 360.0 if star_pos == "EAST" else (lst - 90.0) % 360.0
+            dec = 0.0
+        elif star_pos is not None:
+            ra, dec = star_pos
+            hip = self.cal_star_hip.get(star_name)
+            catalog_star = self.viz.star_by_hip.get(hip) if hip else None
+            if catalog_star is not None:
+                ra, dec = catalog_star["ra"], catalog_star["dec"]
+        else:
+            parsed = self._parse_target_inputs()
+            if parsed is None:
+                return
+            ra, dec = parsed
+        self.ra_edit.setText(f"{ra:.4f}")
+        self.dec_edit.setText(f"{dec:.4f}")
         if self.serial.ser and self.serial.ser.is_open:
             self.serial.send_sync(ra, dec)
-            self._log(f"Sync at RA {ra:.4f} DEC {dec:.4f}")
+            self._log(f"Sync sent: RA={ra:.6f} DEC={dec:.6f} (star: {star_name})")
         else:
             self._log("Not connected.")
+
+    def _adjust_offset(self, ra_dir, dec_dir):
+        """Mirrors EQMountApp._adjust_offset - increments are sent LIVE as a CMD,SYNC_OFFSET
+        delta, and also tracked cumulatively (ra_offset/dec_offset) so a fresh connection can
+        resend the total via _send_current_offsets."""
+        try:
+            increment = float(self.offset_inc_edit.text())
+        except ValueError:
+            self._log("Invalid offset increment.")
+            return
+        ra_adj = ra_dir * increment
+        dec_adj = dec_dir * increment
+        self.ra_offset = round(self.ra_offset + ra_adj, 6)
+        self.dec_offset = round(self.dec_offset + dec_adj, 6)
+        self.ra_offset_edit.setText(f"{self.ra_offset}")
+        self.dec_offset_edit.setText(f"{self.dec_offset}")
+        if self.serial.ser and self.serial.ser.is_open:
+            self.serial.send_sync_offset(ra_adj, dec_adj)
+            self._log(f"Offset adjustment: RA={ra_adj:.6f}° DEC={dec_adj:.6f}° "
+                      f"(cumulative: RA={self.ra_offset:.6f}° DEC={self.dec_offset:.6f}°)")
+        else:
+            self._log("Offset adjustment queued (not connected).")
+
+    def _send_current_offsets(self):
+        if self.serial.ser and self.serial.ser.is_open and (abs(self.ra_offset) > 1e-4 or abs(self.dec_offset) > 1e-4):
+            self.serial.send_sync_offset(self.ra_offset, self.dec_offset)
+            self._log(f"Sent cumulative offsets: RA={self.ra_offset:.6f}° DEC={self.dec_offset:.6f}°")
+
+    def _safe_target(self):
+        if not (self.serial.ser and self.serial.ser.is_open):
+            self._log("Not connected.")
+            return
+        self.serial.send_stop()
+        self.serial.send_safe_target()
+        self.tracking = False
+        self._update_mode_tracking_label()
+        self._log("Safe Target sent: sky DEC -> 0°, RA unchanged, no tracking.")
+
+    def _home_axes(self):
+        if not (self.serial.ser and self.serial.ser.is_open):
+            self._log("Not connected.")
+            return
+        self.serial.send_stop()
+        self.serial.send_home_axes()
+        self.tracking = False
+        self._update_mode_tracking_label()
+        self._log("Home Axes sent: RA/DEC -> mount angle 0°, no tracking.")
+
+    def _manual_resync(self):
+        if self.serial.send_time_if_connected():
+            self._log("Arduino time resynced to laptop.")
+        else:
+            self._log("Not connected - time will sync on next connect.")
+
+    def _toggle_arduino_debug(self):
+        if not (self.serial.ser and self.serial.ser.is_open):
+            self._log("Not connected.")
+            return
+        self.arduino_debug_enabled = not self.arduino_debug_enabled
+        self.serial.send_debug(self.arduino_debug_enabled)
+        self.debug_toggle_btn.setText(f"Verbose Debug: {'ON' if self.arduino_debug_enabled else 'OFF'}")
+        self._log(f"Sent CMD,DEBUG,{'ON' if self.arduino_debug_enabled else 'OFF'}")
 
     def _toggle_tracking(self):
         if not (self.serial.ser and self.serial.ser.is_open):
@@ -1303,16 +1675,21 @@ class MainWindow(QMainWindow):
         if not self.tracking:
             if self.serial.send_start_tracking(risk_ok=True):
                 self.tracking = True
-                self.tracking_btn.setText("Stop Tracking")
+                self.tracking_btn.setText("■ Stop Tracking")
+                self.tracking_btn.setStyleSheet("background-color: #8B0000; color: white; font-weight: bold; padding: 8px;")
         else:
             self.serial.send_stop()
             self.tracking = False
-            self.tracking_btn.setText("Start Tracking")
+            self.tracking_btn.setText("▶ Start Tracking")
+            self.tracking_btn.setStyleSheet("background-color: #006400; color: white; font-weight: bold; padding: 8px;")
+        self._update_mode_tracking_label()
 
     def _stop(self):
         self.serial.send_stop()
         self.tracking = False
-        self.tracking_btn.setText("Start Tracking")
+        self.tracking_btn.setText("▶ Start Tracking")
+        self.tracking_btn.setStyleSheet("background-color: #006400; color: white; font-weight: bold; padding: 8px;")
+        self._update_mode_tracking_label()
 
     def _on_target_picked(self, ra, dec):
         self.ra_edit.setText(f"{ra:.4f}")
@@ -1320,6 +1697,32 @@ class MainWindow(QMainWindow):
 
     def _on_hover_info(self, text):
         self.hover_label.setText(text)
+
+    @staticmethod
+    def _calc_smoothed_speed(history, window_s=0.250):
+        """Ported 1:1 from EQMountApp._calc_smoothed_speed - rate of change over the last
+        window_s of a (value, timestamp) deque, falling back to the single last delta if the
+        previous sample is older than that."""
+        if len(history) < 2:
+            return 0.0
+        curr_ang, curr_t = history[-1]
+        window_start = curr_t - window_s
+        start_idx = 0
+        for i, (ang, t) in enumerate(history):
+            if t >= window_start:
+                start_idx = i
+                break
+        if start_idx == len(history) - 1:
+            prev_ang, prev_t = history[-2]
+            dt = curr_t - prev_t
+            return (curr_ang - prev_ang) / dt if dt > 0 else 0.0
+        total_dangle, total_dt = 0.0, 0.0
+        for i in range(start_idx, len(history) - 1):
+            a0, t0 = history[i]
+            a1, t1 = history[i + 1]
+            total_dangle += a1 - a0
+            total_dt += t1 - t0
+        return total_dangle / total_dt if total_dt > 0 else 0.0
 
     # ---------------- serial queue polling ----------------
     def _poll_serial_queue(self):
@@ -1335,14 +1738,17 @@ class MainWindow(QMainWindow):
             port = msg.split(":", 1)[1]
             self.conn_status.setText(f"● Connected {port}")
             self.conn_status.setStyleSheet("color: #00FF88;")
-            self._log(f"Connected to {port}.")
-            lat, lon = self._get_lat_lon()
-            self.serial.send_command(f"CMD,SET_LOCATION,LAT:{lat:.6f},LON:{lon:.6f}")
+            self._update_status_display("CONNECTED - WAITING FOR PING RESPONSE", "#ffaa00")
+            self._log(f"Connected to {port}. Waiting for Arduino response...")
+        elif msg.startswith("RX:STATUS:PONG"):
+            self._update_status_display("CONNECTED - READY", "#00ff88")
+            self._log("Arduino responded to PING - connection fully established")
         elif msg.startswith("DISCONNECTED"):
             self.conn_status.setText("● Disconnected")
             self.conn_status.setStyleSheet("color: gray;")
             self.tracking = False
-            self.tracking_btn.setText("Start Tracking")
+            self._update_mode_tracking_label()
+            self._update_status_display("DISCONNECTED", "#ff4444")
             self._log("Disconnected")
         elif msg.startswith("RX:"):
             self._parse_arduino_line(msg[3:])
@@ -1351,6 +1757,12 @@ class MainWindow(QMainWindow):
                 self._log(msg)
         elif msg.startswith("ERROR:"):
             self._log("ERROR: " + msg[6:])
+            self.error_label.setText("Error: " + msg[6:])
+
+    def _update_status_display(self, text, color="#ffaa00"):
+        self.status_display.setText(text)
+        self.status_display.setStyleSheet(
+            f"background-color: #1a1a2e; color: {color}; font-weight: bold; font-size: 14px; padding: 6px;")
 
     def _parse_arduino_line(self, line: str):
         line = line.strip()
@@ -1358,6 +1770,8 @@ class MainWindow(QMainWindow):
             return
         if line.startswith("STATUS:"):
             self._log(line)
+            if not line.startswith("STATUS:WAITING"):
+                self._update_status_display(line[len("STATUS:"):])
             return
         if line.startswith("POS,"):
             # POS,skyRA,skyDEC,targetRA,targetDEC,mountRA,mountDEC,mode,tracking,flipped - see
@@ -1369,27 +1783,68 @@ class MainWindow(QMainWindow):
                 self.current_dec = float(fields[2])
                 self.target_ra = float(fields[3])
                 self.target_dec = float(fields[4])
-            except (ValueError, IndexError):
+                self.mount_ra_angle = float(fields[5])
+                self.mount_dec_angle = float(fields[6])
+                self.err_ra = abs(self.current_ra - self.target_ra)
+                self.err_dec = abs(self.current_dec - self.target_dec)
+
+                now = time.time()
+                cutoff = now - 1.0
+                self.ra_pos_history.append((self.mount_ra_angle, now))
+                while self.ra_pos_history and self.ra_pos_history[0][1] < cutoff:
+                    self.ra_pos_history.popleft()
+                self.speed_ra = self._calc_smoothed_speed(self.ra_pos_history)
+
+                self.dec_pos_history.append((self.mount_dec_angle, now))
+                while self.dec_pos_history and self.dec_pos_history[0][1] < cutoff:
+                    self.dec_pos_history.popleft()
+                self.speed_dec = self._calc_smoothed_speed(self.dec_pos_history)
+            except (ValueError, TypeError, IndexError):
                 return
             if len(fields) > 8:
-                self.tracking = fields[8].strip() == "1" or self.tracking
-                self.tracking_btn.setText("Stop Tracking" if self.tracking else "Start Tracking")
+                pos_track = fields[8].strip() == "1"
+                if pos_track and not self.tracking:
+                    self.tracking = True
+                    self._update_mode_tracking_label()
             if len(fields) > 9:
                 try:
-                    self.viz.telescope_flipped = fields[9].strip() == "1"
+                    flipped = fields[9].strip() == "1"
+                    self.viz.telescope_flipped = flipped
+                    self.flipped_label.setText(f"Telescope Flipped: {'ON' if flipped else 'OFF'}")
                 except (ValueError, IndexError):
                     pass
+
             self.viz.current_ra, self.viz.current_dec = self.current_ra, self.current_dec
             self.viz.target_ra, self.viz.target_dec = self.target_ra, self.target_dec
+            # Simplified stability color vs EQMountApp's windowed-derivative STABLE/SETTLING/
+            # DRIFTING classification (see TRACKING_STABLE_ERR_DEG/_DERIV_DEG_S/_WINDOW_S there) -
+            # just a live error-magnitude threshold here.
+            if not self.tracking:
+                self.viz.stability_color = QColor("#888888")
+            elif max(self.err_ra, self.err_dec) <= TRACKING_STABLE_ERR_DEG:
+                self.viz.stability_color = QColor("#33ff88")
+            else:
+                self.viz.stability_color = QColor("#ffaa00")
+
             if self.viz.view_mode == "TELESCOPE":
                 self.viz.center_ra, self.viz.center_dec = self.current_ra % 360.0, self.current_dec
                 self.viz.clamp_center()
             elif self.viz.view_mode == "TARGET":
                 self.viz.center_ra, self.viz.center_dec = self.target_ra % 360.0, self.target_dec
                 self.viz.clamp_center()
+
             now = time.time()
             if now - self._last_pos_ui_update >= POS_UI_UPDATE_MIN_INTERVAL_S:
                 self._last_pos_ui_update = now
+                self.sky_ra_label.setText(f"{self.current_ra:07.4f}°")
+                self.sky_dec_label.setText(f"{self.current_dec:+08.4f}°")
+                self.mount_ra_label.setText(f"{self.mount_ra_angle:.4f}°")
+                self.mount_dec_label.setText(f"{self.mount_dec_angle:.4f}°")
+                self.speed_ra_label.setText(f"{self.speed_ra:.6f} °/s")
+                self.speed_dec_label.setText(f"{self.speed_dec:.6f} °/s")
+                self.error_label.setText(f"Error: RA {self.err_ra:.4f}°  DEC {self.err_dec:.4f}°")
+                self.live_error_label.setText(f"Live Error: RA {self.err_ra:.4f}°  DEC {self.err_dec:.4f}°")
+                self._update_mode_tracking_label()
                 self.viz.update()
 
 
