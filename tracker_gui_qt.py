@@ -66,8 +66,27 @@ from tracker_gui import (
     POS_UPDATE_RATE_MS, POSITION_BROADCAST_HZ, DEFAULT_LAT, DEFAULT_LON,
     SIDEREAL_RATE_DEG_S, MERIDIAN_LIMIT_WARNING_S, MERIDIAN_LIMIT_URGENT_S,
     CONFIG_PATH, ISS_TRACKING_UPDATE_MS, ISS_DISPLAY_UPDATE_MS, SOLAR_SYSTEM_UPDATE_MS, _muted_hex_color,
+    GUI_VERSION,
 )
 from sky_data import sky_catalog, iss_tracker, solar_system
+
+
+def _read_ino_firmware_version():
+    """Reads FIRMWARE_VERSION out of the project's EQMountTracker.ino - the "most up to date
+    firmware version" the connected Arduino's own reported STATUS:FIRMWARE: version is compared
+    against (see MainWindow._update_version_label's mismatch indicator). Returns None if the file
+    can't be found or parsed (e.g. this GUI file relocated/packaged without the firmware source
+    next to it) - the mismatch indicator just stays off in that case rather than erroring."""
+    ino_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "EQMountTracker", "EQMountTracker.ino")
+    try:
+        with open(ino_path, "r", encoding="utf-8") as f:
+            for line in f:
+                m = re.match(r'\s*#define\s+FIRMWARE_VERSION\s+"([^"]+)"', line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return None
 
 
 # ============================================================
@@ -1216,7 +1235,7 @@ def _run_in_thread(worker):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("EQ Mount DIY Go-To Kit - Qt Controller (experimental)")
+        self.setWindowTitle("EQ Mount DIY Go-To Kit")
         self.resize(1440, 900)
 
         # Time Travel - THE single source of "now" for this whole app, exactly like
@@ -1250,6 +1269,11 @@ class MainWindow(QMainWindow):
         # disabled from a previous session (Arduino stayed powered through a GUI restart) gets
         # corrected back to whatever the GUI currently shows.
         self.meridian_limit_enabled = True
+        # See version_row/_update_version_label - arduino_firmware_version is None until a
+        # connected Arduino actually reports one (STATUS:FIRMWARE:); _ino_firmware_version is
+        # read once from this project's own EQMountTracker.ino (None if that file isn't found).
+        self.arduino_firmware_version = None
+        self._ino_firmware_version = _read_ino_firmware_version()
         self.arduino_debug_enabled = False
         self.last_status = ""
         self._last_pos_ui_update = 0.0
@@ -1402,18 +1426,44 @@ class MainWindow(QMainWindow):
         conn_box = QGroupBox("Connection")
         conn_l = QGridLayout(conn_box)
         self.port_combo = QComboBox()
-        refresh_btn = QPushButton("Refresh")
-        refresh_btn.clicked.connect(self._refresh_ports)
-        self._flat_btn(refresh_btn, "cyan")
         # Single Connect<->Disconnect toggle (like tracking_btn), not two separate buttons.
+        # Sits immediately right of the port dropdown (where Refresh used to be) - Refresh itself
+        # moved to a small icon-only button right of Connect, per request.
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.clicked.connect(self._toggle_connection)
         self._flat_btn(self.connect_btn, "green")
+        # "↻" (U+21BB CLOCKWISE OPEN CIRCLE ARROW) - the typical refresh glyph, icon-only rather
+        # than a text button now that it's tucked next to Connect instead of spanning its own space.
+        refresh_btn = QPushButton("↻")
+        refresh_btn.setFixedWidth(32)
+        refresh_btn.setToolTip("Refresh port list")
+        refresh_btn.clicked.connect(self._refresh_ports)
+        self._flat_btn(refresh_btn, "cyan")
         self.conn_status = QLabel("● Disconnected")
         self.conn_status.setStyleSheet("color: gray;")
-        conn_l.addWidget(self.port_combo, 0, 0, 1, 2)
+
+        # GUI version always shown; Arduino firmware version appended once connected and
+        # reported (STATUS:FIRMWARE: - see _parse_arduino_line/_update_version_label), colored
+        # orange with a hover-tooltip info icon if it doesn't match FIRMWARE_VERSION in this
+        # project's own EQMountTracker.ino (_read_ino_firmware_version) - i.e. the mount is
+        # running firmware other than what's currently in the project files, most likely stale/
+        # not yet reflashed after a firmware change here.
+        version_row = QHBoxLayout()
+        version_row.setContentsMargins(0, 0, 0, 0)
+        version_row.setSpacing(4)
+        self.version_label = QLabel(f"GUI v{GUI_VERSION}")
+        self.version_label.setStyleSheet("color: #8888aa; font-size: 11px;")
+        version_row.addWidget(self.version_label)
+        self.version_info_icon = QLabel("ⓘ")
+        self.version_info_icon.setStyleSheet(f"color: {PALETTE['orange']}; font-size: 11px; font-weight: bold;")
+        self.version_info_icon.hide()
+        version_row.addWidget(self.version_info_icon)
+        version_row.addStretch(1)
+
+        conn_l.addWidget(self.port_combo, 0, 0)
+        conn_l.addWidget(self.connect_btn, 0, 1)
         conn_l.addWidget(refresh_btn, 0, 2)
-        conn_l.addWidget(self.connect_btn, 1, 0, 1, 2)
+        conn_l.addLayout(version_row, 1, 0, 1, 2)
         conn_l.addWidget(self.conn_status, 1, 2)
         top_row.addWidget(conn_box, stretch=2)
 
@@ -2296,6 +2346,33 @@ class MainWindow(QMainWindow):
         self.connect_btn.setText("Connect")
         self._flat_btn(self.connect_btn, "green")
         self._set_arduino_controls_enabled(False)
+        # No longer a live Arduino to have reported a version - drop back to GUI-version-only
+        # rather than keep showing a firmware version that may no longer even be the same device.
+        self.arduino_firmware_version = None
+        self._update_version_label()
+
+    def _update_version_label(self):
+        """Refreshes version_label/version_info_icon (see their construction in _build_ui) - GUI
+        version always shown; Arduino firmware version appended once connected and reported
+        (STATUS:FIRMWARE:, see _parse_arduino_line), colored orange with a hover-tooltip info
+        icon if it doesn't match FIRMWARE_VERSION in this project's own EQMountTracker.ino
+        (_ino_firmware_version) - i.e. the mount is running firmware other than what's currently
+        in the project files, most likely stale/not yet reflashed after a firmware change here.
+        Called on connect/disconnect and whenever a fresh STATUS:FIRMWARE: line arrives."""
+        text = f"GUI v{GUI_VERSION}"
+        mismatch = False
+        if self.arduino_firmware_version is not None:
+            text += f"   |   Firmware v{self.arduino_firmware_version}"
+            mismatch = (self._ino_firmware_version is not None
+                        and self.arduino_firmware_version != self._ino_firmware_version)
+        self.version_label.setText(text)
+        self.version_label.setStyleSheet(f"color: {PALETTE['orange'] if mismatch else '#8888aa'}; font-size: 11px;")
+        if mismatch:
+            self.version_info_icon.setToolTip(
+                f"Most up to date firmware in project files: v{self._ino_firmware_version}")
+            self.version_info_icon.show()
+        else:
+            self.version_info_icon.hide()
 
     def _set_arduino_controls_enabled(self, enabled: bool):
         """Mirrors EQMountApp._set_arduino_controls_enabled - only controls that actually send
@@ -3048,6 +3125,12 @@ class MainWindow(QMainWindow):
             # EQMountApp._parse_arduino_line's comment on this same check.
             if "CMD_ACTION:START_TRACKING" in line and self._pending_action == "START":
                 self._pending_action_confirmed = True
+
+        if line.startswith("STATUS:FIRMWARE:"):
+            self.arduino_firmware_version = line[len("STATUS:FIRMWARE:"):].strip()
+            self._log(f"Arduino firmware version: {self.arduino_firmware_version}")
+            self._update_version_label()
+            return
 
         if line.startswith("STATUS:"):
             if not line.startswith("STATUS:WAITING"):
