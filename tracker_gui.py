@@ -105,7 +105,12 @@ from sky_data import sky_catalog, iss_tracker, solar_system
 #           before TRACKING phase even began. Now also cleared at the true ALIGNING->TRACKING
 #           transition (the final, non-AXIS:RA TRACKING_STARTED line), so the stability trend is
 #           judged only on real tracking data.
-GUI_VERSION = "1.0.7"
+#   1.0.8 - Added a Meridian Limit ON/OFF toggle (new meridian_limit_btn), mirroring the
+#           firmware 1.8.52 CMD,SET_MERIDIAN_LIMIT toggle - turning it OFF requires an explicit
+#           confirmation dialog every time, same pattern as the solar tracking safety gate.
+#           Re-sent to the Arduino on every connect (_apply_initial_meridian_limit) and
+#           reconciled against firmware-confirmed state via STATUS:MERIDIAN_LIMIT_ENABLED.
+GUI_VERSION = "1.0.8"
 
 BAUD_RATE = 250000
 # GUI poll rate for the serial queue. Fast enough to comfortably keep up with the Arduino's 50Hz
@@ -782,6 +787,15 @@ class SerialHandler:
         """Query Arduino for its current location (requires firmware support)."""
         self.send_command("CMD,QUERY_LOCATION")
 
+    def send_meridian_limit(self, enable: bool):
+        """Enable/disable the firmware's meridian-limit safety check (see meridianLimitEnabled
+        in the .ino) - requires firmware 1.8.52+."""
+        self.send_command(f"CMD,SET_MERIDIAN_LIMIT,ENABLED:{1 if enable else 0}")
+
+    def send_query_meridian_limit(self):
+        """Query Arduino for its current meridian-limit enabled state (requires firmware 1.8.52+)."""
+        self.send_command("CMD,QUERY_MERIDIAN_LIMIT")
+
     def request_debug_dump(self):
         """Ask Arduino for one full debug state dump right now."""
         self.send_command("CMD,DEBUG,DUMP")
@@ -847,6 +861,14 @@ class EQMountApp(ctk.CTk):
         # Last CONFIRMED telescope-flip state (from POS's "flipped" field or STATUS:FLIP_COMPLETE)
         # - see _toggle_telescope_flipped/flipped_toggle_btn and the .ino's setTelescopeFlipped().
         self._telescope_flipped = False
+        # Local mirror of the firmware's meridianLimitEnabled flag - see
+        # _toggle_meridian_limit/meridian_limit_btn and the .ino's CMD,SET_MERIDIAN_LIMIT.
+        # Defaults True (enabled/safe), matching the firmware's own boot default, and is
+        # re-sent to the Arduino on every connect (_apply_initial_meridian_limit) so a firmware
+        # that was left disabled from a previous session (Arduino stayed powered through a GUI
+        # restart) gets corrected back to whatever the GUI currently shows, rather than the two
+        # silently disagreeing.
+        self._meridian_limit_enabled = True
         self.arduino_debug_enabled = False
         self.last_status = "Disconnected"
         self.system_state = "DISCONNECTED"
@@ -1491,6 +1513,19 @@ class EQMountApp(ctk.CTk):
             command=self._toggle_telescope_flipped
         )
         self.flipped_toggle_btn.pack(fill="x", pady=(0, 4))
+
+        # Master on/off for the firmware's meridian-limit safety check (see meridianLimitEnabled
+        # in the .ino / _toggle_meridian_limit below) - for advanced users with confirmed
+        # mechanical clearance past the meridian. Defaults ON (safe); turning it OFF requires an
+        # explicit confirmation dialog every time, same pattern as the solar tracking safety gate.
+        self.meridian_limit_btn = ctk.CTkButton(
+            btn_frame,
+            text="Meridian Limit: ON",
+            height=28,
+            fg_color="#006400",
+            command=self._toggle_meridian_limit
+        )
+        self.meridian_limit_btn.pack(fill="x", pady=(0, 4))
 
         # Sync with star selector
         sync_frame = ctk.CTkFrame(right)
@@ -3558,6 +3593,13 @@ class EQMountApp(ctk.CTk):
         if hasattr(self, 'serial') and self.serial and self.serial.ser and self.serial.ser.is_open:
             self.serial.send_pos_update_rate(POS_UPDATE_RATE_MS)
 
+    def _apply_initial_meridian_limit(self):
+        """Re-sends the GUI's current meridian-limit toggle state to the Arduino on every connect
+        (see _meridian_limit_enabled's comment) - belt-and-suspenders against the firmware having
+        been left disabled from a previous session while staying powered through a GUI restart."""
+        if hasattr(self, 'serial') and self.serial and self.serial.ser and self.serial.ser.is_open:
+            self.serial.send_meridian_limit(self._meridian_limit_enabled)
+
     # ---------------- QUEUE / MESSAGE HANDLING ----------------
     def _poll_queue(self):
         try:
@@ -3804,6 +3846,55 @@ class EQMountApp(ctk.CTk):
         else:
             self.flipped_toggle_btn.configure(text="Telescope Flipped: OFF", fg_color="#444444")
         self._schedule_viz_redraw()  # the meridian-limit shading only draws while not flipped
+
+    def _toggle_meridian_limit(self):
+        """Toggles the firmware's meridian-limit safety check on/off (CMD,SET_MERIDIAN_LIMIT -
+        see meridianLimitEnabled in the .ino). Unlike the telescope-flip toggle, this applies
+        instantly firmware-side (no motor movement to wait on), so the button updates
+        optimistically here rather than waiting for STATUS:MERIDIAN_LIMIT_ENABLED confirmation -
+        that confirmation still arrives and will correct the button if it ever disagrees (e.g.
+        a write that silently failed)."""
+        if not self.serial or not self.serial.ser or not self.serial.ser.is_open:
+            self._log("Not connected.")
+            return
+        requested = not self._meridian_limit_enabled
+        if not requested:
+            # Turning OFF a safety check that exists to prevent an OTA/dovetail-vs-tripod/pier
+            # collision - require explicit confirmation every time, same pattern as the solar
+            # tracking safety gate (_toggle_tracking), since this is exactly the kind of setting
+            # that's easy to forget was left off between sessions.
+            if not messagebox.askyesno(
+                "Disable Meridian Limit Safety Check",
+                "This disables the mount's meridian-limit safety check.\n\n"
+                "With it off, GOTO/tracking will NOT be refused or stopped when the target "
+                "crosses the meridian - only do this if you have confirmed your mount's actual "
+                "mechanical clearance past the meridian.\n\n"
+                "Disable the meridian limit check?",
+                icon="warning",
+            ):
+                self._log("Meridian limit disable cancelled.")
+                return
+        self._meridian_limit_enabled = requested
+        self.serial.send_meridian_limit(requested)
+        if requested:
+            self.meridian_limit_btn.configure(text="Meridian Limit: ON", fg_color="#006400")
+        else:
+            self.meridian_limit_btn.configure(text="Meridian Limit: OFF", fg_color="#8B0000")
+        self._log(f"Meridian limit safety check: {'ON' if requested else 'OFF'}")
+        self._schedule_viz_redraw()  # the meridian-limit shading only makes sense while enabled
+
+    def _on_meridian_limit_confirmed(self, enabled: bool):
+        """Reconciles self._meridian_limit_enabled/meridian_limit_btn with a firmware-confirmed
+        state (STATUS:MERIDIAN_LIMIT_ENABLED, from our own SET_MERIDIAN_LIMIT or a QUERY reply on
+        connect) - a no-op if already showing that state, so it's safe to call on every such line."""
+        if enabled == self._meridian_limit_enabled:
+            return
+        self._meridian_limit_enabled = enabled
+        if enabled:
+            self.meridian_limit_btn.configure(text="Meridian Limit: ON", fg_color="#006400")
+        else:
+            self.meridian_limit_btn.configure(text="Meridian Limit: OFF", fg_color="#8B0000")
+        self._schedule_viz_redraw()
 
     def _toggle_iss_tracking(self):
         self._iss_enabled = not self._iss_enabled
@@ -4309,7 +4400,10 @@ class EQMountApp(ctk.CTk):
 
             # Apply current GUI rate to Arduino shortly after connect
             self.after(1200, self._apply_initial_rate)
-        
+
+            # Re-sync the meridian-limit toggle too - see _apply_initial_meridian_limit's comment.
+            self.after(1200, self._apply_initial_meridian_limit)
+
         elif msg.startswith("RX:STATUS:PONG"):
             # Arduino responded to our PING command - connection is fully established
             if self._connection_timeout_id is not None:
@@ -4465,6 +4559,15 @@ class EQMountApp(ctk.CTk):
                         hz = 1000.0 / confirmed_ms if confirmed_ms > 0 else 0.0
                         self.pos_rate_label.configure(
                             text=f"Arduino POS Update Rate: {confirmed_ms} ms (~{hz:.1f} Hz)")
+
+            # Firmware-confirmed meridian-limit enabled state - from our own SET_MERIDIAN_LIMIT or
+            # a QUERY_MERIDIAN_LIMIT reply on connect (see _apply_initial_meridian_limit). Requires
+            # firmware 1.8.52+; silently ignored (no attribute error) on older firmware that never
+            # sends this line, so the GUI just keeps assuming its own default (enabled).
+            if "MERIDIAN_LIMIT_ENABLED" in line:
+                m = re.search(r"MERIDIAN_LIMIT_ENABLED,(\d)", line)
+                if m:
+                    self._on_meridian_limit_confirmed(m.group(1) == "1")
 
             # Extract error if present (from STATUS during alignment)
             if "ERROR:" in line:

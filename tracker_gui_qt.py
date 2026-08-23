@@ -1198,6 +1198,13 @@ class MainWindow(QMainWindow):
         self.dec_offset = 0.0
         self.tracking = False
         self.slewing = False
+        # Local mirror of the firmware's meridianLimitEnabled flag - see
+        # _toggle_meridian_limit/meridian_limit_btn and the .ino's CMD,SET_MERIDIAN_LIMIT.
+        # Defaults True (enabled/safe), matching the firmware's own boot default, and is re-sent
+        # to the Arduino on every connect (_apply_initial_meridian_limit) so a firmware left
+        # disabled from a previous session (Arduino stayed powered through a GUI restart) gets
+        # corrected back to whatever the GUI currently shows.
+        self.meridian_limit_enabled = True
         self.arduino_debug_enabled = False
         self.last_status = ""
         self._last_pos_ui_update = 0.0
@@ -1722,6 +1729,15 @@ class MainWindow(QMainWindow):
         self.flipped_btn.clicked.connect(self._toggle_telescope_flipped)
         right.addWidget(self.flipped_btn)
 
+        # Master on/off for the firmware's meridian-limit safety check - see
+        # EQMountApp._toggle_meridian_limit's docstring (ported here) and meridianLimitEnabled in
+        # the .ino. Unlike flipped_btn above, this applies instantly firmware-side, so it updates
+        # optimistically on click rather than waiting for a STATUS confirmation.
+        self.meridian_limit_btn = QPushButton("Meridian Limit: ON")
+        self.meridian_limit_btn.clicked.connect(self._toggle_meridian_limit)
+        self.meridian_limit_btn.setStyleSheet(f"background-color: {PALETTE['green']}; color: black; font-weight: bold;")
+        right.addWidget(self.meridian_limit_btn)
+
         sync_box = QGroupBox("Sync / Calibrate (choose star)")
         sync_l = QVBoxLayout(sync_box)
         self.sync_combo = QComboBox()
@@ -2161,6 +2177,9 @@ class MainWindow(QMainWindow):
             self._set_location()
             self._send_current_offsets()
             QTimer.singleShot(1200, lambda: self.serial.send_pos_update_rate(POS_UPDATE_RATE_MS))
+            # Re-sync the meridian-limit toggle too - see meridian_limit_enabled's comment.
+            QTimer.singleShot(1200, lambda: self.serial.send_command(
+                f"CMD,SET_MERIDIAN_LIMIT,ENABLED:{1 if self.meridian_limit_enabled else 0}"))
             self._connection_timeout_timer.start(3000)
 
     def _handle_connection_timeout(self):
@@ -2533,6 +2552,50 @@ class MainWindow(QMainWindow):
         self.flipped_btn.setText(f"Telescope Flipped: {'ON' if flipped else 'OFF'}")
         self.flipped_btn.setStyleSheet(f"background-color: {PALETTE['orange']}; color: black; font-weight: bold;" if flipped else "")
         self.viz.update()  # the meridian-limit shading only draws while not flipped
+
+    def _toggle_meridian_limit(self):
+        """Ported from EQMountApp._toggle_meridian_limit: toggles the firmware's meridian-limit
+        safety check on/off (CMD,SET_MERIDIAN_LIMIT). Applies instantly firmware-side (no motor
+        movement to wait on), so the button updates optimistically here rather than waiting for
+        STATUS:MERIDIAN_LIMIT_ENABLED confirmation - that confirmation still arrives and will
+        correct the button if it ever disagrees."""
+        if not (self.serial.ser and self.serial.ser.is_open):
+            self._log("Not connected.")
+            return
+        requested = not self.meridian_limit_enabled
+        if not requested:
+            # Turning OFF a safety check that exists to prevent an OTA/dovetail-vs-tripod/pier
+            # collision - require explicit confirmation every time, same pattern as the solar
+            # tracking safety gate (_toggle_tracking) and Enter-defaults-to-No for the same reason.
+            if QMessageBox.question(
+                self, "Disable Meridian Limit Safety Check",
+                "This disables the mount's meridian-limit safety check.\n\n"
+                "With it off, GOTO/tracking will NOT be refused or stopped when the target "
+                "crosses the meridian - only do this if you have confirmed your mount's actual "
+                "mechanical clearance past the meridian.\n\nDisable the meridian limit check?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            ) != QMessageBox.Yes:
+                self._log("Meridian limit disable cancelled.")
+                return
+        self.meridian_limit_enabled = requested
+        self.serial.send_command(f"CMD,SET_MERIDIAN_LIMIT,ENABLED:{1 if requested else 0}")
+        self.meridian_limit_btn.setText(f"Meridian Limit: {'ON' if requested else 'OFF'}")
+        self.meridian_limit_btn.setStyleSheet(
+            f"background-color: {PALETTE['green'] if requested else PALETTE['red']}; color: black; font-weight: bold;")
+        self._log(f"Meridian limit safety check: {'ON' if requested else 'OFF'}")
+        self.viz.update()  # the meridian-limit shading only makes sense while enabled
+
+    def _on_meridian_limit_confirmed(self, enabled):
+        """Reconciles self.meridian_limit_enabled/meridian_limit_btn with a firmware-confirmed
+        state (STATUS:MERIDIAN_LIMIT_ENABLED, from our own SET_MERIDIAN_LIMIT or a QUERY reply on
+        connect) - a no-op if already showing that state."""
+        if enabled == self.meridian_limit_enabled:
+            return
+        self.meridian_limit_enabled = enabled
+        self.meridian_limit_btn.setText(f"Meridian Limit: {'ON' if enabled else 'OFF'}")
+        self.meridian_limit_btn.setStyleSheet(
+            f"background-color: {PALETTE['green'] if enabled else PALETTE['red']}; color: black; font-weight: bold;")
+        self.viz.update()
 
     def _toggle_tracking(self):
         """Ported from EQMountApp._toggle_tracking: SOLAR gets a safety confirmation dialog,
@@ -2916,6 +2979,13 @@ class MainWindow(QMainWindow):
             m = re.search(r"UPDATE_RATE.*?MS:(\d+)", line)
             if m:
                 self.pos_rate_label.setText(f"Arduino POS Update Rate: confirmed {m.group(1)} ms")
+
+            # Firmware-confirmed meridian-limit enabled state - from our own SET_MERIDIAN_LIMIT or
+            # a QUERY_MERIDIAN_LIMIT reply. Requires firmware 1.8.52+; silently ignored on older
+            # firmware that never sends this line, so the GUI just keeps assuming its own default.
+            m = re.search(r"MERIDIAN_LIMIT_ENABLED,(\d)", line)
+            if m:
+                self._on_meridian_limit_confirmed(m.group(1) == "1")
             return
 
         if line.startswith("POS,"):
