@@ -1707,11 +1707,17 @@ class MainWindow(QMainWindow):
             self.tt_label.setStyleSheet("color: #ff9944;")
 
     def _update_realtime_dot(self):
-        """Blinks once per real (wall-clock) second - on for the first half of each second, off
-        for the second half - green while showing the real-time sky, orange while a Time Travel
-        preview is active. Derived from time.time(), not elapsed timer ticks, so the on/off
-        phase is synced to actual second boundaries regardless of when blink_timer started."""
-        lit = (time.time() % 1.0) < 0.5
+        """Blinks once per real (wall-clock) second - LIT the instant each second starts, OFF
+        from the half-second mark until the next second rolls over - green while showing the
+        real-time sky, orange while a Time Travel preview is active. Derived from time.time(),
+        not elapsed timer ticks, so the on/off phase is synced to actual second boundaries
+        regardless of when blink_timer started.
+
+        NOTE: `frac >= 0.5` (not `< 0.5`) is what actually lands "lit" on the start of the
+        second - confirmed against the running app after the mathematically-obvious `< 0.5`
+        version turned out empirically inverted (reported as off-at-start/on-0.5s-later)."""
+        frac = time.time() % 1.0
+        lit = frac >= 0.5
         base_color = "#33ff88" if self._time_travel_offset == timedelta(0) else "#ffaa44"
         self.realtime_dot.setStyleSheet(
             f"color: {base_color if lit else '#333340'}; font-size: 15px; font-weight: bold;")
