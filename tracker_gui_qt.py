@@ -71,6 +71,50 @@ from sky_data import sky_catalog, iss_tracker, solar_system
 
 
 # ============================================================
+# OKLCH COLOR PALETTE
+# ============================================================
+# Every non-gray/near-gray accent color in this GUI (buttons, badges, status text, the target
+# reticle, camera FOV overlay, DSO/planet/ISS markers, ...) is generated from ONE shared
+# (lightness, chroma) pair in OKLCH space - only the hue differs per semantic meaning. Qt's
+# stylesheet engine has no native oklch() support, so these are converted to sRGB hex once at
+# import time (see _oklch_to_hex) and used as plain hex strings everywhere below, same as any
+# other color literal. Backgrounds, panel borders, muted gray-blue label text, and the star
+# field's own catalog-sourced B-V colors are intentionally NOT part of this palette (they're
+# gray/near-gray, or - for star colors - real astronomical data, not a decorative UI choice).
+_PALETTE_L = 0.78   # lightness - fixed for every hue below
+_PALETTE_C = 0.10   # chroma - fixed for every hue below; this (not a saturated ~0.2+) is what
+                    # makes every accent color read as muted/pastel rather than neon
+
+
+def _oklch_to_hex(L, C, h_deg):
+    """OKLCH -> sRGB hex, via Bjorn Ottosson's OKLab (https://bottosson.github.io/posts/oklab/)."""
+    h = math.radians(h_deg)
+    a, b = C * math.cos(h), C * math.sin(h)
+    l_ = L + 0.3963377774 * a + 0.2158037573 * b
+    m_ = L - 0.1055613458 * a - 0.0638541728 * b
+    s_ = L - 0.0894841775 * a - 1.2914855480 * b
+    l, m, s = l_ ** 3, m_ ** 3, s_ ** 3
+    r = 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s
+    g = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s
+    bl = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s
+
+    def _encode(c):
+        c = max(0.0, min(1.0, c))
+        c = 12.92 * c if c <= 0.0031308 else 1.055 * (c ** (1 / 2.4)) - 0.055
+        return max(0, min(255, round(c * 255)))
+    return "#%02x%02x%02x" % (_encode(r), _encode(g), _encode(bl))
+
+
+# Hues spread evenly around the OKLCH wheel, one per semantic role - see each usage site for
+# what it's used for (tracking-stable badge, target reticle, DSO type legend, planet markers...).
+_PALETTE_HUES = {
+    "red": 15, "salmon": 35, "orange": 55, "sun": 75, "yellow": 95,
+    "green": 145, "teal": 175, "cyan": 205, "blue": 255, "purple": 300, "pink": 330,
+}
+PALETTE = {name: _oklch_to_hex(_PALETTE_L, _PALETTE_C, hue) for name, hue in _PALETTE_HUES.items()}
+
+
+# ============================================================
 # PURE GEOMETRY/STYLE HELPERS
 # ============================================================
 # Small, stateless helpers ported directly from the matching EQMountApp methods in tracker_gui.py
@@ -78,24 +122,28 @@ from sky_data import sky_catalog, iss_tracker, solar_system
 # here since SkyViewWidget isn't an EQMountApp subclass.
 
 def _dso_render_style(type_code):
-    """See EQMountApp._dso_render_style's docstring for the color/shape reasoning - identical
-    mapping, just returning a QColor instead of a hex string."""
+    """See EQMountApp._dso_render_style's docstring for the color/shape reasoning - same
+    per-type mapping, but every color comes from PALETTE (see its module docstring) instead of
+    its own hand-picked hex, so the DSO-type legend reads as one consistent color system rather
+    than a grab-bag of independently chosen saturations. DrkN (dark nebula) is the one exception
+    left as its own muted brownish-gray literal - it's meant to read as dust/near-gray, not a
+    vivid accent, so it's exempt from the uniform-chroma palette the same way backgrounds are."""
     t = type_code or ""
     if t in ("OCl", "GCl"):
-        return "cluster", QColor("#ffee88")
+        return "cluster", QColor(PALETTE["yellow"])
     if t == "PN":
-        return "ring", QColor("#dd88ff")
+        return "ring", QColor(PALETTE["purple"])
     if t.startswith("G") and t not in ("GCl",):
-        return "ellipse", QColor("#ffaa66")
+        return "ellipse", QColor(PALETTE["salmon"])
     if t in ("HII", "EmN"):
-        return "ellipse", QColor("#ff6666")
+        return "ellipse", QColor(PALETTE["red"])
     if t == "RfN":
-        return "ellipse", QColor("#77aaff")
+        return "ellipse", QColor(PALETTE["blue"])
     if t == "DrkN":
         return "ellipse", QColor("#998877")
     if t == "SNR":
-        return "ellipse", QColor("#ff9933")
-    return "ellipse", QColor("#66ddcc")
+        return "ellipse", QColor(PALETTE["orange"])
+    return "ellipse", QColor(PALETTE["teal"])
 
 
 def _darken_hex_color(hex_color, factor=0.28):
@@ -659,7 +707,7 @@ class SkyViewWidget(QOpenGLWidget):
         if self.iss_enabled and self.iss_ra is not None and ra_min <= self.iss_ra <= ra_max and dec_min <= self.iss_dec <= dec_max:
             ix = self.ra_to_x(self.iss_ra, w, margin, ra_min, ra_span)
             iy = self.dec_to_y(self.iss_dec, h, margin, dec_min, dec_span)
-            iss_color = QColor("#00ffaa" if self.iss_above else "#336655")
+            iss_color = QColor(PALETTE["green"] if self.iss_above else "#336655")
             r = 4
             p.setPen(QPen(iss_color, 1.5))
             p.drawLine(QPointF(ix - r, iy), QPointF(ix + r, iy))
@@ -676,10 +724,10 @@ class SkyViewWidget(QOpenGLWidget):
             sx = self.ra_to_x(self.sun_ra, w, margin, ra_min, ra_span)
             sy = self.dec_to_y(self.sun_dec, h, margin, dec_min, dec_span)
             sr = max(4.0, (self.sun_diam / 2.0) * pixels_per_deg)
-            p.setPen(QPen(QColor("#aa7700"), 1))
-            p.setBrush(QBrush(QColor("#ffcc33")))
+            p.setPen(QPen(QColor(_darken_hex_color(PALETTE["sun"])), 1))
+            p.setBrush(QBrush(QColor(PALETTE["sun"])))
             p.drawEllipse(QPointF(sx, sy), sr, sr)
-            _draw_centered_text(p, sx, sy - sr - 8, "Sun", self._font_small_bold, QColor("#ffcc33"))
+            _draw_centered_text(p, sx, sy - sr - 8, "Sun", self._font_small_bold, QColor(PALETTE["sun"]))
             self._visible_hits.append({"x": sx, "y": sy, "ra": self.sun_ra, "dec": self.sun_dec,
                                         "radius": max(12.0, sr), "name": "Sun",
                                         "extra": f"diam {self.sun_diam*60:.1f}'", "labeled": True})
@@ -699,9 +747,14 @@ class SkyViewWidget(QOpenGLWidget):
                                         "extra": f"{self.moon_illum*100:.0f}% illuminated, {waxwane}",
                                         "labeled": True})
 
+        # Mercury stays its own neutral gray (a near-gray "no strong color" is accurate for it,
+        # and exempt from the uniform-chroma palette the same way any other gray is) - the rest
+        # each get a distinct PALETTE hue so the planets stay visually distinguishable from each
+        # other and from the DSO-type legend colors, all at the same muted lightness/chroma.
         planet_colors = {
-            "Mercury": "#aaaaaa", "Venus": "#e8dcb0", "Mars": "#cc6644",
-            "Jupiter": "#d8b088", "Saturn": "#e0d0a0", "Uranus": "#9fd8d8", "Neptune": "#6e8fd8",
+            "Mercury": "#aaaaaa", "Venus": PALETTE["yellow"], "Mars": PALETTE["red"],
+            "Jupiter": PALETTE["sun"], "Saturn": PALETTE["orange"], "Uranus": PALETTE["cyan"],
+            "Neptune": PALETTE["blue"],
         }
         PLANET_MIN_R, PLANET_PHASE_R = 3.5, 6.0
         for pname, (pra, pdec, pang_diam, pring_ang_diam, pillum) in self.planet_positions.items():
@@ -756,13 +809,13 @@ class SkyViewWidget(QOpenGLWidget):
         lst = self.current_lst_deg()
         cardinal_ra = {"S": lst % 360.0, "N": (lst + 180.0) % 360.0,
                        "E": (lst + 90.0) % 360.0, "W": (lst - 90.0) % 360.0}
-        pen = _dashed_pen(QColor("#aa8844"))
+        pen = _dashed_pen(QColor(PALETTE["yellow"]))
         for label, cra in cardinal_ra.items():
             if ra_min <= cra <= ra_max:
                 line_x = self.ra_to_x(cra, w, margin, ra_min, ra_span)
                 p.setPen(pen)
                 p.drawLine(QPointF(line_x, 8), QPointF(line_x, h - 8))
-                _draw_centered_text(p, line_x, 20, label, self._font_label_bold, QColor("#ddaa55"))
+                _draw_centered_text(p, line_x, 20, label, self._font_label_bold, QColor(PALETTE["yellow"]))
 
     def _draw_corner_labels(self, p, w, h, cx, cy, ra_min, ra_max, dec_min, dec_max):
         col = QColor("#8888aa")
@@ -781,11 +834,11 @@ class SkyViewWidget(QOpenGLWidget):
         y = self.dec_to_y(self.current_dec, h, margin, dec_min, dec_span)
         cam_half_w, cam_half_h = _camera_fov_half_size(pixels_per_deg)
 
-        p.setPen(_dashed_pen(QColor("#5599ff"), 1.5))
+        p.setPen(_dashed_pen(QColor(PALETTE["blue"]), 1.5))
         p.setBrush(Qt.NoBrush)
         p.drawPolygon(_camera_rect_points(x, y, cam_half_w, cam_half_h, self.camera_orientation_deg))
         p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(QColor("#5599ff")))
+        p.setBrush(QBrush(QColor(PALETTE["blue"])))
         p.drawPolygon(_camera_top_marker_points(x, y, cam_half_w, cam_half_h, self.camera_orientation_deg))
 
         fov_radius = max(5.0, math.hypot(cam_half_w, cam_half_h))
@@ -805,7 +858,7 @@ class SkyViewWidget(QOpenGLWidget):
         tx = self.ra_to_x(self.target_ra % 360.0, w, margin, ra_min, ra_span)
         ty = self.dec_to_y(self.target_dec, h, margin, dec_min, dec_span)
         radius, gap, tick_len = 8, 2, 6
-        p.setPen(QPen(QColor("#ffaa00"), 1.5))
+        p.setPen(QPen(QColor(PALETTE["orange"]), 1.5))
         p.drawEllipse(QPointF(tx, ty), radius, radius)
         p.drawLine(QPointF(tx, ty - radius - gap), QPointF(tx, ty - radius - gap - tick_len))
         p.drawLine(QPointF(tx, ty + radius + gap), QPointF(tx, ty + radius + gap + tick_len))
@@ -1232,7 +1285,7 @@ class MainWindow(QMainWindow):
         # is active - see _update_realtime_dot, driven by wall-clock time so the blink itself is
         # also a live "yes, this is still ticking" signal, not just the color.
         self.realtime_dot = QLabel("●")
-        self.realtime_dot.setStyleSheet("color: #33ff88; font-size: 15px; font-weight: bold;")
+        self.realtime_dot.setStyleSheet(f"color: {PALETTE['green']}; font-size: 15px; font-weight: bold;")
         tt_row.addWidget(self.realtime_dot)
         tt_row.addWidget(QLabel("Time Travel (UTC):"))
         self.tt_date_edit = QLineEdit()
@@ -1260,7 +1313,7 @@ class MainWindow(QMainWindow):
         self.status_display = QLabel("DISCONNECTED - Select COM port and click Connect")
         self.status_display.setAlignment(Qt.AlignCenter)
         self.status_display.setStyleSheet(
-            "background-color: #1a1a2e; color: #ffaa00; font-weight: bold; font-size: 14px; padding: 6px;")
+            f"background-color: #1a1a2e; color: {PALETTE['orange']}; font-weight: bold; font-size: 14px; padding: 6px;")
         left.addWidget(self.status_display)
 
         # ---- position readout panel ----
@@ -1268,9 +1321,9 @@ class MainWindow(QMainWindow):
         pos_l = QGridLayout(pos_box)
         mono = "font-family: Consolas;"
         self.sky_ra_label = QLabel("000.0000°")
-        self.sky_ra_label.setStyleSheet(mono + "color: #33ffaa; font-size: 16px; font-weight: bold;")
+        self.sky_ra_label.setStyleSheet(mono + f"color: {PALETTE['green']}; font-size: 16px; font-weight: bold;")
         self.sky_dec_label = QLabel("+00.0000°")
-        self.sky_dec_label.setStyleSheet(mono + "color: #33ffaa; font-size: 16px; font-weight: bold;")
+        self.sky_dec_label.setStyleSheet(mono + f"color: {PALETTE['green']}; font-size: 16px; font-weight: bold;")
         self.mount_ra_label = QLabel("0.0000°")
         self.mount_dec_label = QLabel("0.0000°")
         self.speed_ra_label = QLabel("0.000000 °/s")
@@ -1334,7 +1387,7 @@ class MainWindow(QMainWindow):
         pos_l.addWidget(self.offset_inc_edit, 4, 2)
 
         self.error_label = QLabel("Error: RA 0.0000°  DEC 0.0000°")
-        self.error_label.setStyleSheet("color: #ffaa00;")
+        self.error_label.setStyleSheet(f"color: {PALETTE['orange']};")
         pos_l.addWidget(self.error_label, 5, 0, 1, 10)
 
         # Stability badge - STABLE/SETTLING/DRIFTING/ALIGNING/TRACKING:OFF, driven by
@@ -1348,12 +1401,12 @@ class MainWindow(QMainWindow):
 
         self.target_name_label = QLabel("")
         self.target_name_label.setAlignment(Qt.AlignCenter)
-        self.target_name_label.setStyleSheet("color: #ffdd66; font-weight: bold; font-size: 14px;")
+        self.target_name_label.setStyleSheet(f"color: {PALETTE['yellow']}; font-weight: bold; font-size: 14px;")
         pos_l.addWidget(self.target_name_label, 7, 0, 1, 10)
 
         self.meridian_warning_label = QLabel("")
         self.meridian_warning_label.setAlignment(Qt.AlignCenter)
-        self.meridian_warning_label.setStyleSheet("color: #ffaa00; font-weight: bold;")
+        self.meridian_warning_label.setStyleSheet(f"color: {PALETTE['orange']}; font-weight: bold;")
         pos_l.addWidget(self.meridian_warning_label, 8, 0, 1, 10)
 
         stability_note = QLabel(
@@ -1423,7 +1476,7 @@ class MainWindow(QMainWindow):
         bottom = QHBoxLayout()
         self.mode_tracking_label = QLabel("MODE: SIDEREAL  |  TRACKING: OFF")
         self.live_error_label = QLabel("Live Error: RA 0.0000°  DEC 0.0000°")
-        self.live_error_label.setStyleSheet("color: #ffaa00;")
+        self.live_error_label.setStyleSheet(f"color: {PALETTE['orange']};")
         bottom.addWidget(self.mode_tracking_label)
         bottom.addStretch(1)
         bottom.addWidget(self.live_error_label)
@@ -1448,7 +1501,7 @@ class MainWindow(QMainWindow):
         right.addWidget(mode_box)
 
         self.tracking_btn = QPushButton("▶ Start Tracking")
-        self.tracking_btn.setStyleSheet("background-color: #006400; color: white; font-weight: bold; padding: 8px;")
+        self.tracking_btn.setStyleSheet(f"background-color: {PALETTE['green']}; color: black; font-weight: bold; padding: 8px;")
         self.tracking_btn.clicked.connect(self._toggle_tracking)
         right.addWidget(self.tracking_btn)
 
@@ -1512,7 +1565,7 @@ class MainWindow(QMainWindow):
         right.addWidget(debug_box)
 
         stop_btn = QPushButton("STOP (panic)")
-        stop_btn.setStyleSheet("background-color: #661111; color: white; font-weight: bold; padding: 6px;")
+        stop_btn.setStyleSheet(f"background-color: {PALETTE['red']}; color: black; font-weight: bold; padding: 6px;")
         stop_btn.clicked.connect(self._stop)
         right.addWidget(stop_btn)
 
@@ -1708,7 +1761,7 @@ class MainWindow(QMainWindow):
             connected = bool(self.serial.ser and self.serial.ser.is_open)
             suffix = "" if connected else " - Arduino not connected"
             self.tt_label.setText(f"⚠ TIME TRAVEL: {eff_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC{suffix}")
-            self.tt_label.setStyleSheet("color: #ff9944;")
+            self.tt_label.setStyleSheet("color: " + PALETTE["orange"] + ";")
 
     def _update_realtime_dot(self):
         """Blinks once per real (wall-clock) second - LIT the instant each second starts, OFF
@@ -1723,7 +1776,7 @@ class MainWindow(QMainWindow):
         (reported as "not always well in sync with the computer time")."""
         frac = time.time() % 1.0
         lit = frac < 0.5
-        base_color = "#33ff88" if self._time_travel_offset == timedelta(0) else "#ffaa44"
+        base_color = PALETTE["green"] if self._time_travel_offset == timedelta(0) else PALETTE["orange"]
         self.realtime_dot.setStyleSheet(
             f"color: {base_color if lit else '#333340'}; font-size: 15px; font-weight: bold;")
         next_boundary = 0.5 if lit else 1.0
@@ -1843,7 +1896,7 @@ class MainWindow(QMainWindow):
             self._connection_timeout_timer.start(3000)
 
     def _handle_connection_timeout(self):
-        self._update_status_display("CONNECTED - NO ARDUINO RESPONSE", "#ff6666")
+        self._update_status_display("CONNECTED - NO ARDUINO RESPONSE", PALETTE["red"])
         self._log("Warning: Arduino did not respond to PING command. Connection may be unstable.")
 
     def _disconnect(self):
@@ -1883,7 +1936,7 @@ class MainWindow(QMainWindow):
         gives every on/off toolbar button (ISS, Constellations, Min Size, Verbose Debug, ...) a
         distinct green fill while active, matching CustomTkinter's fg_color-swap convention in
         tracker_gui.py, instead of the text label being the only thing that changes."""
-        btn.setStyleSheet("background-color: #006400; color: white; font-weight: bold;" if on else "")
+        btn.setStyleSheet(f"background-color: {PALETTE['green']}; color: black; font-weight: bold;" if on else "")
 
     def _cycle_view_mode(self):
         order = ["FREE", "TELESCOPE", "TARGET"]
@@ -1892,14 +1945,15 @@ class MainWindow(QMainWindow):
         self._update_view_mode_btn_style()
 
     def _update_view_mode_btn_style(self):
-        """Free = default button color. Telescope = the same blue as the camera FOV rectangle
-        overlay (#5599ff - see SkyViewWidget._draw_camera_and_reticle). Target = the same orange
-        as the target reticle (#ffaa00, same place) - so the button's color itself tells you
-        which overlay the viz is currently following, matching that overlay's own color."""
+        """Free = default button color. Telescope = PALETTE["blue"], the same as the camera FOV
+        rectangle overlay (see SkyViewWidget._draw_camera_and_reticle). Target =
+        PALETTE["orange"], the same as the target reticle (same place) - so the button's color
+        itself tells you which overlay the viz is currently following, matching that overlay's
+        own color."""
         if self.viz.view_mode == "TELESCOPE":
-            self.view_mode_btn.setStyleSheet("background-color: #5599ff; color: black; font-weight: bold;")
+            self.view_mode_btn.setStyleSheet(f"background-color: {PALETTE['blue']}; color: black; font-weight: bold;")
         elif self.viz.view_mode == "TARGET":
-            self.view_mode_btn.setStyleSheet("background-color: #ffaa00; color: black; font-weight: bold;")
+            self.view_mode_btn.setStyleSheet(f"background-color: {PALETTE['orange']}; color: black; font-weight: bold;")
         else:
             self.view_mode_btn.setStyleSheet("")
 
@@ -2035,7 +2089,7 @@ class MainWindow(QMainWindow):
         minutes, seconds = divmod(int(time_to_limit_s), 60)
         urgent = time_to_limit_s <= MERIDIAN_LIMIT_URGENT_S
         self.meridian_warning_label.setText(f"⚠ MERIDIAN LIMIT IN {minutes}m {seconds:02d}s - flip may be needed")
-        self.meridian_warning_label.setStyleSheet(f"color: {'#ff4444' if urgent else '#ffaa00'}; font-weight: bold;")
+        self.meridian_warning_label.setStyleSheet(f"color: {PALETTE['red'] if urgent else PALETTE['orange']}; font-weight: bold;")
 
     def _goto(self):
         parsed = self._parse_target_inputs()
@@ -2157,7 +2211,7 @@ class MainWindow(QMainWindow):
             return
         self.viz.telescope_flipped = flipped
         self.flipped_btn.setText(f"Telescope Flipped: {'ON' if flipped else 'OFF'}")
-        self.flipped_btn.setStyleSheet("background-color: #8B4500;" if flipped else "")
+        self.flipped_btn.setStyleSheet(f"background-color: {PALETTE['orange']}; color: black; font-weight: bold;" if flipped else "")
         self.viz.update()  # the meridian-limit shading only draws while not flipped
 
     def _toggle_tracking(self):
@@ -2258,7 +2312,7 @@ class MainWindow(QMainWindow):
         self.tracking = (action == "START")
         self._align_phase = "ALIGNING" if action == "START" else "IDLE"
         self._update_mode_tracking_label()
-        self._update_status_display(status_text, "#ffaa00")
+        self._update_status_display(status_text, PALETTE["orange"])
         ok = send_fn()
         self._log(f"Sent {action} ({reason})" if ok else f"{action} write failed ({reason}) - will retry")
         retry_ms = 150 if action == "STOP" else 800
@@ -2274,7 +2328,7 @@ class MainWindow(QMainWindow):
         max_retries = 20 if action == "STOP" else 3
         if self._pending_action_retry_count >= max_retries:
             self._log(f"WARNING: Arduino never confirmed {action} after retries - check the connection/mount.")
-            self._update_status_display(f"{action} NOT CONFIRMED - CHECK CONNECTION", "#ff4444")
+            self._update_status_display(f"{action} NOT CONFIRMED - CHECK CONNECTION", PALETTE["red"])
             return
         self._pending_action_retry_count += 1
         ok = send_fn()
@@ -2328,10 +2382,10 @@ class MainWindow(QMainWindow):
     def _on_hover_info(self, text):
         self.hover_label.setText(text)
 
-    def _set_stability(self, text, color):
+    def _set_stability(self, text, color, text_color="black"):
         self.tracking_status_label.setText(text)
         self.tracking_status_label.setStyleSheet(
-            f"background-color: {color}; color: white; font-weight: bold; font-size: 14px; padding: 5px;")
+            f"background-color: {color}; color: {text_color}; font-weight: bold; font-size: 14px; padding: 5px;")
         self.viz.stability_color = QColor(color)
         self.viz.update()
 
@@ -2339,26 +2393,32 @@ class MainWindow(QMainWindow):
         """Ported from EQMountApp._update_tracking_stability: classifies tracking as
         STABLE/SETTLING/DRIFTING from the *trend* of the error (not just its instantaneous
         size) - a large-but-shrinking error is fine, a small-but-growing one is an early
-        warning, which a plain magnitude threshold would miss either way."""
+        warning, which a plain magnitude threshold would miss either way.
+
+        Badge fill colors all come from PALETTE (see its module docstring) - black text on
+        those (rather than white) since the palette is deliberately light/pastel, not the dark
+        saturated fills white text would need. TRACKING: OFF keeps its own neutral gray with
+        white text - gray is exempt from the uniform accent palette the same way backgrounds
+        are, and it's dark enough for white to read fine."""
         if self._align_phase == "ALIGNING":
-            self._set_stability("ALIGNING...", "#3a5a8a")
+            self._set_stability("ALIGNING...", PALETTE["cyan"])
             return
         if not self.tracking or self._align_phase != "TRACKING":
-            self._set_stability("TRACKING: OFF", "#444455")
+            self._set_stability("TRACKING: OFF", "#444455", text_color="white")
             return
         if len(self.err_ra_history) < 4 or len(self.err_dec_history) < 4:
-            self._set_stability("● SETTLING", "#8a5a00")
+            self._set_stability("● SETTLING", PALETTE["orange"])
             return
         deriv_ra = self._calc_smoothed_speed(self.err_ra_history, window_s=TRACKING_STABILITY_WINDOW_S)
         deriv_dec = self._calc_smoothed_speed(self.err_dec_history, window_s=TRACKING_STABILITY_WINDOW_S)
         worst_err = max(abs(self.err_ra), abs(self.err_dec))
         worst_growth = max(deriv_ra, deriv_dec)
         if worst_err <= TRACKING_STABLE_ERR_DEG and worst_growth <= TRACKING_STABLE_DERIV_DEG_S:
-            self._set_stability("● STABLE", "#006400")
+            self._set_stability("● STABLE", PALETTE["green"])
         elif worst_growth > TRACKING_STABLE_DERIV_DEG_S:
-            self._set_stability("● DRIFTING", "#8B0000")
+            self._set_stability("● DRIFTING", PALETTE["red"])
         else:
-            self._set_stability("● SETTLING", "#8a5a00")
+            self._set_stability("● SETTLING", PALETTE["orange"])
 
     @staticmethod
     def _calc_smoothed_speed(history, window_s=0.250):
@@ -2399,15 +2459,15 @@ class MainWindow(QMainWindow):
         if msg.startswith("CONNECTED:"):
             port = msg.split(":", 1)[1]
             self.conn_status.setText(f"● Connected {port}")
-            self.conn_status.setStyleSheet("color: #00FF88;")
+            self.conn_status.setStyleSheet(f"color: {PALETTE['green']};")
             self.arduino_debug_enabled = False
             self.debug_toggle_btn.setText("Verbose Debug: OFF")
             self._style_toggle_btn(self.debug_toggle_btn, False)
-            self._update_status_display("CONNECTED - WAITING FOR PING RESPONSE", "#ffaa00")
+            self._update_status_display("CONNECTED - WAITING FOR PING RESPONSE", PALETTE["orange"])
             self._log(f"Connected to {port}. Waiting for Arduino response...")
         elif msg.startswith("RX:STATUS:PONG"):
             self._connection_timeout_timer.stop()
-            self._update_status_display("CONNECTED - READY", "#00ff88")
+            self._update_status_display("CONNECTED - READY", PALETTE["green"])
             self._log("Arduino responded to PING - connection fully established")
         elif msg.startswith("DISCONNECTED"):
             self.conn_status.setText("● Disconnected")
@@ -2418,7 +2478,7 @@ class MainWindow(QMainWindow):
             self.debug_toggle_btn.setText("Verbose Debug: OFF")
             self._style_toggle_btn(self.debug_toggle_btn, False)
             self._update_mode_tracking_label()
-            self._update_status_display("DISCONNECTED", "#ff4444")
+            self._update_status_display("DISCONNECTED", PALETTE["red"])
             self._log("Disconnected")
         elif msg.startswith("RX:"):
             self._parse_arduino_line(msg[3:])
@@ -2429,7 +2489,7 @@ class MainWindow(QMainWindow):
             self._log("ERROR: " + msg[6:])
             self.error_label.setText("Error: " + msg[6:])
 
-    def _update_status_display(self, text, color="#ffaa00"):
+    def _update_status_display(self, text, color=PALETTE["orange"]):
         self.status_display.setText(text)
         self.status_display.setStyleSheet(
             f"background-color: #1a1a2e; color: {color}; font-weight: bold; font-size: 14px; padding: 6px;")
@@ -2454,27 +2514,27 @@ class MainWindow(QMainWindow):
                         "ERROR", "SLEW", "FLIPPING", "FLIP_COMPLETE", "AUTO_CALIBRATED"]
             if any(kw in line for kw in important):
                 status_text = line.replace("STATUS:", "STATUS: ")
-                color = "#00ccff"
+                color = PALETTE["cyan"]
                 if "MERIDIAN_LIMIT" in line and "STOPPED" in line:
                     status_text = ("STOPPED - MERIDIAN LIMIT REACHED - flip the telescope in the "
                                   "clamps, then press Telescope Flipped ON to resume")
-                    color = "#ff6666"
+                    color = PALETTE["red"]
                     self.tracking = False
                     self._align_phase = "IDLE"
                 elif "TRACKING_STARTED" in line or "TRACKING" in line:
-                    color = "#00ff88"
+                    color = PALETTE["green"]
                     self.tracking = True
                     if "AXIS:RA" not in line:
                         self._align_phase = "TRACKING"
                 elif "ALIGNING" in line or "RESETTING" in line or "WAITING" in line:
-                    color = "#ffaa00"
+                    color = PALETTE["orange"]
                     self._align_phase = "ALIGNING"
                 elif "FLIPPING" in line:
-                    color = "#ffaa00"
+                    color = PALETTE["orange"]
                 elif "FLIP_COMPLETE" in line:
-                    color = "#00ccff"
+                    color = PALETTE["cyan"]
                 elif "STOPPED" in line or "ERROR" in line:
-                    color = "#ff6666"
+                    color = PALETTE["red"]
                     self.tracking = False
                     self._align_phase = "IDLE"
                     if "STOPPED" in line and self._pending_action == "STOP":
