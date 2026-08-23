@@ -1496,16 +1496,20 @@ class MainWindow(QMainWindow):
 
         left.addWidget(self.viz, stretch=1)
 
+        # ---- bottom row: cursor position, emergency stop, mode/tracking, live error ----
+        self.hover_label = QLabel("Cursor: -")
+        self.hover_label.setStyleSheet("color: #9aa; font-family: Consolas;")
+
         # Styled per ISO 13850 (emergency stop function) actuator convention - RED actuator on a
         # YELLOW background, the one color pairing that standard exists specifically to make
         # unambiguous - deliberately NOT drawn from PALETTE (see its module docstring). Actuation
         # itself already matches the standard's intent too - one click, immediate (_stop ->
         # _request_tracking_action), no confirmation dialog in the way, same as every other STOP
-        # path in this app (Delete key, panic byte). Placed directly under the sky viz and
-        # centered on it (not the sidebar) - the one control that should be reachable without
-        # hunting for it regardless of what else is going on in the UI, closest to where your
-        # eyes already are while watching the viz.
-        stop_btn = QPushButton("⏹  STOP")
+        # path in this app (Delete key, panic byte). On the same row as the cursor/mode/error
+        # readouts directly under the viz (not the sidebar) - the one control that should be
+        # reachable without hunting for it regardless of what else is on screen, closest to
+        # where your eyes already are while watching the viz.
+        stop_btn = QPushButton("⏹\nSTOP")
         stop_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: {STOP_RED};
@@ -1513,27 +1517,27 @@ class MainWindow(QMainWindow):
                 border: 2px solid #FFD500;
                 border-radius: 5px;
                 font-weight: bold;
-                font-size: 11px;
-                padding: 3px 14px;
+                font-size: 12px;
+                padding: 4px;
             }}
             QPushButton:hover {{ background-color: {STOP_RED_HOVER}; }}
             QPushButton:pressed {{ background-color: {STOP_RED_PRESSED}; }}
         """)
+        stop_btn.setFixedSize(46, 46)  # squarer, and a bit bigger than a single text line needs
         stop_btn.setToolTip("Immediately stops tracking/slewing - single action, no confirmation (ISO 13850 emergency stop convention).")
         stop_btn.clicked.connect(self._stop)
-        left.addWidget(stop_btn, alignment=Qt.AlignHCenter)
 
-        self.hover_label = QLabel("Cursor: -")
-        self.hover_label.setStyleSheet("color: #9aa; font-family: Consolas;")
-        left.addWidget(self.hover_label)
-
-        # ---- bottom bar ----
-        bottom = QHBoxLayout()
         self.mode_tracking_label = QLabel("MODE: SIDEREAL  |  TRACKING: OFF")
         self.live_error_label = QLabel("Live Error: RA 0.0000°  DEC 0.0000°")
         self.live_error_label.setStyleSheet(f"color: {PALETTE['orange']};")
-        bottom.addWidget(self.mode_tracking_label)
+
+        bottom = QHBoxLayout()
+        bottom.addWidget(self.hover_label)
         bottom.addStretch(1)
+        bottom.addWidget(stop_btn)
+        bottom.addStretch(1)
+        bottom.addWidget(self.mode_tracking_label)
+        bottom.addSpacing(16)
         bottom.addWidget(self.live_error_label)
         left.addLayout(bottom)
 
