@@ -1666,7 +1666,7 @@ class MainWindow(QMainWindow):
         right.addWidget(self.safe_target_btn)
         self.home_axes_btn = QPushButton("Home Axes (RA/DEC to 0°)")
         self.home_axes_btn.clicked.connect(self._home_axes)
-        self._flat_btn(self.home_axes_btn, "yellow")
+        self._flat_btn(self.home_axes_btn, "sun")  # distinct from Safe Target's yellow, same warm/caution family
         right.addWidget(self.home_axes_btn)
 
         # Manual meridian-flip toggle - see EQMountApp._toggle_telescope_flipped's docstring:
