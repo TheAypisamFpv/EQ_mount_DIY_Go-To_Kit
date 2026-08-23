@@ -1235,7 +1235,7 @@ def _run_in_thread(worker):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("EQ Mount DIY Go-To Kit")
+        self.setWindowTitle("EQ Mount DIY Go-To Kit - Controller")
         self.resize(1440, 900)
 
         # Time Travel - THE single source of "now" for this whole app, exactly like
