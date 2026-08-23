@@ -11,5 +11,6 @@ iss_tle.txt
 *.bsp.*
 sky_catalog.json
 tracker_log.txt
+launch_log.txt
 .claude/
 CLAUDE.md
