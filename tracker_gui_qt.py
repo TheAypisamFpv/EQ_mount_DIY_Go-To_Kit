@@ -1509,8 +1509,8 @@ class MainWindow(QMainWindow):
         # readouts directly under the viz (not the sidebar) - the one control that should be
         # reachable without hunting for it regardless of what else is on screen, closest to
         # where your eyes already are while watching the viz.
-        stop_btn = QPushButton("STOP")
-        stop_btn.setStyleSheet(f"""
+        self.stop_btn = QPushButton("STOP")
+        self.stop_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: {STOP_RED};
                 color: white;
@@ -1523,9 +1523,9 @@ class MainWindow(QMainWindow):
             QPushButton:hover {{ background-color: {STOP_RED_HOVER}; }}
             QPushButton:pressed {{ background-color: {STOP_RED_PRESSED}; }}
         """)
-        stop_btn.setFixedSize(46, 46)  # squarer, and a bit bigger than a single text line needs
-        stop_btn.setToolTip("Immediately stops tracking/slewing - single action, no confirmation (ISO 13850 emergency stop convention).")
-        stop_btn.clicked.connect(self._stop)
+        self.stop_btn.setFixedSize(46, 46)  # squarer, and a bit bigger than a single text line needs
+        self.stop_btn.setToolTip("Immediately stops tracking/slewing - single action, no confirmation (ISO 13850 emergency stop convention).")
+        self.stop_btn.clicked.connect(self._stop)
 
         self.mode_tracking_label = QLabel("MODE: SIDEREAL  |  TRACKING: OFF")
         self.live_error_label = QLabel("Live Error: RA 0.0000°  DEC 0.0000°")
@@ -1564,7 +1564,7 @@ class MainWindow(QMainWindow):
         bottom = QHBoxLayout()
         bottom.addWidget(left_wrap)
         bottom.addStretch(1)
-        bottom.addWidget(stop_btn)
+        bottom.addWidget(self.stop_btn)
         bottom.addStretch(1)
         bottom.addWidget(right_wrap)
         left.addLayout(bottom)
@@ -2815,20 +2815,24 @@ class MainWindow(QMainWindow):
         """Delete/Backspace: emergency stop, unconditionally (even if the GUI's tracking flag
         happens to be stale). Enter/Return: start tracking, UNLESS focus is in a text entry or
         the search results list (each of those already has its own Enter handling) - mirrors
-        EQMountApp._stop_tracking_key/_start_tracking_key."""
+        EQMountApp._stop_tracking_key/_start_tracking_key.
+
+        Both go through animateClick() on the actual linked button (stop_btn / tracking_btn)
+        rather than calling the underlying handler directly - animateClick() visually depresses
+        the button for a moment, exactly like a real mouse click would, before firing its
+        clicked signal (which is what actually runs the action, same as it always did) - so the
+        keyboard shortcut is visibly confirmed on-screen the same way clicking with the mouse
+        would be, not silently actioned with no visual feedback at all."""
         focus_widget = self.focusWidget()
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace) and not isinstance(focus_widget, QLineEdit):
-            if self.serial.ser and self.serial.ser.is_open:
-                self._request_tracking_action("STOP", self.serial.send_stop, "Delete key", "STOPPING...")
-            else:
-                self._log("Not connected.")
+            self.stop_btn.animateClick()
             return
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             if isinstance(focus_widget, (QLineEdit, QListWidget)):
                 super().keyPressEvent(event)
                 return
             if not self.tracking:
-                self._toggle_tracking()
+                self.tracking_btn.animateClick()
             return
         super().keyPressEvent(event)
 
