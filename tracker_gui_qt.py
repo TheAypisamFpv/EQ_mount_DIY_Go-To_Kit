@@ -2636,6 +2636,20 @@ class MainWindow(QMainWindow):
         self._pending_action_retry_count = 0
         self.tracking = (action == "START")
         self._align_phase = "ALIGNING" if action == "START" else "IDLE"
+        # Real bug, not just cosmetic: these were never cleared, so the STABLE/SETTLING/DRIFTING
+        # trend calc (_update_tracking_stability) kept blending old error samples from BEFORE
+        # this start (the previous session's tracking, or this session's own alignment slew,
+        # where error is large and changing fast) into its rolling TRACKING_STABILITY_WINDOW_S
+        # window for up to that long after a fresh Start - a genuinely stable new tracking
+        # session could read as SETTLING/DRIFTING for that whole stretch, since the trend was
+        # computed over old-large + new-small data mixed together, not the new data alone.
+        # Reported as "tracking sometimes needs a stop+restart to show as stable" - restarting
+        # didn't actually fix anything by itself; it just happened to be far enough after the
+        # poisoned window that it had already aged out on its own by the time of the retry.
+        # Clearing here (both START and STOP) means every fresh tracking session's trend is
+        # judged purely on its own data from the start.
+        self.err_ra_history.clear()
+        self.err_dec_history.clear()
         self._update_mode_tracking_label()
         self._update_status_display(status_text, PALETTE["orange"])
         ok = send_fn()
