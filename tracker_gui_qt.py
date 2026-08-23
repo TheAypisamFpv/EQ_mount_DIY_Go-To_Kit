@@ -65,6 +65,7 @@ from tracker_gui import (
     TRACKING_STABLE_DERIV_DEG_S, TRACKING_STABILITY_WINDOW_S,
     POS_UPDATE_RATE_MS, POSITION_BROADCAST_HZ, DEFAULT_LAT, DEFAULT_LON,
     SIDEREAL_RATE_DEG_S, MERIDIAN_LIMIT_WARNING_S, MERIDIAN_LIMIT_URGENT_S,
+    CONFIG_PATH,
 )
 from sky_data import sky_catalog, iss_tracker, solar_system
 
@@ -1093,6 +1094,17 @@ class MainWindow(QMainWindow):
         self._set_arduino_controls_enabled(False)
         self._reset_time_travel_inputs_to_now()
 
+        # Same gui_config.json tracker_gui.py reads/writes (CONFIG_PATH, gitignored) - NOT a
+        # separate config file for this GUI, so whichever one you last set your location in is
+        # what the other picks up too.
+        self._location_save_timer = QTimer(self)
+        self._location_save_timer.setSingleShot(True)
+        self._location_save_timer.timeout.connect(self._on_location_changed)
+        self._load_gui_config()
+        self.lat_edit.textChanged.connect(lambda _: self._location_save_timer.start(200))
+        self.lon_edit.textChanged.connect(lambda _: self._location_save_timer.start(200))
+        self.gps_edit.textChanged.connect(lambda _: self._location_save_timer.start(200))
+
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._poll_serial_queue)
         self.poll_timer.start(POLL_INTERVAL_MS)
@@ -1511,6 +1523,8 @@ class MainWindow(QMainWindow):
             self.gps_edit.setVisible(False)
             self.lat_edit.setVisible(True)
             self.lon_edit.setVisible(True)
+        if hasattr(self, "_location_save_timer"):
+            self._location_save_timer.start(200)
 
     def _on_streamer_mode_toggle(self, checked):
         """Mirrors EQMountApp._on_streamer_mode_toggle - masks the location display only, never
@@ -1537,6 +1551,61 @@ class MainWindow(QMainWindow):
             self.serial.send_command(f"CMD,SET_LOCATION,LAT:{lat:.6f},LON:{lon:.6f}")
         self._set_location_label(f"Loc: {lat}, {lon}")
         self._log(f"Location set: LAT {lat:.4f}, LON {lon:.4f}")
+
+    def _on_location_changed(self):
+        """Debounced (200ms, see _location_save_timer) reaction to editing any of the location
+        fields - saves gui_config.json, pushes the new location live to the Arduino if
+        connected, and redraws the viz's horizon, same as EQMountApp._on_location_var_changed.
+        Not tied to the Set button - typing a new value alone is enough, matching the Tk app."""
+        self._save_gui_config()
+        lat, lon = self._get_lat_lon()
+        self.viz.lat, self.viz.lon = lat, lon
+        self.viz.update()
+        if self.serial.ser and self.serial.ser.is_open:
+            self.serial.send_command(f"CMD,SET_LOCATION,LAT:{lat:.6f},LON:{lon:.6f}")
+
+    def _load_gui_config(self):
+        """Loads the single GPS coordinate from CONFIG_PATH (gui_config.json) - the SAME file
+        tracker_gui.py reads/writes, not a separate config for this GUI (see its
+        _load_gui_config's docstring: only "gps"/"location", a combined "lat, lon" string, is
+        stored). Switches to GPS-format mode on load, same as the Tk app."""
+        if not os.path.exists(CONFIG_PATH):
+            print(f"[gui_config] no config file at {CONFIG_PATH} - using default location")
+            return
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception as e:
+            self._log(f"Could not load gui_config.json: {e}")
+            return
+        if not isinstance(cfg, dict):
+            return
+        gps_val = cfg.get("gps") or cfg.get("location")
+        if not gps_val:
+            return
+        gps_str = str(gps_val).strip()
+        self.gps_edit.setText(gps_str)
+        parts = [p.strip() for p in gps_str.split(",")]
+        if len(parts) == 2:
+            self.lat_edit.setText(parts[0])
+            self.lon_edit.setText(parts[1])
+        self.gps_mode_check.setChecked(True)  # triggers _on_gps_mode_toggle to show gps_edit
+        lat, lon = self._get_lat_lon()
+        self.viz.lat, self.viz.lon = lat, lon
+        self._set_location_label(f"Loc: {lat}, {lon} (loaded)")
+        self._log(f"Loaded saved location from gui_config.json: {gps_str}")
+
+    def _save_gui_config(self):
+        """Same schema as EQMountApp._save_gui_config: {"gps": "lat, lon"} written to
+        CONFIG_PATH - the same gui_config.json the Tk app uses, so either GUI's last-set
+        location is what the other one loads next time."""
+        lat, lon = self._get_lat_lon()
+        gps = f"{lat}, {lon}"
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump({"gps": gps}, f, indent=2)
+        except OSError as e:
+            self._log(f"Could not save gui_config.json: {e}")
 
     # ---------------- Time Travel (ported from EQMountApp) ----------------
     def _reset_time_travel_inputs_to_now(self):
