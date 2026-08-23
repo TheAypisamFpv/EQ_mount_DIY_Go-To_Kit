@@ -65,7 +65,7 @@ from tracker_gui import (
     TRACKING_STABLE_DERIV_DEG_S, TRACKING_STABILITY_WINDOW_S,
     POS_UPDATE_RATE_MS, POSITION_BROADCAST_HZ, DEFAULT_LAT, DEFAULT_LON,
     SIDEREAL_RATE_DEG_S, MERIDIAN_LIMIT_WARNING_S, MERIDIAN_LIMIT_URGENT_S,
-    CONFIG_PATH,
+    CONFIG_PATH, ISS_TRACKING_UPDATE_MS,
 )
 from sky_data import sky_catalog, iss_tracker, solar_system
 
@@ -1176,17 +1176,27 @@ class MainWindow(QMainWindow):
         self.solar_timer.timeout.connect(self._trigger_solar_system_update)
         self.solar_timer.start(2000)
 
+        # Self-rescheduling (see _trigger_iss_update), not a fixed interval - it needs to run
+        # much faster (ISS_TRACKING_UPDATE_MS, 20ms) while the ISS is the actively tracked
+        # target, and a plain 5s repeating timer had no way to speed itself up for that.
         self.iss_timer = QTimer(self)
+        self.iss_timer.setSingleShot(True)
         self.iss_timer.timeout.connect(self._trigger_iss_update)
-        self.iss_timer.start(5000)
 
         self.meridian_timer = QTimer(self)
         self.meridian_timer.timeout.connect(self._update_meridian_warning)
         self.meridian_timer.start(500)
 
+        # Self-rescheduling (see _update_realtime_dot's identical reasoning), not a fixed 1000ms
+        # repeating timer - that could show a stale HH:MM:SS for up to a full second after the
+        # real second actually changed (reported as looking "about half a second out of sync"),
+        # since a timer started at arbitrary app-launch time has no reason to land on real
+        # second boundaries. _update_time_travel_label now reschedules itself precisely instead.
         self.time_travel_label_timer = QTimer(self)
+        self.time_travel_label_timer.setSingleShot(True)
+        self.time_travel_label_timer.setTimerType(Qt.PreciseTimer)
         self.time_travel_label_timer.timeout.connect(self._update_time_travel_label)
-        self.time_travel_label_timer.start(1000)
+        self._update_time_travel_label()
 
         # Self-rescheduling (see _update_realtime_dot) rather than a fixed-interval repeating
         # timer - a 200ms poll could be showing a stale state for up to 200ms after an actual
@@ -1812,6 +1822,10 @@ class MainWindow(QMainWindow):
             # like every other accent color in this app, from PALETTE (OKLCH), not a one-off hex.
             self.preview_btn.setStyleSheet(
                 f"background-color: {PALETTE['orange']}; color: black; font-weight: bold;")
+        # Reschedule for the exact next real second boundary (see this timer's setup in
+        # __init__) instead of a fixed 1000ms poll - same technique as _update_realtime_dot.
+        frac = time.time() % 1.0
+        self.time_travel_label_timer.start(max(1, round((1.0 - frac) * 1000)))
 
     def _update_realtime_dot(self):
         """Blinks once per real (wall-clock) second - LIT the instant each second starts, OFF
@@ -1913,16 +1927,45 @@ class MainWindow(QMainWindow):
         self.viz.planet_positions = planets
         self.viz.update()
 
+    def _iss_actively_tracked(self):
+        """True while the ISS is the currently active tracked target - see
+        EQMountApp._iss_update_tick's docstring for why this matters: it's what decides between
+        a leisurely 5s marker-only refresh and a fast ISS_TRACKING_UPDATE_MS one that actually
+        keeps the Arduino's target current enough to follow the ISS's real orbital motion."""
+        mode = self.mode_group.checkedButton().text() if self.mode_group.checkedButton() else ""
+        return self.target_object_name == "ISS" and self.tracking and mode == "SIDEREAL"
+
     def _trigger_iss_update(self):
+        """Fetches/refreshes the ISS position in a background thread (see _IssWorker), then
+        reschedules itself - fast (ISS_TRACKING_UPDATE_MS) while the ISS is the actively tracked
+        target, otherwise a leisurely 5s marker-only refresh (ported from
+        EQMountApp._iss_update_tick, which this Qt port previously left as a fixed 5s timer that
+        never sped up while tracking - the Arduino's target was only ever set once, at Start
+        Tracking, and never refreshed again, so it drifted increasingly far behind the ISS's
+        real position instead of following it)."""
+        self.iss_timer.stop()  # defend against a second in-flight schedule - see call sites in
+                                # _apply_time_travel/_reset_time_travel that also trigger this directly
         worker = _IssWorker(self._get_lat_lon, at_time=self._get_effective_utc_now())
         self._start_worker(worker,
                             (worker.updated, self._on_iss_updated),
                             (worker.failed, lambda err: self._log(f"ISS update failed: {err}")))
+        interval_ms = ISS_TRACKING_UPDATE_MS if self._iss_actively_tracked() else 5000
+        self.iss_timer.start(interval_ms)
 
     def _on_iss_updated(self, result):
         ra, dec, above = result
         self.viz.iss_ra, self.viz.iss_dec, self.viz.iss_above = ra, dec, above
         self.viz.update()
+
+        # If the ISS is the currently active tracked target, keep the Arduino's target fresh
+        # too - not just the on-screen marker. Same CONTINUATION:1 mechanism as
+        # EQMountApp._on_iss_position: tells the firmware this is the SAME tracked object being
+        # refreshed (not a fresh target), so it's safe to derive a tracking rate from consecutive
+        # updates, the same SIDEREAL SET_TARGET + continuous-correction machinery any other
+        # search-selected target uses.
+        if self._iss_actively_tracked() and self.serial.ser and self.serial.ser.is_open:
+            self.target_ra, self.target_dec = ra, dec
+            self.serial.send_command(f"CMD,SET_TARGET,RA:{ra:.6f},DEC:{dec:.6f},CONTINUATION:1")
 
     # ---------------- serial connection ----------------
     def _refresh_ports(self):
@@ -1978,6 +2021,23 @@ class MainWindow(QMainWindow):
         state = "ON" if self.tracking else "OFF"
         self.mode_tracking_label.setText(f"MODE: {mode}  |  TRACKING: {state}")
         self._update_tracking_stability()
+        self._update_tracking_btn_style()
+
+    def _update_tracking_btn_style(self):
+        """Start/Stop Tracking is one toggle button (like EQMountApp's tracking_btn), separate
+        from the always-visible ISO 13850 STOP actuator below it (see its own comment) - that one
+        is the immediate, no-questions-asked emergency stop; this one is the normal
+        start<->stop toggle for the current tracking session, and reflects which action it would
+        currently perform. Called from _update_mode_tracking_label, the one place every tracking
+        state change already funnels through."""
+        if self.tracking:
+            self.tracking_btn.setText("■ Stop Tracking")
+            self.tracking_btn.setStyleSheet(
+                f"background-color: {PALETTE['red']}; color: black; font-weight: bold; padding: 8px;")
+        else:
+            self.tracking_btn.setText("▶ Start Tracking")
+            self.tracking_btn.setStyleSheet(
+                f"background-color: {PALETTE['green']}; color: black; font-weight: bold; padding: 8px;")
 
     @staticmethod
     def _style_toggle_btn(btn, on):
@@ -2415,9 +2475,14 @@ class MainWindow(QMainWindow):
             self._on_mode_changed(0)
         self._log(f"{source_label}: starting sidereal tracking there")
         self._toggle_tracking()
-        if target_name == "ISS" and self.tracking and not self.viz.iss_enabled:
-            self.viz.iss_enabled = True
-            self.iss_btn.setText("ISS: ON")
+        if target_name == "ISS" and self.tracking:
+            if not self.viz.iss_enabled:
+                self.viz.iss_enabled = True
+                self.iss_btn.setText("ISS: ON")
+            # Kick off the fast ISS_TRACKING_UPDATE_MS refresh cadence immediately (see
+            # _trigger_iss_update/_iss_actively_tracked) instead of waiting up to 5s for
+            # whatever slow-interval tick happened to already be scheduled.
+            self._trigger_iss_update()
 
     def _stop(self):
         """The standalone "STOP (panic)" button - not in EQMountApp's UI (there tracking
