@@ -1297,19 +1297,15 @@ class MainWindow(QMainWindow):
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self._refresh_ports)
         self._flat_btn(refresh_btn, "cyan")
+        # Single Connect<->Disconnect toggle (like tracking_btn), not two separate buttons.
         self.connect_btn = QPushButton("Connect")
-        self.connect_btn.clicked.connect(self._connect)
+        self.connect_btn.clicked.connect(self._toggle_connection)
         self._flat_btn(self.connect_btn, "green")
-        self.disconnect_btn = QPushButton("Disconnect")
-        self.disconnect_btn.clicked.connect(self._disconnect)
-        self.disconnect_btn.setEnabled(False)
-        self._flat_btn(self.disconnect_btn, "red")
         self.conn_status = QLabel("● Disconnected")
         self.conn_status.setStyleSheet("color: gray;")
         conn_l.addWidget(self.port_combo, 0, 0, 1, 2)
         conn_l.addWidget(refresh_btn, 0, 2)
-        conn_l.addWidget(self.connect_btn, 1, 0)
-        conn_l.addWidget(self.disconnect_btn, 1, 1)
+        conn_l.addWidget(self.connect_btn, 1, 0, 1, 2)
         conn_l.addWidget(self.conn_status, 1, 2)
         top_row.addWidget(conn_box, stretch=2)
 
@@ -1480,7 +1476,8 @@ class MainWindow(QMainWindow):
         self.tracking_status_label.setAlignment(Qt.AlignCenter)
         self.tracking_status_label.setStyleSheet(
             "background-color: #444455; color: white; font-weight: bold; font-size: 14px; padding: 5px;")
-        pos_l.addWidget(self.tracking_status_label, 6, 0, 1, 10)
+        self.tracking_status_label.setFixedWidth(250)  # ~25% of the panel's previous full-span width
+        pos_l.addWidget(self.tracking_status_label, 6, 0, 1, 10, alignment=Qt.AlignCenter)
 
         # Fills the space below the badge (previously just empty) with whatever's actually
         # being tracked, e.g. a named star/DSO/Sun/Moon/ISS from a search selection or
@@ -1678,7 +1675,6 @@ class MainWindow(QMainWindow):
         # not optimistically, since the RA axis physically has to rotate ~180° first.
         self.flipped_btn = QPushButton("Telescope Flipped: OFF")
         self.flipped_btn.clicked.connect(self._toggle_telescope_flipped)
-        self.flipped_btn.setStyleSheet(f"border: 1px solid {PALETTE['orange']};")
         right.addWidget(self.flipped_btn)
 
         sync_box = QGroupBox("Sync / Calibrate (choose star)")
@@ -1934,9 +1930,7 @@ class MainWindow(QMainWindow):
         if self._time_travel_offset == timedelta(0):
             self.tt_label.setText("Showing: real-time sky")
             self.tt_label.setStyleSheet("color: #8888aa;")
-            # Outline-only, not a full fill - baseline/inactive state, distinct from the solid
-            # orange fill once a preview actually starts (below).
-            self.preview_btn.setStyleSheet(f"border: 1px solid {PALETTE['orange']};")
+            self.preview_btn.setStyleSheet("")
             # Keep the date/time fields ticking forward live while showing the real-time sky,
             # instead of staying frozen at whatever _reset_time_travel_inputs_to_now() last set
             # them to - skipped while either field has focus, so this can't clobber a date/time
@@ -2103,6 +2097,12 @@ class MainWindow(QMainWindow):
         self.port_combo.clear()
         self.port_combo.addItems(ports if ports else ["No ports found"])
 
+    def _toggle_connection(self):
+        if self.serial.ser and self.serial.ser.is_open:
+            self._disconnect()
+        else:
+            self._connect()
+
     def _connect(self):
         port = self.port_combo.currentText()
         if not port or "No ports" in port:
@@ -2110,8 +2110,8 @@ class MainWindow(QMainWindow):
             return
         self._log(f"Connecting to {port} ...")
         if self.serial.connect(port):
-            self.connect_btn.setEnabled(False)
-            self.disconnect_btn.setEnabled(True)
+            self.connect_btn.setText("Disconnect")
+            self._flat_btn(self.connect_btn, "red")
             self._set_arduino_controls_enabled(True)
             self._set_location()
             self._send_current_offsets()
@@ -2125,8 +2125,8 @@ class MainWindow(QMainWindow):
     def _disconnect(self):
         self._connection_timeout_timer.stop()
         self.serial.disconnect()
-        self.connect_btn.setEnabled(True)
-        self.disconnect_btn.setEnabled(False)
+        self.connect_btn.setText("Connect")
+        self._flat_btn(self.connect_btn, "green")
         self._set_arduino_controls_enabled(False)
 
     def _set_arduino_controls_enabled(self, enabled: bool):
@@ -2177,11 +2177,9 @@ class MainWindow(QMainWindow):
         default "pressed/active" look the way a checkable toolbar button would have) - this
         gives every on/off toolbar button (ISS, Constellations, Min Size, Verbose Debug, ...) a
         distinct green fill while active, matching CustomTkinter's fg_color-swap convention in
-        tracker_gui.py, instead of the text label being the only thing that changes. OFF gets a
-        plain teal outline rather than no styling at all, so every button in the app has some
-        color treatment (filled when active, outlined when not)."""
-        btn.setStyleSheet(f"background-color: {PALETTE['green']}; color: black; font-weight: bold;" if on
-                          else f"border: 1px solid {PALETTE['teal']};")
+        tracker_gui.py, instead of the text label being the only thing that changes. OFF is left
+        at the plain default look - only the active state gets a color treatment."""
+        btn.setStyleSheet(f"background-color: {PALETTE['green']}; color: black; font-weight: bold;" if on else "")
 
     @staticmethod
     def _flat_btn(btn, palette_name):
@@ -2219,7 +2217,7 @@ class MainWindow(QMainWindow):
         elif self.viz.view_mode == "TARGET":
             self.view_mode_btn.setStyleSheet(f"background-color: {PALETTE['orange']}; color: black; font-weight: bold;")
         else:
-            self.view_mode_btn.setStyleSheet(f"border: 1px solid {PALETTE['teal']};")
+            self.view_mode_btn.setStyleSheet("")
 
     def _toggle_iss(self):
         self.viz.iss_enabled = not self.viz.iss_enabled
@@ -2480,8 +2478,7 @@ class MainWindow(QMainWindow):
             return
         self.viz.telescope_flipped = flipped
         self.flipped_btn.setText(f"Telescope Flipped: {'ON' if flipped else 'OFF'}")
-        self.flipped_btn.setStyleSheet(f"background-color: {PALETTE['orange']}; color: black; font-weight: bold;" if flipped
-                                       else f"border: 1px solid {PALETTE['orange']};")
+        self.flipped_btn.setStyleSheet(f"background-color: {PALETTE['orange']}; color: black; font-weight: bold;" if flipped else "")
         self.viz.update()  # the meridian-limit shading only draws while not flipped
 
     def _toggle_tracking(self):
