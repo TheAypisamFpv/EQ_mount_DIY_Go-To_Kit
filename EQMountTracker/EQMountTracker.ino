@@ -946,7 +946,21 @@ float OBS_LON_DEG = -0.0005f;   // Positive east
 //            from it (steps-per-degree, slew/tracking speed math, etc.), so this is a real
 //            behavioral change matching the mount to its actual microstepping, not just a comment
 //            update.
-#define FIRMWARE_VERSION "1.8.50"
+//   1.8.51 - Reported: "the Arduino always loads the previous GPS pos from EEPROM but never uses/
+//            updates the one sent by the GUI, on connect or manually". Root cause: CMD,SET_LOCATION
+//            always updated OBS_LAT_DEG/OBS_LON_DEG (so e.g. the GUI's own Sun/Moon/horizon calc
+//            looked right), but autoCalibrateFromHome() - which actually derives the mount's home-
+//            position pointing calibration from OBS_LAT_DEG/OBS_LON_DEG - silently no-ops once
+//            homeCalibrationSettled has latched true (see its comment: deliberately, so it stops
+//            re-deriving on every routine ~60s SET_TIME resync). That's correct for a resync, but
+//            wrong for a genuinely NEW location (EEPROM-loaded value from boot corrected by a real
+//            manual GUI "Set", or moving the mount to a new site mid-session) - the calibration
+//            stayed anchored to whichever location happened to settle it first, regardless of what
+//            was sent afterward. Fix: CMD,SET_LOCATION now resets homeCalibrationSettled (allowing
+//            one real re-derivation) whenever the new LAT/LON actually differs from the previous
+//            value by more than 0.0001 deg - unless calibrationLocked is already set, in which case
+//            a real CMD,SYNC stays authoritative and is not silently overridden by a location change.
+#define FIRMWARE_VERSION "1.8.51"
 
 // Sidereal rate (deg/sec on sky for RA axis). Approx 15.041 arcsec/s.
 const float SIDEREAL_RATE_DEG_S = 0.004178f;
@@ -2839,6 +2853,7 @@ void parseAndExecuteCommand(char* cmd) {
   }
   else if (strcmp(action, "SET_LOCATION") == 0) {
     // Robust parse like SYNC/SET_TARGET/GOTO to tolerate any stale buffer junk.
+    float prevLat = OBS_LAT_DEG, prevLon = OBS_LON_DEG;
     const char* lat_p = strstr(line, "LAT:");
     const char* lon_p = strstr(line, "LON:");
     if (lat_p) OBS_LAT_DEG = atof(lat_p + 4);
@@ -2855,6 +2870,22 @@ void parseAndExecuteCommand(char* cmd) {
     Serial.print(",LON:");
     Serial.println(OBS_LON_DEG, 6);
     locationEverConfirmed = true;  // see homeCalibrationSettled's comment
+    // A GENUINELY different location (not just the GUI re-sending the same coords on its
+    // periodic ~60s resync, or the routine post-connect SET_TIME+SET_LOCATION pair) needs to be
+    // allowed to actually change the home calibration, not just OBS_LAT_DEG/OBS_LON_DEG - without
+    // this, once homeCalibrationSettled had already latched true from an earlier SET_LOCATION
+    // this session (e.g. the EEPROM-loaded value from boot, or an earlier connect), every LATER
+    // SET_LOCATION - including a manual "Set" in the GUI with the mount's actual real GPS coords -
+    // still updated the raw variables (so e.g. the viz's own Sun/Moon/horizon calc looked right),
+    // but autoCalibrateFromHome() below silently no-op'd, so the mount's actual pointing
+    // calibration stayed anchored to whichever location happened to settle it first. Reported as
+    // "the Arduino always uses the previous EEPROM location, never the one the GUI just sent".
+    // Still respects calibrationLocked - a real CMD,SYNC stays authoritative and is NOT silently
+    // re-derived out from under the user just because the location also changed.
+    bool locationActuallyChanged = fabs(OBS_LAT_DEG - prevLat) > 0.0001f || fabs(OBS_LON_DEG - prevLon) > 0.0001f;
+    if (locationActuallyChanged && !calibrationLocked) {
+      homeCalibrationSettled = false;
+    }
     // Location may arrive AFTER CMD,SET_TIME (that's the normal case - see calibrationLocked's
     // comment), so (re-)run the home-position auto-calibration here too, now that OBS_LON_DEG is
     // current - a no-op once calibrationLocked/homeCalibrationSettled is set.
