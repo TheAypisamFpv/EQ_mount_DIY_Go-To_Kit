@@ -520,7 +520,13 @@ class SkyViewWidget(QOpenGLWidget):
         hit = self._hovered
         if hit is None:
             return
-        hx, hy, r = hit["x"], hit["y"], hit["radius"]
+        # hit["radius"] already has its own per-type minimum baked in (stars/DSOs/Sun/Moon/
+        # planets/ISS all clamp to at least 12px - see _draw_sky_objects/_draw_realtime_bodies),
+        # so this keeps that same floor while growing 10% past the object's own real on-screen
+        # size once it's bigger than that - e.g. a large DSO's ring visibly circumscribes it
+        # with a bit of clearance, rather than the ring being a fixed size regardless of what's
+        # actually under it.
+        hx, hy, r = hit["x"], hit["y"], hit["radius"] * 1.1
         p.setPen(QPen(QColor("#ffffff"), 1))
         p.setBrush(Qt.NoBrush)
         p.drawEllipse(QPointF(hx, hy), r, r)
@@ -891,7 +897,7 @@ class SkyViewWidget(QOpenGLWidget):
 
         center_ref_radius = 8 + 2 + 6
         for hit in self._visible_hits:
-            if hit["name"] == getattr(self, "target_object_name", None):
+            if hit["name"] == self.target_object_name:
                 center_ref_radius = max(center_ref_radius, hit["radius"])
                 break
         center_ref_radius *= 1.1
@@ -910,7 +916,24 @@ class SkyViewWidget(QOpenGLWidget):
 
     # ---------------- mouse/wheel interaction ----------------
     def wheelEvent(self, event):
-        """Zoom centered on the cursor - same math as EQMountApp._on_viz_zoom."""
+        """Zoom centered on the cursor - same math as EQMountApp._on_viz_zoom - EXCEPT while
+        following the telescope or target (view_mode != FREE): the center stays anchored on
+        whatever's being followed (kept fresh every POS update by MainWindow) instead of
+        re-centering on the cursor and then needing a correction snap back to the followed
+        point on the very next update - reported as a visible jump when zooming while in
+        View: Telescope/Target."""
+        steps = event.angleDelta().y() / 120.0
+        zoom_factor = VIZ_ZOOM_STEP_BASE ** steps
+        new_zoom = max(VIZ_ZOOM_MIN, min(VIZ_ZOOM_MAX, self.zoom * zoom_factor))
+        if new_zoom == self.zoom:
+            return
+
+        if self.view_mode != "FREE":
+            self.zoom = new_zoom
+            self.clamp_center()
+            self.update()
+            return
+
         w, h = max(200, self.width()), max(150, self.height())
         margin = 12
         ra_min, ra_max, dec_min, dec_max = self.view_bounds()
@@ -921,11 +944,6 @@ class SkyViewWidget(QOpenGLWidget):
         cursor_ra = self.x_to_ra(pos.x(), w, margin, ra_min, ra_span)
         cursor_dec = dec_min + dec_span * (1.0 - frac_y)
 
-        steps = event.angleDelta().y() / 120.0
-        zoom_factor = VIZ_ZOOM_STEP_BASE ** steps
-        new_zoom = max(VIZ_ZOOM_MIN, min(VIZ_ZOOM_MAX, self.zoom * zoom_factor))
-        if new_zoom == self.zoom:
-            return
         self.zoom = new_zoom
         new_ra_span, new_dec_span = self.view_span()
         self.center_ra = cursor_ra + new_ra_span * (frac_x - 0.5)
@@ -2638,6 +2656,12 @@ class MainWindow(QMainWindow):
 
     def _update_target_name_label(self):
         self.target_name_label.setText(self.target_object_name or "")
+        # SkyViewWidget.target_object_name (default None, never otherwise assigned) is what
+        # _draw_camera_and_reticle's center-reference-circle sizing keys off of - without this,
+        # getattr(self, "target_object_name", None) there always fell back to None (never
+        # actually matching any real hit's name), so the circle was permanently stuck at its
+        # fixed default size instead of ever tracking the real target's on-screen size.
+        self.viz.target_object_name = self.target_object_name
 
     def _select_sky_target(self, ra, dec, source_label, target_name=None):
         """Ported from EQMountApp._select_sky_target, plus one addition: selecting the Sun or
