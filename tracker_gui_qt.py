@@ -65,7 +65,7 @@ from tracker_gui import (
     TRACKING_STABLE_DERIV_DEG_S, TRACKING_STABILITY_WINDOW_S,
     POS_UPDATE_RATE_MS, POSITION_BROADCAST_HZ, DEFAULT_LAT, DEFAULT_LON,
     SIDEREAL_RATE_DEG_S, MERIDIAN_LIMIT_WARNING_S, MERIDIAN_LIMIT_URGENT_S,
-    CONFIG_PATH, ISS_TRACKING_UPDATE_MS,
+    CONFIG_PATH, ISS_TRACKING_UPDATE_MS, ISS_DISPLAY_UPDATE_MS,
 )
 from sky_data import sky_catalog, iss_tracker, solar_system
 
@@ -2100,7 +2100,7 @@ class MainWindow(QMainWindow):
     def _iss_actively_tracked(self):
         """True while the ISS is the currently active tracked target - see
         EQMountApp._iss_update_tick's docstring for why this matters: it's what decides between
-        a leisurely 5s marker-only refresh and a fast ISS_TRACKING_UPDATE_MS one that actually
+        a leisurely 1Hz marker-only refresh and a fast ISS_TRACKING_UPDATE_MS one that actually
         keeps the Arduino's target current enough to follow the ISS's real orbital motion."""
         mode = self.mode_group.checkedButton().text() if self.mode_group.checkedButton() else ""
         return self.target_object_name == "ISS" and self.tracking and mode == "SIDEREAL"
@@ -2108,11 +2108,11 @@ class MainWindow(QMainWindow):
     def _iss_thread_state(self):
         """Called from _IssTrackingThread's own loop (background thread) each cycle - returns
         (enabled, interval_ms): whether to fetch at all (skip entirely while the ISS toggle is
-        off, rather than always polling every 5s in the background regardless of whether
-        anything's displaying it) and how long to sleep until the next cycle, fast
-        (ISS_TRACKING_UPDATE_MS) while the ISS is the actively tracked target, otherwise a
-        leisurely 5s marker-only refresh."""
-        return self.viz.iss_enabled, (ISS_TRACKING_UPDATE_MS if self._iss_actively_tracked() else 5000)
+        off, rather than always polling in the background regardless of whether anything's
+        displaying it) and how long to sleep until the next cycle, fast (ISS_TRACKING_UPDATE_MS)
+        while the ISS is the actively tracked target, otherwise a leisurely 1Hz
+        (ISS_DISPLAY_UPDATE_MS) marker-only refresh."""
+        return self.viz.iss_enabled, (ISS_TRACKING_UPDATE_MS if self._iss_actively_tracked() else ISS_DISPLAY_UPDATE_MS)
 
     def _trigger_iss_update(self):
         """Wakes the persistent ISS thread for an immediate refresh right now, instead of

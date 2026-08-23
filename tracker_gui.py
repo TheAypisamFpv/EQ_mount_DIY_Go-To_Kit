@@ -95,7 +95,10 @@ from sky_data import sky_catalog, iss_tracker, solar_system
 #           firmware-side rate-derivation/extrapolation (see this constant's own comment) already
 #           made raw update frequency far less important for smoothness than it used to be, so
 #           20Hz is still plenty fresh against the ISS's real path.
-GUI_VERSION = "1.0.5"
+#   1.0.6 - Added ISS_DISPLAY_UPDATE_MS (1Hz) as a distinct, slower refresh rate for when the ISS
+#           is merely shown on the sky viz (not the actively tracked target) - previously this
+#           case used a hardcoded 5000ms; now explicit and 1Hz per request.
+GUI_VERSION = "1.0.6"
 
 BAUD_RATE = 250000
 # GUI poll rate for the serial queue. Fast enough to comfortably keep up with the Arduino's 50Hz
@@ -127,8 +130,8 @@ POSITION_BROADCAST_HZ = 50
 POS_UPDATE_RATE_MS = int(1000 / POSITION_BROADCAST_HZ)  # 20 ms
 
 # How often fresh ISS RA/DEC is sent to the Arduino (CMD,SET_TARGET) while the ISS is the
-# actively tracked target - see _iss_update_tick/_on_iss_position. Independent of the 5s interval
-# used when the ISS is merely displayed (not tracked).
+# actively tracked target - see _iss_update_tick/_on_iss_position. Independent of the 1Hz interval
+# (ISS_DISPLAY_UPDATE_MS, below) used when the ISS is merely displayed (not tracked).
 #
 # Smoothness no longer strictly depends on this being fast - firmware 1.8.29+ derives a tracking
 # rate from recent SET_TARGETs and extrapolates continuously between them on-board (the same role
@@ -136,6 +139,11 @@ POS_UPDATE_RATE_MS = int(1000 / POSITION_BROADCAST_HZ)  # 20 ms
 # fresh against the ISS's real path without needing the previous 50Hz. Lowered from 20ms per
 # request (see GUI_VERSION 1.0.5's changelog entry).
 ISS_TRACKING_UPDATE_MS = 50
+
+# How often the ISS's RA/DEC is refreshed for display only (ISS shown on the sky viz / hover info
+# but NOT the actively tracked target) - see _iss_update_tick. 1Hz is plenty for a display-only
+# refresh; ISS_TRACKING_UPDATE_MS above is used instead once the ISS becomes the tracked target.
+ISS_DISPLAY_UPDATE_MS = 1000
 
 # Matches the firmware's own SIDEREAL_RATE_DEG_S exactly (EQMountTracker.ino) - used ONLY for the
 # client-side meridian-limit countdown estimate (_update_meridian_warning), never for any
@@ -3837,7 +3845,7 @@ class EQMountApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
         actively_tracking_iss = (self.target_object_name == "ISS" and self.tracking
                                   and self.mode_var.get() == "SIDEREAL")
-        interval_ms = ISS_TRACKING_UPDATE_MS if actively_tracking_iss else 5000
+        interval_ms = ISS_TRACKING_UPDATE_MS if actively_tracking_iss else ISS_DISPLAY_UPDATE_MS
         self._iss_update_after_id = self.after(interval_ms, self._iss_update_tick)
 
     def _on_iss_position(self, ra, dec, above_horizon):
