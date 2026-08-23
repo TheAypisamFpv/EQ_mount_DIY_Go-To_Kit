@@ -288,6 +288,9 @@ class SkyViewWidget(QOpenGLWidget):
 
     targetPicked = Signal(float, float)   # emitted (ra_deg, dec_deg) on double-click
     hoverInfoChanged = Signal(str)        # emitted with a "RA ... DEC ... | name (extra)" string
+    viewModeChanged = Signal(str)         # emitted whenever view_mode changes FROM WITHIN this
+                                           # widget (drag/middle-click) - see _set_view_mode -
+                                           # so MainWindow's view_mode_btn label/color can follow
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -376,6 +379,16 @@ class SkyViewWidget(QOpenGLWidget):
             self.center_dec = 0.0
         else:
             self.center_dec = max(-90.0 + dec_span / 2.0, min(90.0 - dec_span / 2.0, self.center_dec))
+
+    def _set_view_mode(self, mode):
+        """Sets view_mode and emits viewModeChanged if it actually changed - used (rather than
+        assigning self.view_mode directly) anywhere INSIDE this widget that drops out of
+        follow mode (drag-pan, middle-click reset), so MainWindow's view_mode_btn label/color
+        stays in sync instead of still showing "Telescope"/"Target" after the viz itself has
+        already switched back to Free."""
+        if mode != self.view_mode:
+            self.view_mode = mode
+            self.viewModeChanged.emit(mode)
 
     @staticmethod
     def ra_to_x(ra, w, margin, ra_min, ra_span):
@@ -904,7 +917,7 @@ class SkyViewWidget(QOpenGLWidget):
         if event.button() == Qt.MiddleButton:
             self.zoom = VIZ_ZOOM_MIN
             self.center_ra, self.center_dec = 180.0, 0.0
-            self.view_mode = "FREE"
+            self._set_view_mode("FREE")
             self.update()
             return
         if event.button() == Qt.LeftButton:
@@ -918,8 +931,7 @@ class SkyViewWidget(QOpenGLWidget):
         ra_span, dec_span = ra_max - ra_min, dec_max - dec_min
 
         if self._pan_last is not None and (event.buttons() & Qt.LeftButton) and self.zoom > VIZ_ZOOM_MIN:
-            if self.view_mode != "FREE":
-                self.view_mode = "FREE"
+            self._set_view_mode("FREE")
             dx, dy = pos.x() - self._pan_last.x(), pos.y() - self._pan_last.y()
             self.center_ra += dx * ra_span / max(1, (w - 2 * margin))
             self.center_dec += dy * dec_span / max(1, (h - 2 * margin))
@@ -1187,6 +1199,7 @@ class MainWindow(QMainWindow):
         self.viz.get_time_fn = self._get_effective_utc_now
         self.viz.targetPicked.connect(lambda ra, dec: self._select_sky_target(ra, dec, "Viz double-click"))
         self.viz.hoverInfoChanged.connect(self._on_hover_info)
+        self.viz.viewModeChanged.connect(self._on_viz_view_mode_changed)
 
         self._build_ui()
         self._set_arduino_controls_enabled(False)
@@ -1283,11 +1296,14 @@ class MainWindow(QMainWindow):
         self.port_combo = QComboBox()
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self._refresh_ports)
+        self._flat_btn(refresh_btn, "cyan")
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.clicked.connect(self._connect)
+        self._flat_btn(self.connect_btn, "green")
         self.disconnect_btn = QPushButton("Disconnect")
         self.disconnect_btn.clicked.connect(self._disconnect)
         self.disconnect_btn.setEnabled(False)
+        self._flat_btn(self.disconnect_btn, "red")
         self.conn_status = QLabel("● Disconnected")
         self.conn_status.setStyleSheet("color: gray;")
         conn_l.addWidget(self.port_combo, 0, 0, 1, 2)
@@ -1306,6 +1322,7 @@ class MainWindow(QMainWindow):
         self.gps_mode_check.toggled.connect(self._on_gps_mode_toggle)
         set_loc_btn = QPushButton("Set")
         set_loc_btn.clicked.connect(self._set_location)
+        self._flat_btn(set_loc_btn, "green")
         self.location_label = QLabel("Loc: not set")
         self.location_label.setStyleSheet("color: #8888aa; font-size: 10px;")
         self.streamer_mode_check = QCheckBox("Streamer Mode (hide GPS)")
@@ -1352,9 +1369,10 @@ class MainWindow(QMainWindow):
         self.tt_date_edit.returnPressed.connect(self._apply_time_travel)
         self.tt_time_edit.returnPressed.connect(self._apply_time_travel)
         self.preview_btn = QPushButton("Preview")
-        self.preview_btn.clicked.connect(self._apply_time_travel)
+        self.preview_btn.clicked.connect(self._apply_time_travel)  # baseline (inactive) style set in _update_time_travel_label
         now_btn = QPushButton("Now (Real Time)")
         now_btn.clicked.connect(self._reset_time_travel)
+        self._flat_btn(now_btn, "green")
         self.tt_label = QLabel("Showing: real-time sky")
         self.tt_label.setStyleSheet("color: #8888aa;")
         tt_row.addWidget(self.tt_date_edit)
@@ -1408,6 +1426,7 @@ class MainWindow(QMainWindow):
         dec_off_plus.clicked.connect(lambda: self._adjust_offset(0, 1))
         for b in (ra_off_minus, ra_off_plus, dec_off_minus, dec_off_plus):
             b.setFixedWidth(28)
+            self._flat_btn(b, "teal")  # same hue as the Mount readout these offsets adjust
 
         pos_l.addWidget(QLabel("Sky RA:"), 0, 0)
         pos_l.addWidget(self.sky_ra_label, 0, 1)
@@ -1449,22 +1468,27 @@ class MainWindow(QMainWindow):
         pos_l.addWidget(QLabel("Offset increment:"), 4, 0, 1, 2)
         pos_l.addWidget(self.offset_inc_edit, 4, 2)
 
-        self.error_label = QLabel("Error: RA 0.0000°  DEC 0.0000°")
-        self.error_label.setStyleSheet(f"color: {PALETTE['orange']};")
+        self.error_label = QLabel("Error: RA 0.0000° | DEC 0.0000°")
+        self.error_label.setAlignment(Qt.AlignCenter)
+        self.error_label.setStyleSheet(f"color: {PALETTE['orange']}; font-size: 18px; font-weight: bold;")
         pos_l.addWidget(self.error_label, 5, 0, 1, 10)
 
         # Stability badge - STABLE/SETTLING/DRIFTING/ALIGNING/TRACKING:OFF, driven by
         # _update_tracking_stability (ported from EQMountApp._update_tracking_stability's
         # error-trend classification, not just a plain magnitude threshold).
-        self.tracking_status_label = QLabel("TRACKING: OFF")
+        self.tracking_status_label = QLabel("OFF")
         self.tracking_status_label.setAlignment(Qt.AlignCenter)
         self.tracking_status_label.setStyleSheet(
             "background-color: #444455; color: white; font-weight: bold; font-size: 14px; padding: 5px;")
         pos_l.addWidget(self.tracking_status_label, 6, 0, 1, 10)
 
+        # Fills the space below the badge (previously just empty) with whatever's actually
+        # being tracked, e.g. a named star/DSO/Sun/Moon/ISS from a search selection or
+        # double-click (see _select_sky_target/target_object_name) - blank when tracking an
+        # arbitrary manually-entered RA/DEC, same as EQMountApp's target_name_label.
         self.target_name_label = QLabel("")
         self.target_name_label.setAlignment(Qt.AlignCenter)
-        self.target_name_label.setStyleSheet(f"color: {PALETTE['yellow']}; font-weight: bold; font-size: 14px;")
+        self.target_name_label.setStyleSheet(f"color: {PALETTE['yellow']}; font-weight: bold; font-size: 26px; padding: 10px;")
         pos_l.addWidget(self.target_name_label, 7, 0, 1, 10)
 
         self.meridian_warning_label = QLabel("")
@@ -1487,13 +1511,16 @@ class MainWindow(QMainWindow):
         toolbar = QHBoxLayout()
         self.view_mode_btn = QPushButton("View: Free")
         self.view_mode_btn.clicked.connect(self._cycle_view_mode)
+        self._update_view_mode_btn_style()
         self.iss_btn = QPushButton("ISS: OFF")
         self.iss_btn.clicked.connect(self._toggle_iss)
+        self._style_toggle_btn(self.iss_btn, False)
         self.const_btn = QPushButton("Constellations: ON")
         self.const_btn.clicked.connect(self._toggle_constellations)
         self._style_toggle_btn(self.const_btn, True)  # constellations_enabled defaults True
         self.min_size_btn = QPushButton("Min Size: OFF")
         self.min_size_btn.clicked.connect(self._toggle_min_size_filter)
+        self._style_toggle_btn(self.min_size_btn, False)
         self.min_size_edit = QLineEdit("100.0")
         self.min_size_edit.setFixedWidth(50)
         self.min_size_edit.editingFinished.connect(self._on_min_size_commit)
@@ -1501,6 +1528,8 @@ class MainWindow(QMainWindow):
         cam_plus = QPushButton("►")
         cam_minus.setFixedWidth(28)
         cam_plus.setFixedWidth(28)
+        self._flat_btn(cam_minus, "blue")  # camera/telescope hue, matching the FOV overlay
+        self._flat_btn(cam_plus, "blue")
         cam_minus.clicked.connect(lambda: self._adjust_camera_orientation(-5.0))
         cam_plus.clicked.connect(lambda: self._adjust_camera_orientation(5.0))
         self.cam_rot_edit = QLineEdit("0.0")
@@ -1565,7 +1594,7 @@ class MainWindow(QMainWindow):
             QPushButton:hover {{ background-color: {STOP_RED_HOVER}; }}
             QPushButton:pressed {{ background-color: {STOP_RED_PRESSED}; }}
         """)
-        self.stop_btn.setFixedSize(46, 46)  # squarer, and a bit bigger than a single text line needs
+        self.stop_btn.setFixedSize(92, 46)  # width doubled from the previous 46x46 square
         self.stop_btn.setToolTip("Immediately stops tracking/slewing - single action, no confirmation (ISO 13850 emergency stop convention).")
         self.stop_btn.clicked.connect(self._stop)
 
@@ -1636,9 +1665,11 @@ class MainWindow(QMainWindow):
 
         self.safe_target_btn = QPushButton("Safe Target (DEC to 0°)")
         self.safe_target_btn.clicked.connect(self._safe_target)
+        self._flat_btn(self.safe_target_btn, "yellow")  # caution, echoing EQMountApp's olive fg_color for these two
         right.addWidget(self.safe_target_btn)
         self.home_axes_btn = QPushButton("Home Axes (RA/DEC to 0°)")
         self.home_axes_btn.clicked.connect(self._home_axes)
+        self._flat_btn(self.home_axes_btn, "yellow")
         right.addWidget(self.home_axes_btn)
 
         # Manual meridian-flip toggle - see EQMountApp._toggle_telescope_flipped's docstring:
@@ -1647,6 +1678,7 @@ class MainWindow(QMainWindow):
         # not optimistically, since the RA axis physically has to rotate ~180° first.
         self.flipped_btn = QPushButton("Telescope Flipped: OFF")
         self.flipped_btn.clicked.connect(self._toggle_telescope_flipped)
+        self.flipped_btn.setStyleSheet(f"border: 1px solid {PALETTE['orange']};")
         right.addWidget(self.flipped_btn)
 
         sync_box = QGroupBox("Sync / Calibrate (choose star)")
@@ -1657,6 +1689,7 @@ class MainWindow(QMainWindow):
         sync_l.addWidget(self.sync_combo)
         sync_btn = QPushButton("Sync Position (send to Arduino)")
         sync_btn.clicked.connect(self._sync)
+        self._flat_btn(sync_btn, "green")
         sync_l.addWidget(sync_btn)
         right.addWidget(sync_box)
 
@@ -1666,6 +1699,7 @@ class MainWindow(QMainWindow):
         self.dec_edit = QLineEdit("0.0")
         goto_btn = QPushButton("Goto")
         goto_btn.clicked.connect(self._goto)
+        self._flat_btn(goto_btn, "blue")
         target_l.addWidget(QLabel("RA:"), 0, 0)
         target_l.addWidget(self.ra_edit, 0, 1)
         target_l.addWidget(QLabel("DEC:"), 1, 0)
@@ -1675,6 +1709,7 @@ class MainWindow(QMainWindow):
 
         resync_btn = QPushButton("Resync Arduino Time to Laptop")
         resync_btn.clicked.connect(lambda: self._manual_resync())
+        self._flat_btn(resync_btn, "cyan")
         right.addWidget(resync_btn)
 
         self.pos_rate_label = QLabel(
@@ -1687,8 +1722,10 @@ class MainWindow(QMainWindow):
         debug_l = QHBoxLayout(debug_box)
         self.debug_toggle_btn = QPushButton("Verbose Debug: OFF")
         self.debug_toggle_btn.clicked.connect(self._toggle_arduino_debug)
+        self._style_toggle_btn(self.debug_toggle_btn, False)
         dump_btn = QPushButton("Force Dump")
         dump_btn.clicked.connect(lambda: self.serial.request_debug_dump())
+        self._flat_btn(dump_btn, "cyan")
         debug_l.addWidget(self.debug_toggle_btn)
         debug_l.addWidget(dump_btn)
         right.addWidget(debug_box)
@@ -1897,7 +1934,9 @@ class MainWindow(QMainWindow):
         if self._time_travel_offset == timedelta(0):
             self.tt_label.setText("Showing: real-time sky")
             self.tt_label.setStyleSheet("color: #8888aa;")
-            self.preview_btn.setStyleSheet("")
+            # Outline-only, not a full fill - baseline/inactive state, distinct from the solid
+            # orange fill once a preview actually starts (below).
+            self.preview_btn.setStyleSheet(f"border: 1px solid {PALETTE['orange']};")
             # Keep the date/time fields ticking forward live while showing the real-time sky,
             # instead of staying frozen at whatever _reset_time_travel_inputs_to_now() last set
             # them to - skipped while either field has focus, so this can't clobber a date/time
@@ -2138,13 +2177,35 @@ class MainWindow(QMainWindow):
         default "pressed/active" look the way a checkable toolbar button would have) - this
         gives every on/off toolbar button (ISS, Constellations, Min Size, Verbose Debug, ...) a
         distinct green fill while active, matching CustomTkinter's fg_color-swap convention in
-        tracker_gui.py, instead of the text label being the only thing that changes."""
-        btn.setStyleSheet(f"background-color: {PALETTE['green']}; color: black; font-weight: bold;" if on else "")
+        tracker_gui.py, instead of the text label being the only thing that changes. OFF gets a
+        plain teal outline rather than no styling at all, so every button in the app has some
+        color treatment (filled when active, outlined when not)."""
+        btn.setStyleSheet(f"background-color: {PALETTE['green']}; color: black; font-weight: bold;" if on
+                          else f"border: 1px solid {PALETTE['teal']};")
+
+    @staticmethod
+    def _flat_btn(btn, palette_name):
+        """Flat-filled button in one PALETTE color, black text (the palette is light/pastel -
+        see PALETTE's own module docstring - so black reads better than white on it, same
+        reasoning as every other filled button/badge in this app). Every plain QPushButton that
+        isn't already a stateful toggle (see _style_toggle_btn) or otherwise state-driven
+        (tracking_btn, flipped_btn, stop_btn, preview_btn) gets one of these instead of the
+        default unstyled look, loosely echoing which color role EQMountApp gave the matching
+        button (green ~ CTk's default "go" blue/positive actions, red ~ its disconnect red,
+        yellow ~ its olive safe-target/home-axes, cyan ~ neutral utility actions it left default)."""
+        btn.setStyleSheet(f"background-color: {PALETTE[palette_name]}; color: black; font-weight: bold;")
 
     def _cycle_view_mode(self):
         order = ["FREE", "TELESCOPE", "TARGET"]
         self.viz.view_mode = order[(order.index(self.viz.view_mode) + 1) % len(order)]
         self.view_mode_btn.setText(f"View: {self.viz.view_mode.title()}")
+        self._update_view_mode_btn_style()
+
+    def _on_viz_view_mode_changed(self, mode):
+        """The viz itself drops back to Free on a manual drag-pan or middle-click reset (see
+        SkyViewWidget._set_view_mode) - keeps view_mode_btn's label/color in sync with that,
+        instead of it still reading "Telescope"/"Target" after the viz has already switched."""
+        self.view_mode_btn.setText(f"View: {mode.title()}")
         self._update_view_mode_btn_style()
 
     def _update_view_mode_btn_style(self):
@@ -2158,7 +2219,7 @@ class MainWindow(QMainWindow):
         elif self.viz.view_mode == "TARGET":
             self.view_mode_btn.setStyleSheet(f"background-color: {PALETTE['orange']}; color: black; font-weight: bold;")
         else:
-            self.view_mode_btn.setStyleSheet("")
+            self.view_mode_btn.setStyleSheet(f"border: 1px solid {PALETTE['teal']};")
 
     def _toggle_iss(self):
         self.viz.iss_enabled = not self.viz.iss_enabled
@@ -2270,11 +2331,14 @@ class MainWindow(QMainWindow):
     def _confirm_risky_slew(self, ra, dec):
         if not self._is_target_risky(ra, dec):
             return True
+        # Same reasoning as the solar-tracking confirm's explicit defaultButton=No - a collision
+        # risk shouldn't be the thing an accidental Enter press confirms.
         return QMessageBox.question(
             self, "Meridian Limit Warning",
             f"Target RA={ra:.3f}° DEC={dec:.3f}° is past the meridian limit for the mount's "
             f"current configuration - continuing risks the OTA colliding with the tripod/mount.\n\n"
             f"Proceed anyway?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         ) == QMessageBox.Yes
 
     def _update_meridian_warning(self):
@@ -2416,7 +2480,8 @@ class MainWindow(QMainWindow):
             return
         self.viz.telescope_flipped = flipped
         self.flipped_btn.setText(f"Telescope Flipped: {'ON' if flipped else 'OFF'}")
-        self.flipped_btn.setStyleSheet(f"background-color: {PALETTE['orange']}; color: black; font-weight: bold;" if flipped else "")
+        self.flipped_btn.setStyleSheet(f"background-color: {PALETTE['orange']}; color: black; font-weight: bold;" if flipped
+                                       else f"border: 1px solid {PALETTE['orange']};")
         self.viz.update()  # the meridian-limit shading only draws while not flipped
 
     def _toggle_tracking(self):
@@ -2433,12 +2498,17 @@ class MainWindow(QMainWindow):
 
         mode = self.mode_group.checkedButton().text() if self.mode_group.checkedButton() else "SIDEREAL"
         if mode == "SOLAR":
+            # Explicit buttons + defaultButton=No - QMessageBox.question() with neither
+            # specified defaults its Enter-activated button to Yes, which is the wrong default
+            # for a "did you actually attach the solar filter" safety gate: an accidental/
+            # reflexive Enter press should never be the thing that confirms this.
             if QMessageBox.question(
                 self, "Solar Tracking Safety Check",
                 "Solar tracking will point the telescope directly at the Sun.\n\n"
                 "Confirm a proper solar filter is attached to the telescope/camera BEFORE "
                 "proceeding - without one, this can cause permanent eye damage or destroy a "
                 "camera sensor.\n\nIs the solar filter in place?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             ) != QMessageBox.Yes:
                 self._log("Solar tracking start cancelled - solar filter not confirmed.")
                 return
@@ -2611,22 +2681,22 @@ class MainWindow(QMainWindow):
         white text - gray is exempt from the uniform accent palette the same way backgrounds
         are, and it's dark enough for white to read fine."""
         if self._align_phase == "ALIGNING":
-            self._set_stability("ALIGNING...", PALETTE["cyan"])
+            self._set_stability("ALIGNING", PALETTE["cyan"])
             return
         if not self.tracking or self._align_phase != "TRACKING":
-            self._set_stability("TRACKING: OFF", "#444455", text_color="white")
+            self._set_stability("OFF", "#444455", text_color="white")
             return
         if len(self.err_ra_history) < 4 or len(self.err_dec_history) < 4:
-            self._set_stability("● SETTLING", PALETTE["orange"])
+            self._set_stability("SETTLING", PALETTE["orange"])
             return
         deriv_ra = self._calc_smoothed_speed(self.err_ra_history, window_s=TRACKING_STABILITY_WINDOW_S)
         deriv_dec = self._calc_smoothed_speed(self.err_dec_history, window_s=TRACKING_STABILITY_WINDOW_S)
         worst_err = max(abs(self.err_ra), abs(self.err_dec))
         worst_growth = max(deriv_ra, deriv_dec)
         if worst_err <= TRACKING_STABLE_ERR_DEG and worst_growth <= TRACKING_STABLE_DERIV_DEG_S:
-            self._set_stability("● STABLE", PALETTE["green"])
+            self._set_stability("STABLE", PALETTE["green"])
         elif worst_growth > TRACKING_STABLE_DERIV_DEG_S:
-            self._set_stability("● DRIFTING", PALETTE["red"])
+            self._set_stability("DRIFTING", PALETTE["red"])
         else:
             self._set_stability("● SETTLING", PALETTE["orange"])
 
@@ -2765,8 +2835,18 @@ class MainWindow(QMainWindow):
             try:
                 self.current_ra = float(fields[1])
                 self.current_dec = float(fields[2])
-                self.target_ra = float(fields[3])
-                self.target_dec = float(fields[4])
+                # Skip while actively tracking the ISS - _on_iss_updated already keeps
+                # target_ra/dec fresh from the GUI's own live skyfield computation (the same
+                # value actually being sent as CONTINUATION updates), up to 50Hz. This field is
+                # just the Arduino's ECHO of whatever target it last received, lagged by real
+                # serial round-trip time - overwriting the fresher client-side value with that
+                # stale echo on every single POS line (also up to 50Hz, on an unsynchronized
+                # clock relative to the ISS thread) made target_ra/dec - and so the View: Target
+                # viz center - visibly flicker between the fresh and stale value. Reported as
+                # "the viz sometimes jumps when in View: Target" while tracking the ISS.
+                if not self._iss_actively_tracked():
+                    self.target_ra = float(fields[3])
+                    self.target_dec = float(fields[4])
                 self.mount_ra_angle = float(fields[5])
                 self.mount_dec_angle = float(fields[6])
                 self.err_ra = abs(self.current_ra - self.target_ra)
@@ -2823,8 +2903,8 @@ class MainWindow(QMainWindow):
                 self.mount_dec_label.setText(f"{self.mount_dec_angle:.4f}°")
                 self.speed_ra_label.setText(f"{self.speed_ra:.6f} °/s")
                 self.speed_dec_label.setText(f"{self.speed_dec:.6f} °/s")
-                self.error_label.setText(f"Error: RA {self.err_ra:.4f}°  DEC {self.err_dec:.4f}°")
-                self.live_error_label.setText(f"Live Error: RA {self.err_ra:.4f}°  DEC {self.err_dec:.4f}°")
+                self.error_label.setText(f"Error: RA {self.err_ra:.4f}° | DEC {self.err_dec:.4f}°")
+                self.live_error_label.setText(f"Live Error: RA {self.err_ra:.4f}° | DEC {self.err_dec:.4f}°")
                 self._update_mode_tracking_label()
                 self._update_tracking_stability()
                 self.viz.update()
