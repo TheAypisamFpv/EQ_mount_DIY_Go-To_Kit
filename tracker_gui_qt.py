@@ -1565,8 +1565,29 @@ class MainWindow(QMainWindow):
         debug_l.addWidget(dump_btn)
         right.addWidget(debug_box)
 
-        stop_btn = QPushButton("STOP (panic)")
-        stop_btn.setStyleSheet(f"background-color: {PALETTE['red']}; color: black; font-weight: bold; padding: 6px;")
+        # Styled per ISO 13850 (emergency stop function) actuator convention - RED actuator on a
+        # YELLOW background, the one color pairing that standard exists specifically to make
+        # unambiguous - deliberately NOT drawn from PALETTE (see its module docstring): a muted
+        # OKLCH-derived red would undercut the exact thing this convention is for, which is
+        # being instantly recognizable as "the emergency stop" at a glance, not visually
+        # consistent with the rest of the app. Actuation itself already matches the standard's
+        # intent too - one click, immediate (_stop -> _request_tracking_action), no confirmation
+        # dialog in the way, same as every other STOP path in this app (Delete key, panic byte).
+        stop_btn = QPushButton("⏹  STOP")
+        stop_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #CC0000;
+                color: white;
+                border: 4px solid #FFD500;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 15px;
+                padding: 10px;
+            }
+            QPushButton:hover { background-color: #E00000; }
+            QPushButton:pressed { background-color: #990000; }
+        """)
+        stop_btn.setToolTip("Immediately stops tracking/slewing - single action, no confirmation (ISO 13850 emergency stop convention).")
         stop_btn.clicked.connect(self._stop)
         right.addWidget(stop_btn)
 
