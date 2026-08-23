@@ -98,7 +98,14 @@ from sky_data import sky_catalog, iss_tracker, solar_system
 #   1.0.6 - Added ISS_DISPLAY_UPDATE_MS (1Hz) as a distinct, slower refresh rate for when the ISS
 #           is merely shown on the sky viz (not the actively tracked target) - previously this
 #           case used a hardcoded 5000ms; now explicit and 1Hz per request.
-GUI_VERSION = "1.0.6"
+#   1.0.7 - Fixed the remaining half of "tracking sometimes needs stop+restart to show stable":
+#           an earlier fix cleared _err_ra_history/_err_dec_history on the initial Start click,
+#           but the history kept accumulating unconditionally on every POS line straight through
+#           the ALIGNING slew that follows, re-poisoning the window with slew-noise error samples
+#           before TRACKING phase even began. Now also cleared at the true ALIGNING->TRACKING
+#           transition (the final, non-AXIS:RA TRACKING_STARTED line), so the stability trend is
+#           judged only on real tracking data.
+GUI_VERSION = "1.0.7"
 
 BAUD_RATE = 250000
 # GUI poll rate for the serial queue. Fast enough to comfortably keep up with the Arduino's 50Hz
@@ -4245,6 +4252,15 @@ class EQMountApp(ctk.CTk):
         # DRIFTING (left over from a previous tracking session) in the gap before the first
         # STATUS:RESETTING/STOPPED confirmation arrives.
         self._align_phase = "ALIGNING" if action == "START" else "IDLE"
+        # Clear the error-trend history too, not just the phase - otherwise stale (error, time)
+        # pairs from the PREVIOUS tracking session are still sitting in the deques once TRACKING
+        # phase is reached, and _update_tracking_stability's windowed derivative mixes them into
+        # the trend, making a genuinely fresh/stable start look like it's still SETTLING or even
+        # DRIFTING for up to TRACKING_STABILITY_WINDOW_S. This was the root cause of "tracking
+        # sometimes needs stop+restart to show stable" - it looked identical to real settling, so
+        # it went unnoticed until traced here.
+        self._err_ra_history.clear()
+        self._err_dec_history.clear()
         self._update_tracking_button()
         self._update_status_display(status_text, "#ffaa00")
         ok = send_fn()
@@ -4401,6 +4417,21 @@ class EQMountApp(ctk.CTk):
                     # sequence being done - only the final (DEC) one does, so the stability
                     # badge doesn't start judging error trend before DEC has even moved.
                     if "AXIS:RA" not in line:
+                        # Clearing on the initial Start click (_request_tracking_action) isn't
+                        # enough by itself: _err_ra_history/_err_dec_history keep accumulating
+                        # unconditionally on every POS line straight through the ALIGNING slew
+                        # that follows (RESETTING_DEC/RA/WAIT_RA/DEC/WAIT_DEC), where error is
+                        # naturally large and fast-changing - exactly the kind of data this
+                        # history exists to flag as unstable. By the time this STATUS line
+                        # actually flips align_phase to TRACKING, the window is already
+                        # re-poisoned with that slew noise, so a genuinely fresh, already-
+                        # converged tracking session can still read as SETTLING/DRIFTING right
+                        # out of the gate. Clear again right here, at the true ALIGNING->TRACKING
+                        # transition, so the trend is judged only on data from actual tracking,
+                        # never the slew that preceded it.
+                        if self._align_phase != "TRACKING":
+                            self._err_ra_history.clear()
+                            self._err_dec_history.clear()
                         self._align_phase = "TRACKING"
                 elif "ALIGNING" in line or "RESETTING" in line or "WAITING" in line:
                     color = "#ffaa00"

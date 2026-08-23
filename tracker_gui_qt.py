@@ -2882,6 +2882,20 @@ class MainWindow(QMainWindow):
                     color = PALETTE["green"]
                     self.tracking = True
                     if "AXIS:RA" not in line:
+                        # Clearing on the initial Start click (_request_tracking_action) isn't
+                        # enough by itself: err_ra_history/err_dec_history keep accumulating
+                        # unconditionally on every POS line straight through the ALIGNING slew
+                        # that follows (RESETTING_DEC/RA/WAIT_RA/DEC/WAIT_DEC), where error is
+                        # naturally large and fast-changing - that's exactly the kind of data
+                        # this history exists to flag as unstable. By the time this STATUS line
+                        # actually flips align_phase to TRACKING, the window is already re-poisoned
+                        # with that slew noise, so a genuinely fresh, already-converged tracking
+                        # session can still read as SETTLING/DRIFTING right out of the gate. Clear
+                        # again right here, at the true ALIGNING->TRACKING transition, so the trend
+                        # is judged only on data from actual tracking, never the slew that preceded it.
+                        if self._align_phase != "TRACKING":
+                            self.err_ra_history.clear()
+                            self.err_dec_history.clear()
                         self._align_phase = "TRACKING"
                 elif "ALIGNING" in line or "RESETTING" in line or "WAITING" in line:
                     color = PALETTE["orange"]
