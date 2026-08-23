@@ -1134,6 +1134,13 @@ class MainWindow(QMainWindow):
         self.time_travel_label_timer.timeout.connect(self._update_time_travel_label)
         self.time_travel_label_timer.start(1000)
 
+        # Ticks fast enough (5x/sec) for a crisp on/off blink edge, but derives the actual on/off
+        # phase from wall-clock time.time() (not elapsed timer ticks) so the blink is genuinely
+        # synced to real seconds regardless of exactly when this timer started.
+        self.blink_timer = QTimer(self)
+        self.blink_timer.timeout.connect(self._update_realtime_dot)
+        self.blink_timer.start(200)
+
         self._load_catalog()
         self._refresh_ports()
         QTimer.singleShot(500, self._trigger_solar_system_update)
@@ -1192,22 +1199,38 @@ class MainWindow(QMainWindow):
         self.streamer_mode_check = QCheckBox("Streamer Mode (hide GPS)")
         self.streamer_mode_check.toggled.connect(self._on_streamer_mode_toggle)
 
+        self.lat_label = QLabel("Lat:")
+        self.lon_label = QLabel("Lon:")
+        self.gps_label = QLabel("GPS:")
         loc_l.addWidget(self.gps_mode_check, 0, 0, 1, 5)
-        loc_l.addWidget(QLabel("Lat:"), 1, 0)
+        loc_l.addWidget(self.lat_label, 1, 0)
         loc_l.addWidget(self.lat_edit, 1, 1)
-        loc_l.addWidget(QLabel("Lon:"), 1, 2)
+        loc_l.addWidget(self.lon_label, 1, 2)
         loc_l.addWidget(self.lon_edit, 1, 3)
-        loc_l.addWidget(self.gps_edit, 1, 1, 1, 3)  # overlaps lat/lon cells; shown xor via _on_gps_mode_toggle
+        # gps_label/gps_edit occupy the SAME cells as lat/lon (columns 0-3) - only one set is
+        # ever visible at a time (toggled in _on_gps_mode_toggle), never both, so they don't
+        # overlap visually the way lat_label/lon_label previously stayed visible underneath the
+        # combined field (the Lon: label rendering in the middle of the GPS text).
+        loc_l.addWidget(self.gps_label, 1, 0)
+        loc_l.addWidget(self.gps_edit, 1, 1, 1, 3)
         loc_l.addWidget(set_loc_btn, 1, 4)
         loc_l.addWidget(self.location_label, 2, 0, 1, 4)
         loc_l.addWidget(self.streamer_mode_check, 2, 4)
+        self.gps_label.setVisible(False)
         self.gps_edit.setVisible(False)
         top_row.addWidget(loc_box, stretch=3)
         left.addLayout(top_row)
 
         # ---- Time Travel row ----
         tt_row = QHBoxLayout()
-        tt_row.addWidget(QLabel("\U0001F550 Time Travel (UTC):"))
+        # Blinking dot instead of a static clock icon - green and blinking once per real second
+        # while showing the real-time sky, orange (still blinking) while a Time Travel preview
+        # is active - see _update_realtime_dot, driven by wall-clock time so the blink itself is
+        # also a live "yes, this is still ticking" signal, not just the color.
+        self.realtime_dot = QLabel("●")
+        self.realtime_dot.setStyleSheet("color: #33ff88; font-size: 15px; font-weight: bold;")
+        tt_row.addWidget(self.realtime_dot)
+        tt_row.addWidget(QLabel("Time Travel (UTC):"))
         self.tt_date_edit = QLineEdit()
         self.tt_date_edit.setFixedWidth(90)
         self.tt_date_edit.setPlaceholderText("YYYY-MM-DD")
@@ -1348,6 +1371,7 @@ class MainWindow(QMainWindow):
         self.iss_btn.clicked.connect(self._toggle_iss)
         self.const_btn = QPushButton("Constellations: ON")
         self.const_btn.clicked.connect(self._toggle_constellations)
+        self._style_toggle_btn(self.const_btn, True)  # constellations_enabled defaults True
         self.min_size_btn = QPushButton("Min Size: OFF")
         self.min_size_btn.clicked.connect(self._toggle_min_size_filter)
         self.min_size_edit = QLineEdit("100.0")
@@ -1530,16 +1554,22 @@ class MainWindow(QMainWindow):
                 self.gps_edit.setText(f"{lat}, {lon}")
             except ValueError:
                 pass
+            self.lat_label.setVisible(False)
             self.lat_edit.setVisible(False)
+            self.lon_label.setVisible(False)
             self.lon_edit.setVisible(False)
+            self.gps_label.setVisible(True)
             self.gps_edit.setVisible(True)
         else:
             nums = re.findall(r"[-+]?\d*\.?\d+", self.gps_edit.text())
             if len(nums) >= 2:
                 self.lat_edit.setText(nums[0])
                 self.lon_edit.setText(nums[1])
+            self.gps_label.setVisible(False)
             self.gps_edit.setVisible(False)
+            self.lat_label.setVisible(True)
             self.lat_edit.setVisible(True)
+            self.lon_label.setVisible(True)
             self.lon_edit.setVisible(True)
         if hasattr(self, "_location_save_timer"):
             self._location_save_timer.start(200)
@@ -1675,6 +1705,16 @@ class MainWindow(QMainWindow):
             suffix = "" if connected else " - Arduino not connected"
             self.tt_label.setText(f"⚠ TIME TRAVEL: {eff_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC{suffix}")
             self.tt_label.setStyleSheet("color: #ff9944;")
+
+    def _update_realtime_dot(self):
+        """Blinks once per real (wall-clock) second - on for the first half of each second, off
+        for the second half - green while showing the real-time sky, orange while a Time Travel
+        preview is active. Derived from time.time(), not elapsed timer ticks, so the on/off
+        phase is synced to actual second boundaries regardless of when blink_timer started."""
+        lit = (time.time() % 1.0) < 0.5
+        base_color = "#33ff88" if self._time_travel_offset == timedelta(0) else "#ffaa44"
+        self.realtime_dot.setStyleSheet(
+            f"color: {base_color if lit else '#333340'}; font-size: 15px; font-weight: bold;")
 
     # ---------------- catalog ----------------
     def _start_worker(self, worker, *connections):
@@ -1823,24 +1863,37 @@ class MainWindow(QMainWindow):
         self.mode_tracking_label.setText(f"MODE: {mode}  |  TRACKING: {state}")
         self._update_tracking_stability()
 
+    @staticmethod
+    def _style_toggle_btn(btn, on):
+        """A plain QPushButton looks identical whether the thing it toggles is on or off (no
+        default "pressed/active" look the way a checkable toolbar button would have) - this
+        gives every on/off toolbar button (ISS, Constellations, Min Size, Verbose Debug, ...) a
+        distinct green fill while active, matching CustomTkinter's fg_color-swap convention in
+        tracker_gui.py, instead of the text label being the only thing that changes."""
+        btn.setStyleSheet("background-color: #006400; color: white; font-weight: bold;" if on else "")
+
     def _cycle_view_mode(self):
         order = ["FREE", "TELESCOPE", "TARGET"]
         self.viz.view_mode = order[(order.index(self.viz.view_mode) + 1) % len(order)]
         self.view_mode_btn.setText(f"View: {self.viz.view_mode.title()}")
+        self._style_toggle_btn(self.view_mode_btn, self.viz.view_mode != "FREE")
 
     def _toggle_iss(self):
         self.viz.iss_enabled = not self.viz.iss_enabled
         self.iss_btn.setText(f"ISS: {'ON' if self.viz.iss_enabled else 'OFF'}")
+        self._style_toggle_btn(self.iss_btn, self.viz.iss_enabled)
         self.viz.update()
 
     def _toggle_constellations(self):
         self.viz.constellations_enabled = not self.viz.constellations_enabled
         self.const_btn.setText(f"Constellations: {'ON' if self.viz.constellations_enabled else 'OFF'}")
+        self._style_toggle_btn(self.const_btn, self.viz.constellations_enabled)
         self.viz.update()
 
     def _toggle_min_size_filter(self):
         self.viz.min_dso_size_filter_enabled = not self.viz.min_dso_size_filter_enabled
         self.min_size_btn.setText(f"Min Size: {'ON' if self.viz.min_dso_size_filter_enabled else 'OFF'}")
+        self._style_toggle_btn(self.min_size_btn, self.viz.min_dso_size_filter_enabled)
         self.viz.update()
 
     def _on_min_size_commit(self):
@@ -2062,6 +2115,7 @@ class MainWindow(QMainWindow):
         self.arduino_debug_enabled = not self.arduino_debug_enabled
         self.serial.send_debug(self.arduino_debug_enabled)
         self.debug_toggle_btn.setText(f"Verbose Debug: {'ON' if self.arduino_debug_enabled else 'OFF'}")
+        self._style_toggle_btn(self.debug_toggle_btn, self.arduino_debug_enabled)
         self._log(f"Sent CMD,DEBUG,{'ON' if self.arduino_debug_enabled else 'OFF'}")
 
     def _toggle_telescope_flipped(self):
@@ -2323,6 +2377,7 @@ class MainWindow(QMainWindow):
             self.conn_status.setStyleSheet("color: #00FF88;")
             self.arduino_debug_enabled = False
             self.debug_toggle_btn.setText("Verbose Debug: OFF")
+            self._style_toggle_btn(self.debug_toggle_btn, False)
             self._update_status_display("CONNECTED - WAITING FOR PING RESPONSE", "#ffaa00")
             self._log(f"Connected to {port}. Waiting for Arduino response...")
         elif msg.startswith("RX:STATUS:PONG"):
@@ -2336,6 +2391,7 @@ class MainWindow(QMainWindow):
             self.slewing = False
             self.arduino_debug_enabled = False
             self.debug_toggle_btn.setText("Verbose Debug: OFF")
+            self._style_toggle_btn(self.debug_toggle_btn, False)
             self._update_mode_tracking_label()
             self._update_status_display("DISCONNECTED", "#ff4444")
             self._log("Disconnected")
