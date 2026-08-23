@@ -1509,7 +1509,7 @@ class MainWindow(QMainWindow):
         # readouts directly under the viz (not the sidebar) - the one control that should be
         # reachable without hunting for it regardless of what else is on screen, closest to
         # where your eyes already are while watching the viz.
-        stop_btn = QPushButton("⏹\nSTOP")
+        stop_btn = QPushButton("STOP")
         stop_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: {STOP_RED};
