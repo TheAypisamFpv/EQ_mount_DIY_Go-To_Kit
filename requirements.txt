@@ -2,3 +2,4 @@ customtkinter>=5.2.0
 pyserial>=3.5
 skyfield>=1.49
 Pillow>=10.0.0
+PySide6>=6.5.0
