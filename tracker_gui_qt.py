@@ -45,7 +45,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QComboBox, QLabel, QLineEdit, QTextEdit, QRadioButton, QButtonGroup,
-    QGroupBox, QCheckBox, QListWidget, QMessageBox,
+    QGroupBox, QCheckBox, QListWidget, QMessageBox, QFrame,
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
@@ -159,9 +159,14 @@ def _illuminated_disc_path(x, y, r, bearing_deg, illum_fraction):
     # Qt's arcTo (like Tk's create_arc, style="chord") measures angles in degrees, 0 at the
     # 3 o'clock position, increasing counter-clockwise - the exact same convention the original
     # Tk call (start=bearing_deg, extent=180, style="chord") relies on, so no sign/offset
-    # translation is needed. arcTo() as the first op on an empty path implicitly moves to the
-    # arc's own start point; closeSubpath() then draws the straight chord back to it.
+    # translation is needed.
+    # Qt's docs say arcTo() on an empty path implicitly moveTo()s the arc's own start point -
+    # it doesn't, at least on this PySide6 version: it instead inserts a MoveTo(0, 0) (the
+    # path's default origin) followed by a LineTo the arc's start, which drew a long stray wedge
+    # from the top-left of the canvas to the Moon/planet disc. Explicit moveTo first avoids it.
+    start_rad = math.radians(bearing_deg)
     path_lit = QPainterPath()
+    path_lit.moveTo(x + r * math.cos(start_rad), y - r * math.sin(start_rad))
     path_lit.arcTo(QRectF(x - r, y - r, 2 * r, 2 * r), bearing_deg, 180)
     path_lit.closeSubpath()
 
@@ -1272,25 +1277,38 @@ class MainWindow(QMainWindow):
         pos_l.addWidget(self.ra_offset_edit, 0, 8)
         pos_l.addWidget(ra_off_plus, 0, 9)
 
-        pos_l.addWidget(QLabel("Sky DEC:"), 1, 0)
-        pos_l.addWidget(self.sky_dec_label, 1, 1)
-        pos_l.addWidget(QLabel("Mount:"), 1, 2)
-        pos_l.addWidget(self.mount_dec_label, 1, 3)
-        pos_l.addWidget(QLabel("Speed:"), 1, 4)
-        pos_l.addWidget(self.speed_dec_label, 1, 5)
-        pos_l.addWidget(QLabel("Offset:"), 1, 6)
-        pos_l.addWidget(dec_off_minus, 1, 7)
-        pos_l.addWidget(self.dec_offset_edit, 1, 8)
-        pos_l.addWidget(dec_off_plus, 1, 9)
+        # Visible delimiter between the Sky RA and Sky DEC lines - a plain QGridLayout with no
+        # per-cell background otherwise has no boundary between them at all (see _APP_STYLESHEET
+        # for why the GroupBox's own outer border needed the same fix).
+        ra_dec_sep = QFrame()
+        ra_dec_sep.setFrameShape(QFrame.HLine)
+        ra_dec_sep.setStyleSheet("color: #3a3a4a;")
+        pos_l.addWidget(ra_dec_sep, 1, 0, 1, 10)
+
+        pos_l.addWidget(QLabel("Sky DEC:"), 2, 0)
+        pos_l.addWidget(self.sky_dec_label, 2, 1)
+        pos_l.addWidget(QLabel("Mount:"), 2, 2)
+        pos_l.addWidget(self.mount_dec_label, 2, 3)
+        pos_l.addWidget(QLabel("Speed:"), 2, 4)
+        pos_l.addWidget(self.speed_dec_label, 2, 5)
+        pos_l.addWidget(QLabel("Offset:"), 2, 6)
+        pos_l.addWidget(dec_off_minus, 2, 7)
+        pos_l.addWidget(self.dec_offset_edit, 2, 8)
+        pos_l.addWidget(dec_off_plus, 2, 9)
+
+        below_dec_sep = QFrame()
+        below_dec_sep.setFrameShape(QFrame.HLine)
+        below_dec_sep.setStyleSheet("color: #3a3a4a;")
+        pos_l.addWidget(below_dec_sep, 3, 0, 1, 10)
 
         self.offset_inc_edit = QLineEdit("0.01")
         self.offset_inc_edit.setFixedWidth(60)
-        pos_l.addWidget(QLabel("Offset increment:"), 2, 0, 1, 2)
-        pos_l.addWidget(self.offset_inc_edit, 2, 2)
+        pos_l.addWidget(QLabel("Offset increment:"), 4, 0, 1, 2)
+        pos_l.addWidget(self.offset_inc_edit, 4, 2)
 
         self.error_label = QLabel("Error: RA 0.0000°  DEC 0.0000°")
         self.error_label.setStyleSheet("color: #ffaa00;")
-        pos_l.addWidget(self.error_label, 3, 0, 1, 10)
+        pos_l.addWidget(self.error_label, 5, 0, 1, 10)
 
         # Stability badge - STABLE/SETTLING/DRIFTING/ALIGNING/TRACKING:OFF, driven by
         # _update_tracking_stability (ported from EQMountApp._update_tracking_stability's
@@ -1299,17 +1317,17 @@ class MainWindow(QMainWindow):
         self.tracking_status_label.setAlignment(Qt.AlignCenter)
         self.tracking_status_label.setStyleSheet(
             "background-color: #444455; color: white; font-weight: bold; font-size: 14px; padding: 5px;")
-        pos_l.addWidget(self.tracking_status_label, 4, 0, 1, 10)
+        pos_l.addWidget(self.tracking_status_label, 6, 0, 1, 10)
 
         self.target_name_label = QLabel("")
         self.target_name_label.setAlignment(Qt.AlignCenter)
         self.target_name_label.setStyleSheet("color: #ffdd66; font-weight: bold; font-size: 14px;")
-        pos_l.addWidget(self.target_name_label, 5, 0, 1, 10)
+        pos_l.addWidget(self.target_name_label, 7, 0, 1, 10)
 
         self.meridian_warning_label = QLabel("")
         self.meridian_warning_label.setAlignment(Qt.AlignCenter)
         self.meridian_warning_label.setStyleSheet("color: #ffaa00; font-weight: bold;")
-        pos_l.addWidget(self.meridian_warning_label, 6, 0, 1, 10)
+        pos_l.addWidget(self.meridian_warning_label, 8, 0, 1, 10)
 
         stability_note = QLabel(
             f"Stable = error ≤ {TRACKING_STABLE_ERR_DEG:.4f}° (½ camera pixel) AND flat/"
@@ -1319,7 +1337,7 @@ class MainWindow(QMainWindow):
         stability_note.setWordWrap(True)
         stability_note.setAlignment(Qt.AlignCenter)
         stability_note.setStyleSheet("color: #8888aa; font-size: 9px;")
-        pos_l.addWidget(stability_note, 7, 0, 1, 10)
+        pos_l.addWidget(stability_note, 9, 0, 1, 10)
         left.addWidget(pos_box)
 
         # ---- toolbar row above the sky viz ----
@@ -2487,8 +2505,29 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(event)
 
 
+# Default Fusion-style QGroupBox borders render nearly invisibly against this app's dark
+# palette (thin, low-contrast line) - every panel (Connection, Location, Telescope Position,
+# Tracking Controls, etc.) needs a clearly visible border to actually read as a distinct,
+# delimited block instead of text floating with no boundary.
+_APP_STYLESHEET = """
+QGroupBox {
+    border: 1px solid #4a4a5a;
+    border-radius: 5px;
+    margin-top: 10px;
+    padding-top: 6px;
+    font-weight: bold;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 8px;
+    padding: 0 4px;
+}
+"""
+
+
 def main():
     app = QApplication(sys.argv)
+    app.setStyleSheet(_APP_STYLESHEET)
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
