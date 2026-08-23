@@ -1475,8 +1475,8 @@ class MainWindow(QMainWindow):
         self.tracking_status_label = QLabel("OFF")
         self.tracking_status_label.setAlignment(Qt.AlignCenter)
         self.tracking_status_label.setStyleSheet(
-            "background-color: #444455; color: white; font-weight: bold; font-size: 14px; padding: 5px;")
-        self.tracking_status_label.setFixedWidth(250)  # ~25% of the panel's previous full-span width
+            "background-color: #444455; color: white; font-weight: bold; font-size: 14px; padding: 5px; border-radius: 8px;")
+        self.tracking_status_label.setFixedWidth(300)
         pos_l.addWidget(self.tracking_status_label, 6, 0, 1, 10, alignment=Qt.AlignCenter)
 
         # Fills the space below the badge (previously just empty) with whatever's actually
@@ -2662,7 +2662,7 @@ class MainWindow(QMainWindow):
     def _set_stability(self, text, color, text_color="black"):
         self.tracking_status_label.setText(text)
         self.tracking_status_label.setStyleSheet(
-            f"background-color: {color}; color: {text_color}; font-weight: bold; font-size: 14px; padding: 5px;")
+            f"background-color: {color}; color: {text_color}; font-weight: bold; font-size: 14px; padding: 5px; border-radius: 8px;")
         self.viz.stability_color = QColor(color)
         self.viz.update()
 
