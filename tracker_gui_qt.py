@@ -347,6 +347,8 @@ class SkyViewWidget(QOpenGLWidget):
         self._pan_last = None
         self._visible_hits = []        # [{x,y,ra,dec,radius,name,extra,labeled}, ...] - hit-test list, rebuilt every paint
         self._hovered = None
+        self._last_mouse_pos = None    # last known cursor pos (widget coords) - see _update_hover
+        self._last_hover_text = None   # de-dupes hoverInfoChanged emits from repaint-driven _update_hover calls
 
         self._font_small = QFont("Consolas", 8)
         self._font_small_bold = QFont("Consolas", 8)
@@ -505,6 +507,9 @@ class SkyViewWidget(QOpenGLWidget):
         self._draw_crosshairs_and_cardinals(p, w, h, margin, ra_min, ra_max, dec_min, dec_max, ra_span, dec_span)
         self._draw_corner_labels(p, w, h, cx, cy, ra_min, ra_max, dec_min, dec_max)
         self._draw_camera_and_reticle(p, w, h, cx, cy, margin, ra_min, ra_span, dec_min, dec_span, pixels_per_deg)
+        # Re-resolve the hover hit-test against the _visible_hits list just rebuilt above, not
+        # just whatever mouseMoveEvent last computed - see _update_hover's docstring for why.
+        self._update_hover()
         self._draw_hover(p)
         p.end()
 
@@ -975,12 +980,37 @@ class SkyViewWidget(QOpenGLWidget):
             self.center_dec += dy * dec_span / max(1, (h - 2 * margin))
             self.clamp_center()
             self._pan_last = pos
+            self._last_mouse_pos = pos
             self.update()
             return
         self._pan_last = pos if (event.buttons() & Qt.LeftButton) else None
 
-        # Hover hit-test against the list _draw_sky_objects/_draw_realtime_bodies built on the
-        # last paint - same approach as EQMountApp._on_viz_mouse_move.
+        self._last_mouse_pos = pos
+        self._update_hover(pos)
+        self.update()
+
+    def _update_hover(self, pos=None):
+        """Re-runs the hover hit-test against the CURRENT _visible_hits (rebuilt fresh every
+        paint - see paintEvent) at the given (or last known) cursor position, updating
+        self._hovered/hoverInfoChanged to match.
+
+        Called from mouseMoveEvent (with the event's own position) AND from the end of every
+        paintEvent (with the last known position, no pos arg) - the hit-test previously only ran
+        on actual mouse movement, so the white hover ring/hover info label kept pointing at
+        wherever the cursor last WAS relative to the sky even after the view itself moved out
+        from under a stationary cursor (auto-follow panning, zoom, an object drifting under the
+        pointer while tracking) - reported as the hover ring only updating on mouse movement.
+        Does NOT call self.update() itself - the paintEvent call site is already mid-repaint
+        (calling update() there would just schedule another repaint immediately), so only
+        mouseMoveEvent's own explicit self.update() after this triggers a redraw."""
+        if pos is None:
+            pos = self._last_mouse_pos
+        if pos is None:
+            return
+        w, h = max(200, self.width()), max(150, self.height())
+        margin = 12
+        ra_min, ra_max, dec_min, dec_max = self.view_bounds()
+        ra_span, dec_span = ra_max - ra_min, dec_max - dec_min
         ra = self.x_to_ra(pos.x(), w, margin, ra_min, ra_span) % 360.0
         dec = max(-90.0, min(90.0, self.y_to_dec(pos.y(), h, margin, dec_min, dec_span)))
         hit, best_d2 = None, None
@@ -990,11 +1020,12 @@ class SkyViewWidget(QOpenGLWidget):
                 best_d2, hit = d2, obj
         self._hovered = hit
         if hit is None:
-            self.hoverInfoChanged.emit(f"Cursor: RA {ra:.4f}°  DEC {dec:+.4f}°")
+            text = f"Cursor: RA {ra:.4f}°  DEC {dec:+.4f}°"
         else:
-            self.hoverInfoChanged.emit(
-                f"Cursor: RA {ra:.4f}°  DEC {dec:+.4f}°   |   {hit['name']}  ({hit['extra']})")
-        self.update()
+            text = f"Cursor: RA {ra:.4f}°  DEC {dec:+.4f}°   |   {hit['name']}  ({hit['extra']})"
+        if text != self._last_hover_text:
+            self._last_hover_text = text
+            self.hoverInfoChanged.emit(text)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -1022,7 +1053,13 @@ class SkyViewWidget(QOpenGLWidget):
         self.targetPicked.emit(ra, dec, name)
 
     def leaveEvent(self, event):
+        # Also clears _last_mouse_pos, not just _hovered - otherwise the next paintEvent's
+        # _update_hover() call would immediately re-run the hit-test at the stale last-known
+        # position (still inside the widget bounds) and could re-populate _hovered/the hover
+        # ring even though the cursor has actually left entirely.
         self._hovered = None
+        self._last_mouse_pos = None
+        self._last_hover_text = "Cursor: -"
         self.hoverInfoChanged.emit("Cursor: -")
         self.update()
 
