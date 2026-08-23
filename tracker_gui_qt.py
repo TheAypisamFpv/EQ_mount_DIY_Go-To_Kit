@@ -1179,7 +1179,15 @@ class _IssTrackingThread(QThread):
                     self.failed.emit(str(e))
             else:
                 interval_ms = max(interval_ms, 1000)  # idle poll - no fetch needed until re-enabled
-            self._wake.wait(timeout=max(0.001, interval_ms / 1000.0))
+            # Synced to the wall clock (next exact multiple of interval_ms since the epoch), not a
+            # free-running fixed delay from whenever this iteration happened to start - same self-
+            # rescheduling-to-the-boundary technique as EQMountApp/MainWindow's
+            # _update_realtime_dot, so updates land on a predictable, human-readable cadence (e.g.
+            # every real :00/:01/:02 second at 1Hz) instead of drifting to an arbitrary phase that
+            # shifts by however long each fetch itself took.
+            interval_s = interval_ms / 1000.0
+            wait_s = max(0.001, interval_s - (time.time() % interval_s))
+            self._wake.wait(timeout=wait_s)
             self._wake.clear()
 
     def wake(self):

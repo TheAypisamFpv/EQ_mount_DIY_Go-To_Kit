@@ -123,7 +123,14 @@ from sky_data import sky_catalog, iss_tracker, solar_system
 #            included. Per explicit exception, the emergency STOP button is untouched by any of
 #            this (Qt-only widget; stays fully colored/usable-looking regardless of connection,
 #            matching ISO 13850 convention).
-GUI_VERSION = "1.0.10"
+#   1.0.11 - ISS position updates (both display-only ISS_DISPLAY_UPDATE_MS and actively-tracking
+#            ISS_TRACKING_UPDATE_MS) now sync to the wall clock - each reschedule computes the
+#            delay to the next exact multiple of the interval since the epoch (same self-
+#            rescheduling-to-the-boundary technique as _update_realtime_dot), instead of a
+#            free-running fixed delay from whenever the previous fetch happened to finish, so
+#            updates land on a predictable cadence (e.g. every real :00/:01/:02 second at 1Hz)
+#            rather than drifting to an arbitrary phase. Both GUIs.
+GUI_VERSION = "1.0.11"
 
 BAUD_RATE = 250000
 # GUI poll rate for the serial queue. Fast enough to comfortably keep up with the Arduino's 50Hz
@@ -4010,7 +4017,15 @@ class EQMountApp(ctk.CTk):
         actively_tracking_iss = (self.target_object_name == "ISS" and self.tracking
                                   and self.mode_var.get() == "SIDEREAL")
         interval_ms = ISS_TRACKING_UPDATE_MS if actively_tracking_iss else ISS_DISPLAY_UPDATE_MS
-        self._iss_update_after_id = self.after(interval_ms, self._iss_update_tick)
+        # Synced to the wall clock (next exact multiple of interval_ms since the epoch), not a
+        # free-running fixed delay from whenever this call happened to fire - same self-
+        # rescheduling-to-the-boundary technique as _update_realtime_dot/_update_time_travel_label,
+        # so ISS updates land on a predictable, human-readable cadence (e.g. every real :00/:01/:02
+        # second at 1Hz) instead of drifting to an arbitrary phase that shifts by however long
+        # get_current_radec()/the Thread start took each time.
+        interval_s = interval_ms / 1000.0
+        next_delay_ms = max(1, round((interval_s - (time.time() % interval_s)) * 1000))
+        self._iss_update_after_id = self.after(next_delay_ms, self._iss_update_tick)
 
     def _on_iss_position(self, ra, dec, above_horizon):
         self._iss_ra = ra
