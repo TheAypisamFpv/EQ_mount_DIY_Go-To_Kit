@@ -38,7 +38,7 @@ from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, Signal, QObject, QEvent
+from PySide6.QtCore import Qt, QTimer, QThread, QPointF, QRectF, Signal, QObject, QEvent
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont, QPolygonF, QPainterPath, QFontMetrics,
 )
@@ -1050,24 +1050,53 @@ class _SolarSystemWorker(QObject):
                             illum, waxing, planets))
 
 
-class _IssWorker(QObject):
+class _IssTrackingThread(QThread):
+    """ONE persistent background thread for ISS position updates, for the thread's entire
+    lifetime - NOT a fresh worker+thread spawned on every tick the way this used to work (up to
+    50/sec, at ISS_TRACKING_UPDATE_MS, while the ISS was the actively tracked target). That
+    turned out to be enough thread-creation/GIL-handoff churn to visibly stutter the GUI's own
+    rendering (reported as "the mount is fine, but the viz and axis angles stutter" while
+    tracking the ISS) - the mount itself was never affected, since its motion comes from the
+    firmware's own extrapolation between whatever SET_TARGET updates it gets, not from the GUI's
+    render loop. Loops internally instead, sleeping between fetches via a threading.Event (so an
+    external wake() call can cut a wait short for an immediate refresh, e.g. after a Time Travel
+    jump) rather than blocking in one-shot worker runs."""
     updated = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, get_lat_lon_fn, at_time=None):
-        super().__init__()
+    def __init__(self, get_lat_lon_fn, get_time_fn, state_fn, parent=None):
+        super().__init__(parent)
         self.get_lat_lon_fn = get_lat_lon_fn
-        self.at_time = at_time
+        self.get_time_fn = get_time_fn
+        self.state_fn = state_fn  # () -> (enabled: bool, interval_ms: int)
+        self._stop_requested = False
+        self._wake = threading.Event()
 
     def run(self):
-        try:
-            iss_tracker.ensure_tle_current()
-            lat, lon = self.get_lat_lon_fn()
-            ra, dec, alt, az, above = iss_tracker.get_current_radec(lat, lon, at_time=self.at_time)
-        except Exception as e:
-            self.failed.emit(str(e))
-            return
-        self.updated.emit((ra, dec, above))
+        while not self._stop_requested:
+            enabled, interval_ms = self.state_fn()
+            if enabled:
+                try:
+                    iss_tracker.ensure_tle_current()
+                    lat, lon = self.get_lat_lon_fn()
+                    at_time = self.get_time_fn()
+                    ra, dec, alt, az, above = iss_tracker.get_current_radec(lat, lon, at_time=at_time)
+                    self.updated.emit((ra, dec, above))
+                except Exception as e:
+                    self.failed.emit(str(e))
+            else:
+                interval_ms = max(interval_ms, 1000)  # idle poll - no fetch needed until re-enabled
+            self._wake.wait(timeout=max(0.001, interval_ms / 1000.0))
+            self._wake.clear()
+
+    def wake(self):
+        """Cuts the current sleep short so the next fetch happens right away, instead of
+        waiting out whatever interval was already in progress."""
+        self._wake.set()
+
+    def stop(self):
+        self._stop_requested = True
+        self._wake.set()
 
 
 def _run_in_thread(worker):
@@ -1186,12 +1215,13 @@ class MainWindow(QMainWindow):
         self.solar_timer.timeout.connect(self._trigger_solar_system_update)
         self.solar_timer.start(2000)
 
-        # Self-rescheduling (see _trigger_iss_update), not a fixed interval - it needs to run
-        # much faster (ISS_TRACKING_UPDATE_MS, 20ms) while the ISS is the actively tracked
-        # target, and a plain 5s repeating timer had no way to speed itself up for that.
-        self.iss_timer = QTimer(self)
-        self.iss_timer.setSingleShot(True)
-        self.iss_timer.timeout.connect(self._trigger_iss_update)
+        # One persistent thread for the whole app lifetime - see _IssTrackingThread's docstring
+        # for why this isn't a repeating timer spawning a fresh worker+thread every tick.
+        self.iss_thread = _IssTrackingThread(self._get_lat_lon, self._get_effective_utc_now,
+                                             self._iss_thread_state)
+        self.iss_thread.updated.connect(self._on_iss_updated)
+        self.iss_thread.failed.connect(lambda err: self._log(f"ISS update failed: {err}"))
+        self.iss_thread.start()
 
         self.meridian_timer = QTimer(self)
         self.meridian_timer.timeout.connect(self._update_meridian_warning)
@@ -1222,7 +1252,11 @@ class MainWindow(QMainWindow):
         self._load_catalog()
         self._refresh_ports()
         QTimer.singleShot(500, self._trigger_solar_system_update)
-        QTimer.singleShot(1000, self._trigger_iss_update)
+
+    def closeEvent(self, event):
+        self.iss_thread.stop()
+        self.iss_thread.wait(2000)
+        super().closeEvent(event)
 
     def _get_effective_utc_now(self) -> datetime:
         """THE single source of "now" - see _time_travel_offset's comment. Every position lookup
@@ -1345,12 +1379,20 @@ class MainWindow(QMainWindow):
         self.sky_ra_label.setStyleSheet(mono + f"color: {PALETTE['green']}; font-size: 16px; font-weight: bold;")
         self.sky_dec_label = QLabel("+00.0000°")
         self.sky_dec_label.setStyleSheet(mono + f"color: {PALETTE['green']}; font-size: 16px; font-weight: bold;")
+        # Same font size as the Sky RA/DEC readout (was smaller/plain gray) - and, like
+        # EQMountApp's own mount_ra_label ("#aaffaa")/speed_ra_label ("#ffaa88"), each gets its
+        # own distinct color rather than sharing one muted gray: teal for Mount (a green-adjacent
+        # hue, related to but distinguishable from Sky's green), salmon for Speed (the same
+        # peachy-orange role EQMountApp's speed color plays) - both from PALETTE (OKLCH), not a
+        # one-off hex.
         self.mount_ra_label = QLabel("0.0000°")
         self.mount_dec_label = QLabel("0.0000°")
         self.speed_ra_label = QLabel("0.000000 °/s")
         self.speed_dec_label = QLabel("0.000000 °/s")
-        for lbl in (self.mount_ra_label, self.mount_dec_label, self.speed_ra_label, self.speed_dec_label):
-            lbl.setStyleSheet(mono + "color: #aaaacc;")
+        for lbl in (self.mount_ra_label, self.mount_dec_label):
+            lbl.setStyleSheet(mono + f"color: {PALETTE['teal']}; font-size: 16px; font-weight: bold;")
+        for lbl in (self.speed_ra_label, self.speed_dec_label):
+            lbl.setStyleSheet(mono + f"color: {PALETTE['salmon']}; font-size: 16px; font-weight: bold;")
 
         self.ra_offset_edit = QLineEdit("0.0")
         self.ra_offset_edit.setFixedWidth(60)
@@ -1985,22 +2027,21 @@ class MainWindow(QMainWindow):
         mode = self.mode_group.checkedButton().text() if self.mode_group.checkedButton() else ""
         return self.target_object_name == "ISS" and self.tracking and mode == "SIDEREAL"
 
+    def _iss_thread_state(self):
+        """Called from _IssTrackingThread's own loop (background thread) each cycle - returns
+        (enabled, interval_ms): whether to fetch at all (skip entirely while the ISS toggle is
+        off, rather than always polling every 5s in the background regardless of whether
+        anything's displaying it) and how long to sleep until the next cycle, fast
+        (ISS_TRACKING_UPDATE_MS) while the ISS is the actively tracked target, otherwise a
+        leisurely 5s marker-only refresh."""
+        return self.viz.iss_enabled, (ISS_TRACKING_UPDATE_MS if self._iss_actively_tracked() else 5000)
+
     def _trigger_iss_update(self):
-        """Fetches/refreshes the ISS position in a background thread (see _IssWorker), then
-        reschedules itself - fast (ISS_TRACKING_UPDATE_MS) while the ISS is the actively tracked
-        target, otherwise a leisurely 5s marker-only refresh (ported from
-        EQMountApp._iss_update_tick, which this Qt port previously left as a fixed 5s timer that
-        never sped up while tracking - the Arduino's target was only ever set once, at Start
-        Tracking, and never refreshed again, so it drifted increasingly far behind the ISS's
-        real position instead of following it)."""
-        self.iss_timer.stop()  # defend against a second in-flight schedule - see call sites in
-                                # _apply_time_travel/_reset_time_travel that also trigger this directly
-        worker = _IssWorker(self._get_lat_lon, at_time=self._get_effective_utc_now())
-        self._start_worker(worker,
-                            (worker.updated, self._on_iss_updated),
-                            (worker.failed, lambda err: self._log(f"ISS update failed: {err}")))
-        interval_ms = ISS_TRACKING_UPDATE_MS if self._iss_actively_tracked() else 5000
-        self.iss_timer.start(interval_ms)
+        """Wakes the persistent ISS thread for an immediate refresh right now, instead of
+        waiting out whatever interval it's currently sleeping through - used after a Time Travel
+        jump (position needs to reflect the new time right away) and when ISS tracking actually
+        starts (see _select_sky_target)."""
+        self.iss_thread.wake()
 
     def _on_iss_updated(self, result):
         ra, dec, above = result
@@ -2123,6 +2164,8 @@ class MainWindow(QMainWindow):
         self.viz.iss_enabled = not self.viz.iss_enabled
         self.iss_btn.setText(f"ISS: {'ON' if self.viz.iss_enabled else 'OFF'}")
         self._style_toggle_btn(self.iss_btn, self.viz.iss_enabled)
+        if self.viz.iss_enabled:
+            self.iss_thread.wake()  # don't wait out the idle poll interval before the first fetch
         self.viz.update()
 
     def _toggle_constellations(self):
@@ -2817,24 +2860,38 @@ class MainWindow(QMainWindow):
         the search results list (each of those already has its own Enter handling) - mirrors
         EQMountApp._stop_tracking_key/_start_tracking_key.
 
-        Both go through animateClick() on the actual linked button (stop_btn / tracking_btn)
-        rather than calling the underlying handler directly - animateClick() visually depresses
-        the button for a moment, exactly like a real mouse click would, before firing its
-        clicked signal (which is what actually runs the action, same as it always did) - so the
-        keyboard shortcut is visibly confirmed on-screen the same way clicking with the mouse
-        would be, not silently actioned with no visual feedback at all."""
+        The linked button (stop_btn / tracking_btn) is held visually pressed for as long as the
+        physical key is - setDown(True) here, setDown(False) in keyReleaseEvent - not
+        animateClick()'s fixed ~100ms auto-release, which unpressed the button on its own timer
+        regardless of whether the key was still actually held down. isAutoRepeat() presses are
+        ignored (OS key-repeat while held would otherwise re-fire the action many times a
+        second) - the button just stays down through those, same as it would under a real
+        continuously-held mouse click."""
         focus_widget = self.focusWidget()
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace) and not isinstance(focus_widget, QLineEdit):
-            self.stop_btn.animateClick()
+            if not event.isAutoRepeat():
+                self.stop_btn.setDown(True)
+                self._stop()
             return
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             if isinstance(focus_widget, (QLineEdit, QListWidget)):
                 super().keyPressEvent(event)
                 return
-            if not self.tracking:
-                self.tracking_btn.animateClick()
+            if not event.isAutoRepeat() and not self.tracking:
+                self.tracking_btn.setDown(True)
+                self._toggle_tracking()
             return
         super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.isAutoRepeat():
+            return
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self.stop_btn.setDown(False)
+        elif event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self.tracking_btn.setDown(False)
+        else:
+            super().keyReleaseEvent(event)
 
 
 # Default Fusion-style QGroupBox borders render nearly invisibly against this app's dark
