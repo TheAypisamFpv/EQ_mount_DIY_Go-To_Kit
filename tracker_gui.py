@@ -112,7 +112,18 @@ from sky_data import sky_catalog, iss_tracker, solar_system
 #           reconciled against firmware-confirmed state via STATUS:MERIDIAN_LIMIT_ENABLED.
 #   1.0.9 - Renamed the "Home Axes (RA/DEC to 0°)" button/log text to "Rewind Axes (RA/DEC to
 #           0°)" per request - cosmetic label only, command (CMD,HOME_AXES)/handler names unchanged.
-GUI_VERSION = "1.0.9"
+#   1.0.10 - Buttons gated on being connected (_set_arduino_controls_enabled) now visibly gray
+#            out while disconnected instead of staying fully colored despite being unusable -
+#            new shared _muted_hex_color() blends each button's own color toward neutral gray
+#            (imported by tracker_gui_qt.py too, same math both sides) so the disabled look still
+#            hints the original color rather than looking identical to every other grayed
+#            control. New _apply_disabled_tint() applied in _set_arduino_controls_enabled;
+#            flipped_toggle_btn/meridian_limit_btn were also missing from that gating list
+#            entirely (could be clicked while disconnected, just logging "Not connected.") - now
+#            included. Per explicit exception, the emergency STOP button is untouched by any of
+#            this (Qt-only widget; stays fully colored/usable-looking regardless of connection,
+#            matching ISO 13850 convention).
+GUI_VERSION = "1.0.10"
 
 BAUD_RATE = 250000
 # GUI poll rate for the serial queue. Fast enough to comfortably keep up with the Arduino's 50Hz
@@ -375,6 +386,33 @@ _VIZ_FONT_CACHE = {}
 # B-V colors, etc.), so caching the parsed tuple the first time a given hex string is seen and
 # reusing it skips that re-parsing entirely on every later draw call with the same color.
 _VIZ_COLOR_CACHE = {}
+
+
+def _muted_hex_color(hex_color: str, amount: float = 0.55) -> str:
+    """Blends a "#RRGGBB" color toward a neutral dark gray by `amount` (0=unchanged, 1=fully
+    gray) - used to gray out buttons that can't do anything while disconnected (both GUIs'
+    "_set_arduino_controls_enabled") while still leaving a visible hint of their normal color,
+    per request. Neither CTkButton nor a stylesheet-styled QPushButton changes its own
+    background color on disable once that background has been explicitly overridden, so this is
+    applied manually rather than relying on either toolkit's built-in disabled look. Shared by
+    tracker_gui.py and tracker_gui_qt.py (imported from here) so both use identical math.
+    Returns the input unchanged if it isn't a recognizable "#RRGGBB"/"#RGB" hex string (e.g. a
+    CTk theme tuple element, "transparent", or an already-resolved Qt palette color) - callers
+    should skip muting entirely in that case rather than pass it through blindly."""
+    h = hex_color.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    if len(h) != 6:
+        return hex_color
+    try:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except ValueError:
+        return hex_color
+    gray = 58  # neutral dark gray target, matching this app's general panel/background tone
+    r = round(r + (gray - r) * amount)
+    g = round(g + (gray - g) * amount)
+    b = round(b + (gray - b) * amount)
+    return f"#{r:02x}{g:02x}{b:02x}"
 
 
 def _pil_ink(color):
@@ -2881,10 +2919,36 @@ class EQMountApp(ctk.CTk):
             self.set_loc_btn, self.ra_offset_left_btn, self.ra_offset_right_btn,
             self.dec_offset_up_btn, self.dec_offset_down_btn, self.tracking_btn,
             self.safe_target_btn, self.home_axes_btn, self.sync_btn, self.time_btn,
-            self.debug_toggle_btn, self.debug_dump_btn,
+            self.debug_toggle_btn, self.debug_dump_btn, self.flipped_toggle_btn,
+            self.meridian_limit_btn,
         ] + self.mode_radio_buttons
         for w in widgets:
             w.configure(state=state)
+            self._apply_disabled_tint(w, enabled)
+
+    def _apply_disabled_tint(self, w, enabled: bool):
+        """CTkButton's built-in disabled state only dims text_color, not fg_color, so a colored
+        button (Rewind Axes' olive, tracking_btn's green/red, flipped/meridian toggles' colors,
+        etc.) stays fully lit even while unusable - looking exactly as pressable as it would if
+        connected. Grays it toward a neutral tone (_muted_hex_color) while still hinting the
+        original color, per request, and restores the exact original on re-enable. Captures the
+        "true" fg_color the first time a widget goes disabled and holds onto it for the whole
+        disabled stretch (rather than re-deriving it every call), since a disabled control can't
+        legitimately have its color change out from under it anyway - nothing but this method
+        touches its fg_color while disconnected."""
+        if not enabled:
+            if not hasattr(w, "_true_fg_color"):
+                current = w.cget("fg_color")
+                if isinstance(current, (tuple, list)) and len(current) == 2:
+                    current = current[1 if ctk.get_appearance_mode() == "Dark" else 0]
+                if isinstance(current, str) and current != "transparent":
+                    w._true_fg_color = current
+                    w.configure(fg_color=_muted_hex_color(current))
+        else:
+            true_fg = getattr(w, "_true_fg_color", None)
+            if true_fg is not None:
+                w.configure(fg_color=true_fg)
+                del w._true_fg_color
 
     def _connect(self):
         port = self.port_combo.get()

@@ -65,7 +65,7 @@ from tracker_gui import (
     TRACKING_STABLE_DERIV_DEG_S, TRACKING_STABILITY_WINDOW_S,
     POS_UPDATE_RATE_MS, POSITION_BROADCAST_HZ, DEFAULT_LAT, DEFAULT_LON,
     SIDEREAL_RATE_DEG_S, MERIDIAN_LIMIT_WARNING_S, MERIDIAN_LIMIT_URGENT_S,
-    CONFIG_PATH, ISS_TRACKING_UPDATE_MS, ISS_DISPLAY_UPDATE_MS,
+    CONFIG_PATH, ISS_TRACKING_UPDATE_MS, ISS_DISPLAY_UPDATE_MS, _muted_hex_color,
 )
 from sky_data import sky_catalog, iss_tracker, solar_system
 
@@ -1708,7 +1708,7 @@ class MainWindow(QMainWindow):
         right.addWidget(mode_box)
 
         self.tracking_btn = QPushButton("▶ Start Tracking")
-        self.tracking_btn.setStyleSheet(f"background-color: {PALETTE['green']}; color: black; font-weight: bold; padding: 8px;")
+        self.tracking_btn.setStyleSheet(self._gated_style(PALETTE['green'], extra="padding: 8px;"))
         self.tracking_btn.clicked.connect(self._toggle_tracking)
         right.addWidget(self.tracking_btn)
 
@@ -1735,7 +1735,7 @@ class MainWindow(QMainWindow):
         # optimistically on click rather than waiting for a STATUS confirmation.
         self.meridian_limit_btn = QPushButton("Meridian Limit: ON")
         self.meridian_limit_btn.clicked.connect(self._toggle_meridian_limit)
-        self.meridian_limit_btn.setStyleSheet(f"background-color: {PALETTE['green']}; color: black; font-weight: bold;")
+        self.meridian_limit_btn.setStyleSheet(self._gated_style(PALETTE['green']))
         right.addWidget(self.meridian_limit_btn)
 
         sync_box = QGroupBox("Sync / Calibrate (choose star)")
@@ -1798,6 +1798,7 @@ class MainWindow(QMainWindow):
         self._arduino_widgets = [
             self.safe_target_btn, self.home_axes_btn, sync_btn, goto_btn,
             self.tracking_btn, self.debug_toggle_btn, dump_btn, self.flipped_btn,
+            self.meridian_limit_btn, resync_btn,
             ra_off_minus, ra_off_plus, dec_off_minus, dec_off_plus,
         ] + [self.mode_group.button(i) for i in range(3)]
 
@@ -2234,12 +2235,28 @@ class MainWindow(QMainWindow):
             self.tracking_btn.setText("■ Stop Tracking")
             # TRACKING_STOP_RED, not PALETTE["red"] - a bit less saturated than even the rest of
             # the palette's own red, at the user's request, for this specific button.
-            self.tracking_btn.setStyleSheet(
-                f"background-color: {TRACKING_STOP_RED}; color: black; font-weight: bold; padding: 8px;")
+            self.tracking_btn.setStyleSheet(self._gated_style(TRACKING_STOP_RED, extra="padding: 8px;"))
         else:
             self.tracking_btn.setText("▶ Start Tracking")
-            self.tracking_btn.setStyleSheet(
-                f"background-color: {PALETTE['green']}; color: black; font-weight: bold; padding: 8px;")
+            self.tracking_btn.setStyleSheet(self._gated_style(PALETTE['green'], extra="padding: 8px;"))
+
+    @staticmethod
+    def _gated_style(color, text_color="black", extra=""):
+        """Stylesheet for a colored button, including its :disabled look - a plain
+        QPushButton::setEnabled(False) doesn't gray out a background-color a stylesheet already
+        set (unlike an unstyled button, which follows the platform's native disabled palette),
+        so every colored button that's gated on being connected (see _arduino_widgets/
+        _set_arduino_controls_enabled) needs its disabled look spelled out explicitly here or it
+        would stay fully lit while completely unusable. Muted via _muted_hex_color (shared with
+        tracker_gui.py's identical CTkButton-side fix) rather than losing the color outright, so
+        it still hints what the button normally is, per request. Harmless to apply to buttons
+        that are never actually disabled (Connect, Refresh, Now/Preview, camera rotation, ...) -
+        the :disabled rule then simply never triggers."""
+        dim = _muted_hex_color(color)
+        return (
+            f"QPushButton {{ background-color: {color}; color: {text_color}; font-weight: bold; {extra} }}"
+            f"QPushButton:disabled {{ background-color: {dim}; color: #888899; }}"
+        )
 
     @staticmethod
     def _style_toggle_btn(btn, on):
@@ -2248,8 +2265,10 @@ class MainWindow(QMainWindow):
         gives every on/off toolbar button (ISS, Constellations, Min Size, Verbose Debug, ...) a
         distinct green fill while active, matching CustomTkinter's fg_color-swap convention in
         tracker_gui.py, instead of the text label being the only thing that changes. OFF is left
-        at the plain default look - only the active state gets a color treatment."""
-        btn.setStyleSheet(f"background-color: {PALETTE['green']}; color: black; font-weight: bold;" if on else "")
+        at the plain default look - only the active state gets a color treatment (and, via
+        _gated_style, an explicit muted :disabled look instead of staying fully green while
+        unusable - see that method's docstring)."""
+        btn.setStyleSheet(MainWindow._gated_style(PALETTE["green"]) if on else "")
 
     @staticmethod
     def _flat_btn(btn, palette_name):
@@ -2260,8 +2279,9 @@ class MainWindow(QMainWindow):
         (tracking_btn, flipped_btn, stop_btn, preview_btn) gets one of these instead of the
         default unstyled look, loosely echoing which color role EQMountApp gave the matching
         button (green ~ CTk's default "go" blue/positive actions, red ~ its disconnect red,
-        yellow ~ its olive safe-target/home-axes, cyan ~ neutral utility actions it left default)."""
-        btn.setStyleSheet(f"background-color: {PALETTE[palette_name]}; color: black; font-weight: bold;")
+        yellow ~ its olive safe-target/home-axes, cyan ~ neutral utility actions it left default).
+        See _gated_style for the accompanying muted :disabled look."""
+        btn.setStyleSheet(MainWindow._gated_style(PALETTE[palette_name]))
 
     def _cycle_view_mode(self):
         order = ["FREE", "TELESCOPE", "TARGET"]
@@ -2556,7 +2576,7 @@ class MainWindow(QMainWindow):
             return
         self.viz.telescope_flipped = flipped
         self.flipped_btn.setText(f"Telescope Flipped: {'ON' if flipped else 'OFF'}")
-        self.flipped_btn.setStyleSheet(f"background-color: {PALETTE['orange']}; color: black; font-weight: bold;" if flipped else "")
+        self.flipped_btn.setStyleSheet(self._gated_style(PALETTE['orange']) if flipped else "")
         self.viz.update()  # the meridian-limit shading only draws while not flipped
 
     def _toggle_meridian_limit(self):
@@ -2587,7 +2607,7 @@ class MainWindow(QMainWindow):
         self.serial.send_command(f"CMD,SET_MERIDIAN_LIMIT,ENABLED:{1 if requested else 0}")
         self.meridian_limit_btn.setText(f"Meridian Limit: {'ON' if requested else 'OFF'}")
         self.meridian_limit_btn.setStyleSheet(
-            f"background-color: {PALETTE['green'] if requested else PALETTE['red']}; color: black; font-weight: bold;")
+            self._gated_style(PALETTE['green'] if requested else PALETTE['red']))
         self._log(f"Meridian limit safety check: {'ON' if requested else 'OFF'}")
         self.viz.update()  # the meridian-limit shading only makes sense while enabled
 
@@ -2600,7 +2620,7 @@ class MainWindow(QMainWindow):
         self.meridian_limit_enabled = enabled
         self.meridian_limit_btn.setText(f"Meridian Limit: {'ON' if enabled else 'OFF'}")
         self.meridian_limit_btn.setStyleSheet(
-            f"background-color: {PALETTE['green'] if enabled else PALETTE['red']}; color: black; font-weight: bold;")
+            self._gated_style(PALETTE['green'] if enabled else PALETTE['red']))
         self.viz.update()
 
     def _toggle_tracking(self):
