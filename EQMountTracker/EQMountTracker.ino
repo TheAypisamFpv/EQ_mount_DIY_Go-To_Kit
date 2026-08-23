@@ -106,7 +106,7 @@ const float DEC_BACKLASH_DEG = 0.0f;
 // standalone truth table below is the other way to confirm this with certainty, independent of
 // any timing measurement:
 //   MS1=LOW,MS2=LOW->8   MS1=HIGH,MS2=LOW->32   MS1=LOW,MS2=HIGH->64   MS1=HIGH,MS2=HIGH->16
-const int MICROSTEPS = 8;
+const int MICROSTEPS = 64;
 // switchMicrosteps() is currently a no-op (see its definition below), but the alignment state
 // machine still calls it at each slew/tracking phase transition with these two names - kept as
 // aliases of MICROSTEPS so those call sites don't all need editing right now. Once UART
@@ -939,7 +939,14 @@ float OBS_LON_DEG = -0.0005f;   // Positive east
 //            setTimeFromValues() and reset to 0 at every calibration - deliberately kept far
 //            below the magnitude where float32 precision loss becomes a problem. currentDaysJ2000/
 //            cal_days_j2000 (the 1.8.46-1.8.48 running-total approach) are removed entirely.
-#define FIRMWARE_VERSION "1.8.49"
+//   1.8.50 - MICROSTEPS was 8, the fallback "working assumption" noted in its own comment above
+//            (never precisely measured/confirmed). Now set to 64, confirmed against the MS1/MS2
+//            standalone truth table directly on the driver (MS1=LOW, MS2=HIGH -> 64) now that the
+//            hardware can physically be run at that setting. Every consumer of MICROSTEPS derives
+//            from it (steps-per-degree, slew/tracking speed math, etc.), so this is a real
+//            behavioral change matching the mount to its actual microstepping, not just a comment
+//            update.
+#define FIRMWARE_VERSION "1.8.50"
 
 // Sidereal rate (deg/sec on sky for RA axis). Approx 15.041 arcsec/s.
 const float SIDEREAL_RATE_DEG_S = 0.004178f;
