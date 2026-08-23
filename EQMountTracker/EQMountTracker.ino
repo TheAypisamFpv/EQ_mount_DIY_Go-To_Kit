@@ -960,7 +960,15 @@ float OBS_LON_DEG = -0.0005f;   // Positive east
 //            one real re-derivation) whenever the new LAT/LON actually differs from the previous
 //            value by more than 0.0001 deg - unless calibrationLocked is already set, in which case
 //            a real CMD,SYNC stays authoritative and is not silently overridden by a location change.
-#define FIRMWARE_VERSION "1.8.51"
+//   1.8.52 - Added a runtime on/off toggle for the meridian-limit safety check (new
+//            meridianLimitEnabled flag, defaults true/enabled on every boot - deliberately not
+//            EEPROM-persisted). CMD,SET_MERIDIAN_LIMIT,ENABLED:0/1 sets it and echoes back
+//            STATUS:MERIDIAN_LIMIT_ENABLED,0/1; new CMD,QUERY_MERIDIAN_LIMIT reads current state
+//            without changing it. pastMeridianLimit() now short-circuits to false whenever
+//            disabled - GOTO/START_TRACKING/continuous tracking are never refused or stopped for
+//            meridian risk while off. For advanced users with confirmed mechanical clearance past
+//            the meridian; leave enabled otherwise.
+#define FIRMWARE_VERSION "1.8.52"
 
 // Sidereal rate (deg/sec on sky for RA axis). Approx 15.041 arcsec/s.
 const float SIDEREAL_RATE_DEG_S = 0.004178f;
@@ -1553,6 +1561,16 @@ bool homeCalibrationSettled = false;
 // old one silently.
 bool riskAcknowledged = false;
 
+// Master on/off for the meridian-limit safety check (see pastMeridianLimit()) - toggled by
+// CMD,SET_MERIDIAN_LIMIT,ENABLED:0/1 from the GUI. Defaults to true (enabled/safe) on every boot -
+// deliberately NOT persisted to EEPROM, so a mount that was left disabled during a previous
+// session never silently stays disabled after a power cycle; the user must consciously turn it
+// off again each session if they still want it off. While false, pastMeridianLimit() always
+// returns false, i.e. GOTO/START_TRACKING/continuous tracking are never refused or stopped for
+// meridian risk - intended for mounts with confirmed mechanical clearance well past the meridian,
+// or deliberate advanced use. Leave enabled unless you know your rig's actual clearance.
+bool meridianLimitEnabled = true;
+
 // Declared here (moved up from their old spot further down) so autoCalibrateFromHome() below can
 // assign to them directly - C++ requires the declaration to precede use in the same translation
 // unit, unlike a forward-declared function.
@@ -1729,6 +1747,7 @@ float computeHourAngleDeg(float skyRaDeg) {
 // skyDecDeg exempts the low-DEC band (MERIDIAN_LIMIT_DEC_ALLOWED_MIN/MAX_DEG) from the HA check
 // entirely - see that constant's comment.
 bool pastMeridianLimit(float skyRaDeg, float skyDecDeg) {
+  if (!meridianLimitEnabled) return false;
   if (!isCalibrated) return false;
   if (skyDecDeg >= MERIDIAN_LIMIT_DEC_ALLOWED_MIN_DEG && skyDecDeg <= MERIDIAN_LIMIT_DEC_ALLOWED_MAX_DEG) return false;
   float ha = computeHourAngleDeg(skyRaDeg);
@@ -2372,6 +2391,8 @@ void parseAndExecuteCommand(char* cmd) {
   // CMD,SAVE_LOCATION_EEPROM   // save current location to EEPROM
   // CMD,LOAD_LOCATION_EEPROM   // load location from EEPROM
   // CMD,QUERY_LOCATION         // query current location
+  // CMD,SET_MERIDIAN_LIMIT,ENABLED:0/1   // enable/disable the meridian-limit safety check - see meridianLimitEnabled
+  // CMD,QUERY_MERIDIAN_LIMIT   // query current meridian-limit enabled state
 
   char line[128];
   strncpy(line, cmd, 127);
@@ -2899,6 +2920,17 @@ void parseAndExecuteCommand(char* cmd) {
     bool flipped = p && atoi(p + 12) != 0;  // "SET_FLIPPED," is 12 chars
     setTelescopeFlipped(flipped);
   }
+  else if (strcmp(action, "SET_MERIDIAN_LIMIT") == 0) {
+    // CMD,SET_MERIDIAN_LIMIT,ENABLED:0/1 - see meridianLimitEnabled's comment. Echoes the new
+    // state back as a STATUS line (same pattern as SET_POS_UPDATE below) so the GUI can confirm
+    // the firmware actually applied it rather than assuming its own toggle click succeeded.
+    const char* p = strstr(line, "ENABLED:");
+    if (p) {
+      meridianLimitEnabled = atoi(p + 8) != 0;  // "ENABLED:" is 8 chars
+      Serial.print("STATUS:MERIDIAN_LIMIT_ENABLED,");
+      Serial.println(meridianLimitEnabled ? 1 : 0);
+    }
+  }
   else if (strcmp(action, "SET_POS_UPDATE") == 0) {
     const char* p;
     int ms = 0;
@@ -2953,6 +2985,13 @@ void parseAndExecuteCommand(char* cmd) {
   }
   else if (strcmp(action, "QUERY_LOCATION") == 0) {
     queryLocation();
+  }
+  else if (strcmp(action, "QUERY_MERIDIAN_LIMIT") == 0) {
+    // Lets the GUI confirm the firmware's actual current state on connect (e.g. after a GUI
+    // restart with the Arduino left powered/running) rather than assuming its own remembered
+    // toggle position still matches - see meridianLimitEnabled's comment.
+    Serial.print("STATUS:MERIDIAN_LIMIT_ENABLED,");
+    Serial.println(meridianLimitEnabled ? 1 : 0);
   }
 }
 
