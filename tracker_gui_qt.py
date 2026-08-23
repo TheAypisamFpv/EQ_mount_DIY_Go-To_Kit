@@ -1418,15 +1418,15 @@ class MainWindow(QMainWindow):
         self.tt_time_edit.returnPressed.connect(self._apply_time_travel)
         self.preview_btn = QPushButton("Preview")
         self.preview_btn.clicked.connect(self._apply_time_travel)  # baseline (inactive) style set in _update_time_travel_label
-        now_btn = QPushButton("Now (Real Time)")
-        now_btn.clicked.connect(self._reset_time_travel)
-        self._flat_btn(now_btn, "green")
+        self.now_btn = QPushButton("Now (Real Time)")
+        self.now_btn.clicked.connect(self._reset_time_travel)
+        self._flat_btn(self.now_btn, "green")  # baseline (real-time) style - see _update_time_travel_label for the preview-active override
         self.tt_label = QLabel("Showing: real-time sky")
         self.tt_label.setStyleSheet("color: #8888aa;")
         tt_row.addWidget(self.tt_date_edit)
         tt_row.addWidget(self.tt_time_edit)
         tt_row.addWidget(self.preview_btn)
-        tt_row.addWidget(now_btn)
+        tt_row.addWidget(self.now_btn)
         tt_row.addWidget(self.tt_label, stretch=1)
         left.addLayout(tt_row)
 
@@ -1992,6 +1992,7 @@ class MainWindow(QMainWindow):
             self.tt_label.setText("Showing: real-time sky")
             self.tt_label.setStyleSheet("color: #8888aa;")
             self.preview_btn.setStyleSheet("")
+            self._flat_btn(self.now_btn, "green")
             # Keep the date/time fields ticking forward live while showing the real-time sky,
             # instead of staying frozen at whatever _reset_time_travel_inputs_to_now() last set
             # them to - skipped while either field has focus, so this can't clobber a date/time
@@ -2008,6 +2009,11 @@ class MainWindow(QMainWindow):
             # like every other accent color in this app, from PALETTE (OKLCH), not a one-off hex.
             self.preview_btn.setStyleSheet(
                 f"background-color: {PALETTE['orange']}; color: black; font-weight: bold;")
+            # Green on now_btn means "this is the current state" elsewhere in this app (toggle
+            # buttons, the realtime_dot itself) - leaving it green while a preview is actually
+            # active would misleadingly claim real-time is still showing, so it's plain/default
+            # here instead, matching preview_btn's own inactive style.
+            self.now_btn.setStyleSheet("")
         # Reschedule for the exact next real second boundary (see this timer's setup in
         # __init__) instead of a fixed 1000ms poll - same technique as _update_realtime_dot.
         frac = time.time() % 1.0
