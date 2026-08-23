@@ -1882,7 +1882,19 @@ class MainWindow(QMainWindow):
         order = ["FREE", "TELESCOPE", "TARGET"]
         self.viz.view_mode = order[(order.index(self.viz.view_mode) + 1) % len(order)]
         self.view_mode_btn.setText(f"View: {self.viz.view_mode.title()}")
-        self._style_toggle_btn(self.view_mode_btn, self.viz.view_mode != "FREE")
+        self._update_view_mode_btn_style()
+
+    def _update_view_mode_btn_style(self):
+        """Free = default button color. Telescope = the same blue as the camera FOV rectangle
+        overlay (#5599ff - see SkyViewWidget._draw_camera_and_reticle). Target = the same orange
+        as the target reticle (#ffaa00, same place) - so the button's color itself tells you
+        which overlay the viz is currently following, matching that overlay's own color."""
+        if self.viz.view_mode == "TELESCOPE":
+            self.view_mode_btn.setStyleSheet("background-color: #5599ff; color: black; font-weight: bold;")
+        elif self.viz.view_mode == "TARGET":
+            self.view_mode_btn.setStyleSheet("background-color: #ffaa00; color: black; font-weight: bold;")
+        else:
+            self.view_mode_btn.setStyleSheet("")
 
     def _toggle_iss(self):
         self.viz.iss_enabled = not self.viz.iss_enabled
