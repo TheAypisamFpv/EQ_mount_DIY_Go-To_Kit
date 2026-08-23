@@ -1531,14 +1531,42 @@ class MainWindow(QMainWindow):
         self.live_error_label = QLabel("Live Error: RA 0.0000°  DEC 0.0000°")
         self.live_error_label.setStyleSheet(f"color: {PALETTE['orange']};")
 
+        error_row = QHBoxLayout()
+        error_row.addWidget(self.mode_tracking_label)
+        error_row.addSpacing(16)
+        error_row.addWidget(self.live_error_label)
+        error_box = QWidget()
+        error_box.setLayout(error_row)
+
+        # Equal *stretch factors* on either side of the button do NOT by themselves guarantee
+        # the button lands at the row's true midpoint - stretch only governs how LEFTOVER space
+        # (beyond each side's own natural content width) gets split, so with the cursor label
+        # (narrow) on one side and the mode/error labels (much wider) on the other, the button
+        # still ends up off-center toward the narrower side. Forcing both side containers to the
+        # SAME explicit width (the wider of the two, computed from their actual content) is what
+        # actually centers it - content that doesn't fill its side just sits left/right-aligned
+        # within that fixed width instead.
+        side_w = max(self.hover_label.sizeHint().width(), error_box.sizeHint().width())
+        left_wrap = QWidget()
+        left_wrap_l = QHBoxLayout(left_wrap)
+        left_wrap_l.setContentsMargins(0, 0, 0, 0)
+        left_wrap_l.addWidget(self.hover_label)
+        left_wrap_l.addStretch(1)
+        left_wrap.setFixedWidth(side_w)
+
+        right_wrap = QWidget()
+        right_wrap_l = QHBoxLayout(right_wrap)
+        right_wrap_l.setContentsMargins(0, 0, 0, 0)
+        right_wrap_l.addStretch(1)
+        right_wrap_l.addWidget(error_box)
+        right_wrap.setFixedWidth(side_w)
+
         bottom = QHBoxLayout()
-        bottom.addWidget(self.hover_label)
+        bottom.addWidget(left_wrap)
         bottom.addStretch(1)
         bottom.addWidget(stop_btn)
         bottom.addStretch(1)
-        bottom.addWidget(self.mode_tracking_label)
-        bottom.addSpacing(16)
-        bottom.addWidget(self.live_error_label)
+        bottom.addWidget(right_wrap)
         left.addLayout(bottom)
 
         # ==================== RIGHT SIDEBAR ====================
