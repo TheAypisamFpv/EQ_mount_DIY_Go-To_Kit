@@ -1108,6 +1108,7 @@ class MainWindow(QMainWindow):
         self._last_pos_ui_update = 0.0
         self._workers = []  # keeps background QObjects referenced while their thread runs
         self._search_index = []  # built alongside the catalog - see _on_catalog_loaded
+        self._log_history = []  # (msg, masked_msg) pairs - see _log/_rebuild_log_display
         self._sky_search_matches = []
         self.target_object_name = None  # see _select_sky_target
         self._target_name_box_ra_str = ""
@@ -1296,15 +1297,15 @@ class MainWindow(QMainWindow):
         self.tt_time_edit.setPlaceholderText("HH:MM:SS UTC")
         self.tt_date_edit.returnPressed.connect(self._apply_time_travel)
         self.tt_time_edit.returnPressed.connect(self._apply_time_travel)
-        preview_btn = QPushButton("Preview")
-        preview_btn.clicked.connect(self._apply_time_travel)
+        self.preview_btn = QPushButton("Preview")
+        self.preview_btn.clicked.connect(self._apply_time_travel)
         now_btn = QPushButton("Now (Real Time)")
         now_btn.clicked.connect(self._reset_time_travel)
         self.tt_label = QLabel("Showing: real-time sky")
         self.tt_label.setStyleSheet("color: #8888aa;")
         tt_row.addWidget(self.tt_date_edit)
         tt_row.addWidget(self.tt_time_edit)
-        tt_row.addWidget(preview_btn)
+        tt_row.addWidget(self.preview_btn)
         tt_row.addWidget(now_btn)
         tt_row.addWidget(self.tt_label, stretch=1)
         left.addLayout(tt_row)
@@ -1583,8 +1584,21 @@ class MainWindow(QMainWindow):
             ra_off_minus, ra_off_plus, dec_off_minus, dec_off_plus,
         ] + [self.mode_group.button(i) for i in range(3)]
 
-    def _log(self, msg):
-        self.log_edit.append(msg)
+    def _log(self, msg, masked_msg=None):
+        """Appends to the Status/Messages log. `masked_msg` is an optional alternate text to
+        show instead, whenever Streamer Mode is on, for any log line that would otherwise leak
+        the real GPS coordinates (see _set_location/_load_gui_config's calls) - Streamer Mode
+        is supposed to hide the location entirely (see _on_streamer_mode_toggle), and the log
+        box was the one place that kept showing it in plain text regardless. Every line is kept
+        in self._log_history (msg, masked_msg) so toggling Streamer Mode mid-session can
+        retroactively re-render everything already logged, not just lines logged from then on."""
+        self._log_history.append((msg, masked_msg))
+        self.log_edit.append(masked_msg if (self.streamer_mode and masked_msg is not None) else msg)
+
+    def _rebuild_log_display(self):
+        self.log_edit.clear()
+        for msg, masked_msg in self._log_history:
+            self.log_edit.append(masked_msg if (self.streamer_mode and masked_msg is not None) else msg)
 
     # ---------------- location / lat-lon ----------------
     def _get_lat_lon(self):
@@ -1633,7 +1647,9 @@ class MainWindow(QMainWindow):
 
     def _on_streamer_mode_toggle(self, checked):
         """Mirrors EQMountApp._on_streamer_mode_toggle - masks the location display only, never
-        clears the underlying values, so sync/Sun-Moon/etc. keep working normally while hidden."""
+        clears the underlying values, so sync/Sun-Moon/etc. keep working normally while hidden.
+        Also masks the Status/Messages log (see _log/_rebuild_log_display) - previously that box
+        kept showing the real coordinates in plain text regardless of this toggle."""
         self.streamer_mode = checked
         mode = QLineEdit.Password if checked else QLineEdit.Normal
         self.lat_edit.setEchoMode(mode)
@@ -1644,6 +1660,7 @@ class MainWindow(QMainWindow):
         else:
             lat, lon = self._get_lat_lon()
             self._set_location_label(f"Loc: {lat}, {lon}")
+        self._rebuild_log_display()
 
     def _set_location_label(self, text):
         self.location_label.setText("Loc: •••••• (hidden)" if self.streamer_mode else text)
@@ -1655,7 +1672,7 @@ class MainWindow(QMainWindow):
         if self.serial.ser and self.serial.ser.is_open:
             self.serial.send_command(f"CMD,SET_LOCATION,LAT:{lat:.6f},LON:{lon:.6f}")
         self._set_location_label(f"Loc: {lat}, {lon}")
-        self._log(f"Location set: LAT {lat:.4f}, LON {lon:.4f}")
+        self._log(f"Location set: LAT {lat:.4f}, LON {lon:.4f}", masked_msg="Location set: LAT ••••••, LON ••••••")
 
     def _on_location_changed(self):
         """Debounced (200ms, see _location_save_timer) reaction to editing any of the location
@@ -1698,7 +1715,8 @@ class MainWindow(QMainWindow):
         lat, lon = self._get_lat_lon()
         self.viz.lat, self.viz.lon = lat, lon
         self._set_location_label(f"Loc: {lat}, {lon} (loaded)")
-        self._log(f"Loaded saved location from gui_config.json: {gps_str}")
+        self._log(f"Loaded saved location from gui_config.json: {gps_str}",
+                  masked_msg="Loaded saved location from gui_config.json: •••••• (hidden)")
 
     def _save_gui_config(self):
         """Same schema as EQMountApp._save_gui_config: {"gps": "lat, lon"} written to
@@ -1756,12 +1774,23 @@ class MainWindow(QMainWindow):
         if self._time_travel_offset == timedelta(0):
             self.tt_label.setText("Showing: real-time sky")
             self.tt_label.setStyleSheet("color: #8888aa;")
+            self.preview_btn.setStyleSheet("")
+            # Keep the date/time fields ticking forward live while showing the real-time sky,
+            # instead of staying frozen at whatever _reset_time_travel_inputs_to_now() last set
+            # them to - skipped while either field has focus, so this can't clobber a date/time
+            # the user is actively typing in to set up a preview.
+            if not (self.tt_date_edit.hasFocus() or self.tt_time_edit.hasFocus()):
+                self._reset_time_travel_inputs_to_now()
         else:
             eff_utc = self._get_effective_utc_now()
             connected = bool(self.serial.ser and self.serial.ser.is_open)
             suffix = "" if connected else " - Arduino not connected"
             self.tt_label.setText(f"⚠ TIME TRAVEL: {eff_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC{suffix}")
             self.tt_label.setStyleSheet("color: " + PALETTE["orange"] + ";")
+            # Same orange as the real-time dot in preview mode (see _update_realtime_dot) - and,
+            # like every other accent color in this app, from PALETTE (OKLCH), not a one-off hex.
+            self.preview_btn.setStyleSheet(
+                f"background-color: {PALETTE['orange']}; color: black; font-weight: bold;")
 
     def _update_realtime_dot(self):
         """Blinks once per real (wall-clock) second - LIT the instant each second starts, OFF
