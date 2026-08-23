@@ -65,7 +65,7 @@ from tracker_gui import (
     TRACKING_STABLE_DERIV_DEG_S, TRACKING_STABILITY_WINDOW_S,
     POS_UPDATE_RATE_MS, POSITION_BROADCAST_HZ, DEFAULT_LAT, DEFAULT_LON,
     SIDEREAL_RATE_DEG_S, MERIDIAN_LIMIT_WARNING_S, MERIDIAN_LIMIT_URGENT_S,
-    CONFIG_PATH, ISS_TRACKING_UPDATE_MS, ISS_DISPLAY_UPDATE_MS, _muted_hex_color,
+    CONFIG_PATH, ISS_TRACKING_UPDATE_MS, ISS_DISPLAY_UPDATE_MS, SOLAR_SYSTEM_UPDATE_MS, _muted_hex_color,
 )
 from sky_data import sky_catalog, iss_tracker, solar_system
 
@@ -1362,17 +1362,17 @@ class MainWindow(QMainWindow):
         self._load_catalog()
         self._refresh_ports()
         QTimer.singleShot(500, self._trigger_solar_system_update)
-        # Recurring refresh (2s, matching EQMountApp's _solar_system_update_tick cadence) - was
-        # previously only ever triggered once at startup and again on a Time Travel jump, so the
-        # Sun/Moon/planet positions (and, via _refresh_live_target_position, the target reticle
-        # while one of them is the selected target) went stale for the rest of a real-time
-        # session instead of continuing to track the actual sky. 2s bounds staleness to a
-        # fraction of an arcsecond for the Moon (the fastest of these against the star
-        # background), imperceptible at any real zoom, for a background-thread ephemeris lookup
-        # cheap enough not to matter at this rate.
+        # Recurring refresh (SOLAR_SYSTEM_UPDATE_MS, matching EQMountApp's
+        # _solar_system_update_tick cadence) - was previously only ever triggered once at startup
+        # and again on a Time Travel jump, so the Sun/Moon/planet positions (and, via
+        # _refresh_live_target_position, the target reticle while one of them is the selected
+        # target) went stale for the rest of a real-time session instead of continuing to track
+        # the actual sky. At 1Hz this bounds staleness to a fraction of an arcsecond for the Moon
+        # (the fastest of these against the star background), imperceptible at any real zoom, for
+        # a background-thread ephemeris lookup cheap enough not to matter at this rate.
         self.solar_system_timer = QTimer(self)
         self.solar_system_timer.timeout.connect(self._trigger_solar_system_update)
-        self.solar_system_timer.start(2000)
+        self.solar_system_timer.start(SOLAR_SYSTEM_UPDATE_MS)
 
     def closeEvent(self, event):
         self.iss_thread.stop()

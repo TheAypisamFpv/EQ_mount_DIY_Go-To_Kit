@@ -143,7 +143,11 @@ from sky_data import sky_catalog, iss_tracker, solar_system
 #            refresh (solar_system_timer) - it was previously only ever triggered once at startup
 #            and on a Time Travel jump, so this fix would have had nothing fresh to follow for
 #            those bodies without it.
-GUI_VERSION = "1.0.12"
+#   1.0.13 - Sun/Moon/planet refresh rate raised from 2000ms to 1Hz (new shared
+#            SOLAR_SYSTEM_UPDATE_MS constant, replacing the previous hardcoded 2000/2000ms in
+#            _solar_system_update_tick/solar_system_timer) per request - matches
+#            ISS_DISPLAY_UPDATE_MS's cadence. Both GUIs.
+GUI_VERSION = "1.0.13"
 
 BAUD_RATE = 250000
 # GUI poll rate for the serial queue. Fast enough to comfortably keep up with the Arduino's 50Hz
@@ -189,6 +193,14 @@ ISS_TRACKING_UPDATE_MS = 50
 # but NOT the actively tracked target) - see _iss_update_tick. 1Hz is plenty for a display-only
 # refresh; ISS_TRACKING_UPDATE_MS above is used instead once the ISS becomes the tracked target.
 ISS_DISPLAY_UPDATE_MS = 1000
+
+# How often Sun/Moon/planet positions are refreshed - see _solar_system_update_tick
+# (tracker_gui.py) / solar_system_timer (tracker_gui_qt.py). Previously 2000ms (plenty for how
+# slowly these move against the star background - the Moon, the fastest of them, moves
+# ~33"/min, so even 2s only bounds staleness to ~1"), raised to match ISS_DISPLAY_UPDATE_MS's 1Hz
+# per request - a background-thread ephemeris lookup that's cheap enough not to matter at 2x the
+# old rate.
+SOLAR_SYSTEM_UPDATE_MS = 1000
 
 # Matches the firmware's own SIDEREAL_RATE_DEG_S exactly (EQMountTracker.ino) - used ONLY for the
 # client-side meridian-limit countdown estimate (_update_meridian_warning), never for any
@@ -4140,9 +4152,10 @@ class EQMountApp(ctk.CTk):
         physical telescope stays accurately on the Moon while this GUI-side dot could be up to a
         full 60s stale - the Moon moves ~33"/min, so a 60s-stale dot could be visibly off from
         where the telescope (correctly) actually is, misread as "the telescope isn't centered on
-        the Moon" when it's really just this reticle lagging. Refreshing every 2s instead bounds
-        that staleness to ~1", imperceptible at any real zoom, for a background-thread ephemeris
-        lookup that's cheap enough to not matter at 30x the old rate. Always on (see the comment
+        the Moon" when it's really just this reticle lagging. Refreshing at SOLAR_SYSTEM_UPDATE_MS
+        (1Hz) instead bounds that staleness to a fraction of an arcsecond, imperceptible at any
+        real zoom, for a background-thread ephemeris lookup that's cheap enough not to matter at
+        60x the old rate. Always on (see the comment
         near the state this populates) - no toggle, so this reschedules itself forever once
         kicked off at startup, same pattern as _iss_update_tick but without the enabled-flag check
         (except the one-time "skyfield isn't installed" case, which stops rescheduling entirely
@@ -4173,7 +4186,7 @@ class EQMountApp(ctk.CTk):
                 sun_ra, sun_dec, sun_diam, moon_ra, moon_dec, moon_diam, illum, phase, waxing, planets))
 
         threading.Thread(target=worker, daemon=True).start()
-        self._solar_system_update_after_id = self.after(2000, self._solar_system_update_tick)
+        self._solar_system_update_after_id = self.after(SOLAR_SYSTEM_UPDATE_MS, self._solar_system_update_tick)
 
     def _on_solar_system_position(self, sun_ra, sun_dec, sun_diam, moon_ra, moon_dec, moon_diam,
                                    illum, phase, waxing, planets):
