@@ -130,7 +130,20 @@ from sky_data import sky_catalog, iss_tracker, solar_system
 #            free-running fixed delay from whenever the previous fetch happened to finish, so
 #            updates land on a predictable cadence (e.g. every real :00/:01/:02 second at 1Hz)
 #            rather than drifting to an arbitrary phase. Both GUIs.
-GUI_VERSION = "1.0.11"
+#   1.0.12 - Fixed the target reticle/View: Follow Target/live error readout freezing at wherever
+#            a live-moving target (ISS, Sun, Moon, a planet) was the moment tracking stopped,
+#            instead of continuing to follow its real current position - target_ra/dec updates
+#            from _on_iss_position/_on_solar_system_position were gated on self.tracking, and the
+#            POS handler unconditionally overwrote target_ra/dec with the firmware's echo (frozen
+#            once there are no more fresh SET_TARGETs for it to reflect) the rest of the time. New
+#            _target_is_live_body() gates both; target_ra/dec now stays live-updated for these
+#            bodies purely from the GUI's own computation whenever one is the SELECTED target,
+#            tracking or not - sending a fresh SET_TARGET to the Arduino remains gated on tracking
+#            as before. tracker_gui_qt.py additionally gained a recurring 2s Sun/Moon/planet
+#            refresh (solar_system_timer) - it was previously only ever triggered once at startup
+#            and on a Time Travel jump, so this fix would have had nothing fresh to follow for
+#            those bodies without it.
+GUI_VERSION = "1.0.12"
 
 BAUD_RATE = 250000
 # GUI poll rate for the serial queue. Fast enough to comfortably keep up with the Arduino's 50Hz
@@ -4027,6 +4040,19 @@ class EQMountApp(ctk.CTk):
         next_delay_ms = max(1, round((interval_s - (time.time() % interval_s)) * 1000))
         self._iss_update_after_id = self.after(next_delay_ms, self._iss_update_tick)
 
+    def _target_is_live_body(self):
+        """True while the selected target is a body whose sky position visibly changes over the
+        course of a session (ISS, Sun, Moon, or a planet) and so needs target_ra/dec kept fresh
+        from the GUI's own live computation (_on_iss_position/_on_solar_system_position) rather
+        than the firmware's POS echo (fields[3]/[4]) - which only ever reflects whatever was in
+        the last SET_TARGET sent, frozen once tracking stops (no more SET_TARGETs to echo), and
+        lagged by real serial round-trip time even while tracking. A star/DSO's catalog RA/DEC
+        doesn't change during a session, so the echo is perfectly fine (and, while actually
+        tracking, arguably more accurate than the client-side value) for anything that isn't one
+        of these."""
+        name = self.target_object_name
+        return name == "ISS" or name == "Sun" or name == "Moon" or name in getattr(self, "_planet_positions", {})
+
     def _on_iss_position(self, ra, dec, above_horizon):
         self._iss_ra = ra
         self._iss_dec = dec
@@ -4042,11 +4068,26 @@ class EQMountApp(ctk.CTk):
         # tracked object being refreshed (see the CMD,SET_TARGET handler in the .ino) so it's safe
         # to derive a tracking rate from consecutive updates - every other SET_TARGET sender
         # (double-click, search, manual entry) omits this, since those are always a fresh target.
+        # Keep target_ra/dec (the viz target reticle/View: Follow Target/live error readout)
+        # following the ISS's live position whenever it's the SELECTED target - regardless of
+        # whether tracking is currently active. Previously this was gated on self.tracking too
+        # (bundled with the "send a fresh target to the Arduino" decision below), so target_ra/
+        # dec froze at wherever the ISS was the moment tracking stopped instead of continuing to
+        # follow it - obvious within seconds given how fast the ISS moves. Reported as "when I
+        # stop tracking the ISS, the target stays at the position I stopped tracking instead of
+        # following the actual target." See _target_is_live_body's comment - the same fix applies
+        # to Sun/Moon in _on_solar_system_position.
+        if self.target_object_name == "ISS":
+            self.target_ra = ra
+            self.target_dec = dec
+
+        # Sending a fresh target to the Arduino, however, still only makes sense while actually
+        # tracking - CONTINUATION:1 tells the firmware this is the SAME tracked object being
+        # refreshed (see the CMD,SET_TARGET handler in the .ino) so it's safe to derive a
+        # tracking rate from consecutive updates.
         if (self.target_object_name == "ISS" and self.tracking
                 and self.mode_var.get() == "SIDEREAL"
                 and self.serial and self.serial.ser and self.serial.ser.is_open):
-            self.target_ra = ra
-            self.target_dec = dec
             self.serial.send_command(f"CMD,SET_TARGET,RA:{ra:.6f},DEC:{dec:.6f},CONTINUATION:1")
 
     def _toggle_constellations(self):
@@ -4142,23 +4183,34 @@ class EQMountApp(ctk.CTk):
         self._planet_positions = planets
         self._schedule_viz_redraw()
 
-        # If SOLAR/LUNAR tracking is actually active, keep the Arduino's target fresh too - not
-        # just the on-screen dot. Same CONTINUATION:1 mechanism as _on_iss_position: the Arduino
-        # has no on-board Sun/Moon position mode anymore (see _on_mode_changed), it just derives
-        # a rate from consecutive SET_TARGETs and extrapolates - the Sun/Moon move ~1000x slower
-        # than the ISS, so this 2s cadence (vs ISS_TRACKING_UPDATE_MS) is easily fast enough for a
-        # smooth, accurate rate.
+        # Keep target_ra/dec (the viz target reticle/View: Follow Target/live error readout)
+        # following the Sun/Moon/a planet's live position whenever one is the SELECTED target -
+        # regardless of whether tracking is currently active. Same fix as _on_iss_position's for
+        # the ISS; see _target_is_live_body's comment for why this matters even though these move
+        # much slower - the position was still frozen at Stop, just less obviously/quickly than
+        # the ISS's freeze.
+        if self.target_object_name == "Sun":
+            self.target_ra, self.target_dec = sun_ra, sun_dec
+        elif self.target_object_name == "Moon":
+            self.target_ra, self.target_dec = moon_ra, moon_dec
+        elif self.target_object_name in planets:
+            self.target_ra, self.target_dec = planets[self.target_object_name][0], planets[self.target_object_name][1]
+
+        # Sending a fresh target to the Arduino, however, still only makes sense while SOLAR/LUNAR
+        # tracking is actually active - not just displayed. Same CONTINUATION:1 mechanism as
+        # _on_iss_position: the Arduino has no on-board Sun/Moon position mode anymore (see
+        # _on_mode_changed), it just derives a rate from consecutive SET_TARGETs and extrapolates -
+        # the Sun/Moon move ~1000x slower than the ISS, so this 2s cadence (vs
+        # ISS_TRACKING_UPDATE_MS) is easily fast enough for a smooth, accurate rate.
         mode = self.mode_var.get()
-        target_ra, target_dec, expected_name = (
+        cmd_ra, cmd_dec, expected_name = (
             (sun_ra, sun_dec, "Sun") if mode == "SOLAR" else
             (moon_ra, moon_dec, "Moon") if mode == "LUNAR" else
             (None, None, None)
         )
-        if (target_ra is not None and self.tracking and self.target_object_name == expected_name
+        if (cmd_ra is not None and self.tracking and self.target_object_name == expected_name
                 and self.serial and self.serial.ser and self.serial.ser.is_open):
-            self.target_ra = target_ra
-            self.target_dec = target_dec
-            self.serial.send_command(f"CMD,SET_TARGET,RA:{target_ra:.6f},DEC:{target_dec:.6f},CONTINUATION:1")
+            self.serial.send_command(f"CMD,SET_TARGET,RA:{cmd_ra:.6f},DEC:{cmd_dec:.6f},CONTINUATION:1")
 
     def _cycle_viz_view_mode(self):
         order = ["FREE", "TELESCOPE", "TARGET"]
@@ -4727,8 +4779,17 @@ class EQMountApp(ctk.CTk):
                 self.current_ra = ra_val  # sky from Arduino ONLY (drifts with Earth rotation when not tracking)
                 self.current_dec = dec_val  # sky from Arduino ONLY (drifts with Earth rotation when not tracking)
                 # (labels + viz are refreshed once below, after target/error/mount/speed are all set)
-                self.target_ra = float(fields[3])
-                self.target_dec = float(fields[4])
+                # Skip while the target is a live-moving body (ISS/Sun/Moon/a planet) -
+                # _on_iss_position/_on_solar_system_position already keep target_ra/dec fresh from
+                # the GUI's own live skyfield computation, tracking or not - see
+                # _target_is_live_body's comment for why the firmware's echo isn't good enough for
+                # these. Previously this always overwrote unconditionally, which is exactly what
+                # made the target reticle freeze once tracking stopped (no more fresh SET_TARGETs
+                # for the echo to reflect) - reported as "when I stop tracking the ISS, the target
+                # stays at the position I stopped tracking instead of following the actual target."
+                if not self._target_is_live_body():
+                    self.target_ra = float(fields[3])
+                    self.target_dec = float(fields[4])
                 self.mount_ra_angle = float(fields[5])
                 self.mount_dec_angle = float(fields[6])
                 self.err_ra = abs(self.current_ra - self.target_ra)

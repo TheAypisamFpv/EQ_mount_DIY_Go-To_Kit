@@ -1362,6 +1362,17 @@ class MainWindow(QMainWindow):
         self._load_catalog()
         self._refresh_ports()
         QTimer.singleShot(500, self._trigger_solar_system_update)
+        # Recurring refresh (2s, matching EQMountApp's _solar_system_update_tick cadence) - was
+        # previously only ever triggered once at startup and again on a Time Travel jump, so the
+        # Sun/Moon/planet positions (and, via _refresh_live_target_position, the target reticle
+        # while one of them is the selected target) went stale for the rest of a real-time
+        # session instead of continuing to track the actual sky. 2s bounds staleness to a
+        # fraction of an arcsecond for the Moon (the fastest of these against the star
+        # background), imperceptible at any real zoom, for a background-thread ephemeris lookup
+        # cheap enough not to matter at this rate.
+        self.solar_system_timer = QTimer(self)
+        self.solar_system_timer.timeout.connect(self._trigger_solar_system_update)
+        self.solar_system_timer.start(2000)
 
     def closeEvent(self, event):
         self.iss_thread.stop()
@@ -2164,6 +2175,40 @@ class MainWindow(QMainWindow):
         self.viz.moon_illum, self.viz.moon_waxing = illum, waxing
         self.viz.planet_positions = planets
         self.viz.update()
+        self._refresh_live_target_position()
+
+    def _refresh_live_target_position(self):
+        """Keeps target_ra/target_dec (the reticle/View: Target follow/live error readout)
+        following the CURRENT position of whatever moving body (Sun, Moon, or a planet) is
+        selected as the target, regardless of whether tracking is currently active - same fix as
+        _on_iss_updated applies for the ISS, just for the slower-moving bodies (their motion
+        against the star background is slow enough per update that the staleness is less
+        obvious, but the same bug: target_ra/dec previously only got set once at Start Tracking
+        and then stayed frozen there after Stop instead of continuing to follow the real object).
+        Does NOT send anything to the Arduino - continuous SET_TARGET resync during active
+        tracking for these bodies is a separate concern; this only keeps the GUI's own idea of
+        "where the target currently is" honest, mirroring what's actually drawn on the viz."""
+        name = self.target_object_name
+        if name == "ISS" and self.viz.iss_ra is not None:
+            self.target_ra, self.target_dec = self.viz.iss_ra, self.viz.iss_dec
+        elif name == "Sun" and self.viz.sun_ra is not None:
+            self.target_ra, self.target_dec = self.viz.sun_ra, self.viz.sun_dec
+        elif name == "Moon" and self.viz.moon_ra is not None:
+            self.target_ra, self.target_dec = self.viz.moon_ra, self.viz.moon_dec
+        elif name in self.viz.planet_positions:
+            self.target_ra, self.target_dec = self.viz.planet_positions[name][0], self.viz.planet_positions[name][1]
+
+    def _target_is_live_body(self):
+        """True while the selected target is a body whose sky position visibly changes over the
+        course of a session (ISS, Sun, Moon, or a planet) and so needs target_ra/dec kept fresh
+        from the GUI's own live computation (see _refresh_live_target_position) rather than the
+        firmware's POS echo - which only ever reflects whatever was in the last SET_TARGET sent,
+        frozen once tracking stops (no more SET_TARGETs to echo), and lagged by real serial
+        round-trip time even while tracking. A star/DSO's catalog RA/DEC doesn't change during a
+        session, so the echo is perfectly fine (and, while actually tracking, arguably more
+        accurate than the client-side value) for anything that isn't one of these."""
+        name = self.target_object_name
+        return name == "ISS" or name == "Sun" or name == "Moon" or name in self.viz.planet_positions
 
     def _iss_actively_tracked(self):
         """True while the ISS is the currently active tracked target - see
@@ -2194,14 +2239,21 @@ class MainWindow(QMainWindow):
         self.viz.iss_ra, self.viz.iss_dec, self.viz.iss_above = ra, dec, above
         self.viz.update()
 
-        # If the ISS is the currently active tracked target, keep the Arduino's target fresh
-        # too - not just the on-screen marker. Same CONTINUATION:1 mechanism as
-        # EQMountApp._on_iss_position: tells the firmware this is the SAME tracked object being
-        # refreshed (not a fresh target), so it's safe to derive a tracking rate from consecutive
-        # updates, the same SIDEREAL SET_TARGET + continuous-correction machinery any other
-        # search-selected target uses.
+        # Keep target_ra/dec (the reticle/View: Target follow/live error readout) following the
+        # ISS's live position whenever it's the SELECTED target - regardless of whether tracking
+        # is currently active. Previously this was gated on _iss_actively_tracked(), so target_ra
+        # /dec (and everything reading it) froze at wherever the ISS was the moment tracking
+        # stopped instead of continuing to follow it - obvious within seconds given how fast the
+        # ISS moves. See _refresh_live_target_position's docstring for the same fix applied to
+        # Sun/Moon/planets.
+        self._refresh_live_target_position()
+
+        # Sending a fresh target to the Arduino, however, still only makes sense while actually
+        # tracking - same CONTINUATION:1 mechanism as EQMountApp._on_iss_position: tells the
+        # firmware this is the SAME tracked object being refreshed (not a fresh target), so it's
+        # safe to derive a tracking rate from consecutive updates, the same SIDEREAL SET_TARGET +
+        # continuous-correction machinery any other search-selected target uses.
         if self._iss_actively_tracked() and self.serial.ser and self.serial.ser.is_open:
-            self.target_ra, self.target_dec = ra, dec
             self.serial.send_command(f"CMD,SET_TARGET,RA:{ra:.6f},DEC:{dec:.6f},CONTINUATION:1")
 
     # ---------------- serial connection ----------------
@@ -3067,16 +3119,19 @@ class MainWindow(QMainWindow):
             try:
                 self.current_ra = float(fields[1])
                 self.current_dec = float(fields[2])
-                # Skip while actively tracking the ISS - _on_iss_updated already keeps
-                # target_ra/dec fresh from the GUI's own live skyfield computation (the same
-                # value actually being sent as CONTINUATION updates), up to 50Hz. This field is
-                # just the Arduino's ECHO of whatever target it last received, lagged by real
-                # serial round-trip time - overwriting the fresher client-side value with that
-                # stale echo on every single POS line (also up to 50Hz, on an unsynchronized
-                # clock relative to the ISS thread) made target_ra/dec - and so the View: Target
-                # viz center - visibly flicker between the fresh and stale value. Reported as
-                # "the viz sometimes jumps when in View: Target" while tracking the ISS.
-                if not self._iss_actively_tracked():
+                # Skip while the target is a live-moving body (ISS/Sun/Moon/a planet) -
+                # _on_iss_updated/_on_solar_system_updated already keep target_ra/dec fresh from
+                # the GUI's own live skyfield computation. This field is just the Arduino's ECHO
+                # of whatever target it last received - frozen at whatever that was once tracking
+                # stops (no more SET_TARGETs to echo), and even while tracking it's lagged by real
+                # serial round-trip time. Originally this only excluded active ISS tracking (to
+                # fix "the viz sometimes jumps when in View: Target" while tracking the ISS - the
+                # stale echo racing the fresh client-side value at up to 50Hz caused visible
+                # flicker), but the same staleness applies to every live body any time it's
+                # merely the SELECTED target, tracking or not - reported as "when I stop tracking
+                # the ISS, the target stays at the position I stopped tracking instead of
+                # following the actual target."
+                if not self._target_is_live_body():
                     self.target_ra = float(fields[3])
                     self.target_dec = float(fields[4])
                 self.mount_ra_angle = float(fields[5])
