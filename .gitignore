@@ -9,4 +9,6 @@ TODO.md
 iss_tle.txt
 *.bsp
 *.bsp.*
-sky_catalog.jsontracker_log.txt
+sky_catalog.json
+tracker_log.txt
+.claude/
