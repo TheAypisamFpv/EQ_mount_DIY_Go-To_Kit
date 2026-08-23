@@ -110,7 +110,9 @@ from sky_data import sky_catalog, iss_tracker, solar_system
 #           confirmation dialog every time, same pattern as the solar tracking safety gate.
 #           Re-sent to the Arduino on every connect (_apply_initial_meridian_limit) and
 #           reconciled against firmware-confirmed state via STATUS:MERIDIAN_LIMIT_ENABLED.
-GUI_VERSION = "1.0.8"
+#   1.0.9 - Renamed the "Home Axes (RA/DEC to 0°)" button/log text to "Rewind Axes (RA/DEC to
+#           0°)" per request - cosmetic label only, command (CMD,HOME_AXES)/handler names unchanged.
+GUI_VERSION = "1.0.9"
 
 BAUD_RATE = 250000
 # GUI poll rate for the serial queue. Fast enough to comfortably keep up with the Arduino's 50Hz
@@ -1490,7 +1492,7 @@ class EQMountApp(ctk.CTk):
         # above (sky DEC, RA untouched), this needs no calibration and touches both axes.
         self.home_axes_btn = ctk.CTkButton(
             btn_frame,
-            text="Home Axes (RA/DEC to 0°)",
+            text="Rewind Axes (RA/DEC to 0°)",
             height=28,
             fg_color="#555522",
             command=self._home_axes
@@ -3082,7 +3084,7 @@ class EQMountApp(ctk.CTk):
         self._force_stop_tracking()
         self.serial.send_home_axes()
         self.slewing = False
-        self._log("Home Axes sent: RA/DEC -> mount angle 0°, no tracking.")
+        self._log("Rewind Axes sent: RA/DEC -> mount angle 0°, no tracking.")
 
     def _stop_tracking_key(self, event=None):
         """Delete / Suppr key: emergency stop. Always attempts to send STOP if connected,

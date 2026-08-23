@@ -1716,7 +1716,7 @@ class MainWindow(QMainWindow):
         self.safe_target_btn.clicked.connect(self._safe_target)
         self._flat_btn(self.safe_target_btn, "yellow")  # caution, echoing EQMountApp's olive fg_color for these two
         right.addWidget(self.safe_target_btn)
-        self.home_axes_btn = QPushButton("Home Axes (RA/DEC to 0°)")
+        self.home_axes_btn = QPushButton("Rewind Axes (RA/DEC to 0°)")
         self.home_axes_btn.clicked.connect(self._home_axes)
         self._flat_btn(self.home_axes_btn, "sun")  # distinct from Safe Target's yellow, same warm/caution family
         right.addWidget(self.home_axes_btn)
@@ -2524,7 +2524,7 @@ class MainWindow(QMainWindow):
             return
         self._force_stop_tracking()
         self.serial.send_home_axes()
-        self._log("Home Axes sent: RA/DEC -> mount angle 0°, no tracking.")
+        self._log("Rewind Axes sent: RA/DEC -> mount angle 0°, no tracking.")
 
     def _manual_resync(self):
         if self.serial.send_time_if_connected():
