@@ -10,13 +10,13 @@ Qt's own QPainter onto a GPU-composited QOpenGLWidget surface - no intermediate 
 History: this was originally a second, Qt-only rendering-layer experiment alongside a
 CustomTkinter/Tkinter GUI (whose canvas got laggy at high zoom/pan - individual real widget items
 per star/DSO/grid line, rebuilt every redraw). Once this file reached full feature parity, the
-Tkinter GUI was discarded and this file took over the tracker_gui.py name. Serial protocol,
+Tkinter GUI was discarded and this file took over the trackerGui.py name. Serial protocol,
 tracking-math, and viz geometry constants (along with SerialHandler, the background serial I/O
-thread) that used to live in the discarded Tkinter file are now in tracker_shared.py instead,
+thread) that used to live in the discarded Tkinter file are now in trackerShared.py instead,
 imported from there below.
 
 Run:
-    python tracker_gui.py
+    python trackerGui.py
 """
 
 import sys
@@ -44,8 +44,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 # Toolkit-agnostic infrastructure (serial protocol, camera/meridian/zoom geometry constants, the
-# Milky Way band builder, SerialHandler) - see tracker_shared.py's own module docstring.
-from tracker_shared import (
+# Milky Way band builder, SerialHandler) - see trackerShared.py's own module docstring.
+from trackerShared import (
     SerialHandler, BAUD_RATE, POLL_INTERVAL_MS, POS_UI_UPDATE_MIN_INTERVAL_S,
     CAMERA_FOV_W_DEG, CAMERA_FOV_H_DEG, CAMERA_FOV_DEG_PER_PIXEL,
     MERIDIAN_LIMIT_DEC_ALLOWED_MIN_DEG, MERIDIAN_LIMIT_DEC_ALLOWED_MAX_DEG,
@@ -136,7 +136,7 @@ TRACKING_STOP_RED = STOP_RED
 # ============================================================
 # PURE GEOMETRY/STYLE HELPERS
 # ============================================================
-# Small, stateless helpers ported directly from the matching EQMountApp methods in tracker_gui.py
+# Small, stateless helpers ported directly from the matching EQMountApp methods in trackerGui.py
 # (same formulas, same East-is-leftward/North-is-up screen convention) - kept as free functions
 # here since SkyViewWidget isn't an EQMountApp subclass.
 
@@ -285,14 +285,14 @@ def _draw_centered_text(p, x, y, text, font, color, anchor="center"):
 # SKY VIEW WIDGET
 # ============================================================
 class SkyViewWidget(QOpenGLWidget):
-    """The sky viz panel - Qt/OpenGL equivalent of tracker_gui.py's viz_canvas. Every frame is
+    """The sky viz panel - Qt/OpenGL equivalent of trackerGui.py's viz_canvas. Every frame is
     drawn fresh with QPainter directly onto the GPU-composited surface (paintEvent below) - no
     persistent per-star/per-DSO objects, no intermediate raster image. Qt's own C++ painter and
     OpenGL compositing are fast enough that this "just redraw everything" approach (the same
-    conceptual model as tracker_gui.py's _draw_viz_grid, minus the Tk-item and Pillow-blit
+    conceptual model as trackerGui.py's _draw_viz_grid, minus the Tk-item and Pillow-blit
     layers it needed to stay smooth) is already smooth at the star/DSO counts this catalog has.
 
-    Coordinate convention matches tracker_gui.py exactly: RA increases LEFTWARD on screen, DEC
+    Coordinate convention matches trackerGui.py exactly: RA increases LEFTWARD on screen, DEC
     increases upward - see ra_to_x/dec_to_y below, ported 1:1 from EQMountApp's versions."""
 
     targetPicked = Signal(float, float, object)   # emitted (ra_deg, dec_deg, name_or_None) on double-click
@@ -669,7 +669,7 @@ class SkyViewWidget(QOpenGLWidget):
 
     def _draw_sky_objects(self, p, w, h, margin, ra_min, ra_max, dec_min, dec_max):
         """Draws stars + DSOs and rebuilds self._visible_hits (hover/click hit-test list) fresh
-        every paint - same LOD-tier/bisect/small-DSO-fast-path approach as tracker_gui.py's
+        every paint - same LOD-tier/bisect/small-DSO-fast-path approach as trackerGui.py's
         _draw_sky_objects (see GUI_VERSION 1.0.4's changelog for why the small-DSO fast path
         exists)."""
         self._visible_hits = []
@@ -746,7 +746,7 @@ class SkyViewWidget(QOpenGLWidget):
                 p.drawEllipse(QPointF(x, y), half_w, half_h)
             elif half_w < 6.0 and half_h < 6.0:
                 # Below ~6px, a rotated/dashed outline reads as a plain dot anyway - see
-                # tracker_gui.py's GUI_VERSION 1.0.4 changelog for the profiling behind this.
+                # trackerGui.py's GUI_VERSION 1.0.4 changelog for the profiling behind this.
                 p.setPen(Qt.NoPen)
                 p.setBrush(QBrush(color))
                 p.drawEllipse(QPointF(x, y), half_w, half_h)
@@ -1315,7 +1315,7 @@ class MainWindow(QMainWindow):
         self._set_arduino_controls_enabled(False)
         self._reset_time_travel_inputs_to_now()
 
-        # Same gui_config.json tracker_gui.py reads/writes (CONFIG_PATH, gitignored) - NOT a
+        # Same gui_config.json trackerGui.py reads/writes (CONFIG_PATH, gitignored) - NOT a
         # separate config file for this GUI, so whichever one you last set your location in is
         # what the other picks up too.
         self._location_save_timer = QTimer(self)
@@ -2001,7 +2001,7 @@ class MainWindow(QMainWindow):
 
     def _load_gui_config(self):
         """Loads the single GPS coordinate from CONFIG_PATH (gui_config.json) - the SAME file
-        tracker_gui.py reads/writes, not a separate config for this GUI (see its
+        trackerGui.py reads/writes, not a separate config for this GUI (see its
         _load_gui_config's docstring: only "gps"/"location", a combined "lat, lon" string, is
         stored). Switches to GPS-format mode on load, same as the Tk app."""
         if not os.path.exists(CONFIG_PATH):
@@ -2376,7 +2376,7 @@ class MainWindow(QMainWindow):
         self._force_stop_tracking()
         self._force_full_align_next_start = True
         if self.serial.ser and self.serial.ser.is_open:
-            self.serial.send_mode("SIDEREAL")  # wire protocol is always SIDEREAL - see tracker_gui.py's _on_mode_changed
+            self.serial.send_mode("SIDEREAL")  # wire protocol is always SIDEREAL - see trackerGui.py's _on_mode_changed
         self._log(f"Mode changed to {mode} (tracking stopped)")
         self._update_mode_tracking_label()
 
@@ -2410,7 +2410,7 @@ class MainWindow(QMainWindow):
         set (unlike an unstyled button, which follows the platform's native disabled palette),
         so every colored button that's gated on being connected (see _arduino_widgets/
         _set_arduino_controls_enabled) needs its disabled look spelled out explicitly here or it
-        would stay fully lit while completely unusable. Muted via _muted_hex_color (tracker_shared.py)
+        would stay fully lit while completely unusable. Muted via _muted_hex_color (trackerShared.py)
         rather than losing the color outright, so it still hints what the button normally is, per
         request. Harmless to apply to buttons
         that are never actually disabled (Connect, Refresh, Now/Preview, camera rotation, ...) -
@@ -3185,7 +3185,7 @@ class MainWindow(QMainWindow):
 
         if line.startswith("POS,"):
             # POS,skyRA,skyDEC,targetRA,targetDEC,mountRA,mountDEC,mode,tracking,flipped - see
-            # the matching comment above sendPositionUpdate() in the .ino / tracker_gui.py's
+            # the matching comment above sendPositionUpdate() in the .ino / trackerGui.py's
             # _parse_arduino_line for the full field-by-field breakdown.
             fields = line.split(",")
             try:

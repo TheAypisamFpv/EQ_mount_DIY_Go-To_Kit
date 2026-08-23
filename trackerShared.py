@@ -2,17 +2,17 @@
 """
 EQ Mount Tracker - shared backend
 
-Toolkit-agnostic infrastructure used by tracker_gui.py (the GUI, PySide6/Qt): serial protocol
+Toolkit-agnostic infrastructure used by trackerGui.py (the GUI, PySide6/Qt): serial protocol
 constants, viz/tracking-math constants, the galactic-to-equatorial coordinate helper, and
 SerialHandler (the background serial I/O thread). Nothing in this file imports Qt, Tkinter, or
 any other GUI toolkit - it has no window/widget of its own.
 
 History: until the GUI was ported from Tkinter/CustomTkinter to Qt, this module WAS
-tracker_gui.py itself - the Tkinter EQMountApp class lived directly below everything in this
+trackerGui.py itself - the Tkinter EQMountApp class lived directly below everything in this
 file, and the Qt GUI (then tracker_gui_qt.py) imported this shared portion from it. Once the Qt
 GUI reached full feature parity, the Tkinter GUI was discarded, tracker_gui_qt.py took over the
-tracker_gui.py name, and this shared portion was split out here (under its former filename) so
-the new tracker_gui.py doesn't import from itself.
+trackerGui.py name, and this shared portion was split out here (under its former filename) so
+the new trackerGui.py doesn't import from itself.
 """
 
 import serial
@@ -133,12 +133,12 @@ from typing import Optional
 #            SOLAR_SYSTEM_UPDATE_MS constant, replacing the previous hardcoded 2000/2000ms in
 #            _solar_system_update_tick/solar_system_timer) per request - matches
 #            ISS_DISPLAY_UPDATE_MS's cadence. Both GUIs.
-#   1.0.14 - The Tkinter/CustomTkinter GUI (formerly tracker_gui.py's EQMountApp) is discarded
+#   1.0.14 - The Tkinter/CustomTkinter GUI (formerly trackerGui.py's EQMountApp) is discarded
 #            now that the Qt GUI has full feature parity - it was kept alongside the Qt GUI
 #            purely so the two could be compared during development. tracker_gui_qt.py takes
-#            over the tracker_gui.py name/launcher slot; this shared module (serial protocol,
+#            over the trackerGui.py name/launcher slot; this shared module (serial protocol,
 #            viz/tracking-math constants, SerialHandler) is split out under the file's former
-#            name, tracker_shared.py, so the new tracker_gui.py doesn't import from itself.
+#            name, trackerShared.py, so the new trackerGui.py doesn't import from itself.
 #            requirements.txt drops customtkinter/Pillow (no longer used by anything).
 GUI_VERSION = "1.0.14"
 
@@ -188,7 +188,7 @@ ISS_TRACKING_UPDATE_MS = 50
 ISS_DISPLAY_UPDATE_MS = 1000
 
 # How often Sun/Moon/planet positions are refreshed - see _solar_system_update_tick
-# (tracker_gui.py) / solar_system_timer (tracker_gui_qt.py). Previously 2000ms (plenty for how
+# (trackerGui.py) / solar_system_timer (tracker_gui_qt.py). Previously 2000ms (plenty for how
 # slowly these move against the star background - the Moon, the fastest of them, moves
 # ~33"/min, so even 2s only bounds staleness to ~1"), raised to match ISS_DISPLAY_UPDATE_MS's 1Hz
 # per request - a background-thread ephemeris lookup that's cheap enough not to matter at 2x the

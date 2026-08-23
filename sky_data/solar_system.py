@@ -14,7 +14,7 @@ _SUN_RADIUS_KM = 696000.0
 
 # skyfield's default Loader downloads into the CURRENT WORKING DIRECTORY, not a fixed location -
 # anchoring it to this script's own directory instead means the ephemeris is found/cached in the
-# same place regardless of what directory tracker_gui.py happens to be launched from.
+# same place regardless of what directory trackerGui.py happens to be launched from.
 _DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 
 _eph = None
@@ -38,7 +38,7 @@ def _angular_diameter_deg(distance_km, radius_km):
 
 def _resolve_time(ts, at_time):
     """Returns a skyfield Time for `at_time` (a timezone-aware datetime.datetime), or ts.now() if
-    at_time is None - lets callers (see tracker_gui.py's Time Travel controls) preview positions
+    at_time is None - lets callers (see trackerGui.py's Time Travel controls) preview positions
     at a chosen date/time instead of right now, matching the same simulated time that's also sent
     to the Arduino as its real clock (SerialHandler.send_time()), so the GUI display and the
     physical mount agree on where things are."""

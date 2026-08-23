@@ -1,6 +1,6 @@
 """
 sky_catalog.py - builds/updates the bundled night-sky object catalog (stars + deep-sky objects)
-used by tracker_gui.py's sky visualization.
+used by trackerGui.py's sky visualization.
 
 Data sources (all public, freely licensed):
   - Stars: AT-HYG v3.3, "reduced_m11" subset (871,139 stars: complete to mag +11.0, plus every
@@ -26,7 +26,7 @@ Data sources (all public, freely licensed):
   - Constellation lines: Stellarium's "modern" skyculture, CC BY-SA 4.0.
     https://github.com/Stellarium/stellarium (skycultures/modern/index.json) - each line is a
     polyline of Hipparcos catalog numbers, which join directly against HYG's own "hip" column.
-  - Milky Way band: NOT bundled as data at all - tracker_gui.py draws it analytically from the
+  - Milky Way band: NOT bundled as data at all - trackerGui.py draws it analytically from the
     standard IAU 1958 galactic coordinate system (see _galactic_to_radec/_draw_milky_way there),
     rather than shipping a brightness image/outline asset.
 

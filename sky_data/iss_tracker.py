@@ -50,7 +50,7 @@ def _load_satellite():
 
 def get_current_radec(lat_deg, lon_deg, elevation_m=0.0, at_time=None):
     """Topocentric ISS position, as seen from (lat_deg, lon_deg), at at_time (a timezone-aware
-    datetime.datetime) or right now if at_time is None - see tracker_gui.py's single
+    datetime.datetime) or right now if at_time is None - see trackerGui.py's single
     App._get_effective_utc_now() time source, which every position lookup in the app (Sun, Moon,
     planets, stars/DSOs via LST, and this) is driven from, so a Time Travel preview covers the ISS
     too, not just the solar system.
