@@ -91,7 +91,11 @@ from sky_data import sky_catalog, iss_tracker, solar_system
 #           re-parsing the same handful of hex color strings via a regex-based parser on every
 #           single one of tens of thousands of draw calls - now cached (_pil_ink). New dependency:
 #           Pillow (added to requirements.txt).
-GUI_VERSION = "1.0.4"
+#   1.0.5 - ISS_TRACKING_UPDATE_MS lowered from 20ms (50Hz) to 50ms (20Hz) per request - the
+#           firmware-side rate-derivation/extrapolation (see this constant's own comment) already
+#           made raw update frequency far less important for smoothness than it used to be, so
+#           20Hz is still plenty fresh against the ISS's real path.
+GUI_VERSION = "1.0.5"
 
 BAUD_RATE = 250000
 # GUI poll rate for the serial queue. Fast enough to comfortably keep up with the Arduino's 50Hz
@@ -128,10 +132,10 @@ POS_UPDATE_RATE_MS = int(1000 / POSITION_BROADCAST_HZ)  # 20 ms
 #
 # Smoothness no longer strictly depends on this being fast - firmware 1.8.29+ derives a tracking
 # rate from recent SET_TARGETs and extrapolates continuously between them on-board (the same role
-# SIDEREAL_RATE_DEG_S plays for Earth-rotation compensation) - but per explicit request this is
-# still kept at 50Hz (20ms) for the freshest possible resync against the ISS's real path, not just
-# relying on the extrapolation between updates.
-ISS_TRACKING_UPDATE_MS = 20
+# SIDEREAL_RATE_DEG_S plays for Earth-rotation compensation) - so 20Hz (50ms) is still plenty
+# fresh against the ISS's real path without needing the previous 50Hz. Lowered from 20ms per
+# request (see GUI_VERSION 1.0.5's changelog entry).
+ISS_TRACKING_UPDATE_MS = 50
 
 # Matches the firmware's own SIDEREAL_RATE_DEG_S exactly (EQMountTracker.ino) - used ONLY for the
 # client-side meridian-limit countdown estimate (_update_meridian_warning), never for any
