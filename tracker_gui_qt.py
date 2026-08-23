@@ -505,7 +505,27 @@ class SkyViewWidget(QOpenGLWidget):
         self._draw_crosshairs_and_cardinals(p, w, h, margin, ra_min, ra_max, dec_min, dec_max, ra_span, dec_span)
         self._draw_corner_labels(p, w, h, cx, cy, ra_min, ra_max, dec_min, dec_max)
         self._draw_camera_and_reticle(p, w, h, cx, cy, margin, ra_min, ra_span, dec_min, dec_span, pixels_per_deg)
+        self._draw_hover(p)
         p.end()
+
+    def _draw_hover(self, p):
+        """White ring around whatever mouseMoveEvent last hit-tested (see self._hovered) - the
+        object a double-click would target right now. Ported from EQMountApp._on_viz_mouse_move:
+        the ring always shows for whatever's hovered; the floating name text next to it is
+        skipped only for objects that already have a permanent on-canvas label (Sun/Moon/ISS
+        always do; DSOs do once zoomed in enough - see the "labeled" flag in _draw_sky_objects/
+        _draw_realtime_bodies), since that would just be a redundant second copy of the name.
+        Drawn last (on top of everything else, including the camera/target overlay) so the ring
+        is never hidden by anything it happens to sit near."""
+        hit = self._hovered
+        if hit is None:
+            return
+        hx, hy, r = hit["x"], hit["y"], hit["radius"]
+        p.setPen(QPen(QColor("#ffffff"), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(QPointF(hx, hy), r, r)
+        if not hit.get("labeled"):
+            _draw_centered_text(p, hx + r + 4, hy, hit["name"], self._font_med_bold, QColor("#ffffff"), anchor="w")
 
     def _draw_horizon(self, p, w, h, margin, ra_min, ra_max, dec_min, dec_max):
         ra_span, dec_span = ra_max - ra_min, dec_max - dec_min
@@ -2370,6 +2390,14 @@ class MainWindow(QMainWindow):
         if not self._confirm_risky_slew(ra, dec):
             self._log("GoTo cancelled - target past the meridian limit, not confirmed.")
             return
+        # Same staleness check as _toggle_tracking's SIDEREAL branch: if the RA/DEC boxes no
+        # longer match whatever _select_sky_target last wrote there, this Goto is to a manually
+        # edited point, not the previously named target - clear the badge instead of leaving a
+        # name showing next to coordinates it no longer actually corresponds to.
+        if self.ra_edit.text().strip() != self._target_name_box_ra_str or \
+                self.dec_edit.text().strip() != self._target_name_box_dec_str:
+            self.target_object_name = None
+            self._update_target_name_label()
         self.target_ra, self.target_dec = ra, dec
         self.viz.target_ra, self.viz.target_dec = ra, dec
         self.viz.update()
@@ -2612,11 +2640,16 @@ class MainWindow(QMainWindow):
         self.target_name_label.setText(self.target_object_name or "")
 
     def _select_sky_target(self, ra, dec, source_label, target_name=None):
-        """Ported from EQMountApp._select_sky_target: a double-click or search selection always
-        fills the target fields; if tracking is already active that's all it does (must not
-        interrupt a running session), otherwise it also GoTos there and starts sidereal tracking
-        (sidereal only - a double-click/search result isn't a good way to pick SOLAR/LUNAR,
-        which follow a body rather than a fixed point)."""
+        """Ported from EQMountApp._select_sky_target, plus one addition: selecting the Sun or
+        Moon specifically (double-click or search) now switches Tracking Mode to SOLAR/LUNAR
+        first, so Start Tracking actually follows the real body (and SOLAR still gets its filter-
+        confirmation dialog via _toggle_tracking) instead of being forced into a fixed SIDEREAL
+        point at wherever the Sun/Moon happened to be at selection time. Any other selection
+        (star/DSO/ISS/planet/manual point) still goes through SIDEREAL as before - a double-
+        click/search result isn't a meaningful way to pick a *different* body to follow.
+
+        A double-click or search selection always fills the target fields; if tracking is
+        already active that's all it does (must not interrupt a running session)."""
         self.target_object_name = target_name
         self._update_target_name_label()
         ra_str, dec_str = f"{ra:.4f}", f"{dec:.4f}"
@@ -2632,10 +2665,12 @@ class MainWindow(QMainWindow):
             return
 
         self.target_ra, self.target_dec = ra, dec
-        if self.mode_group.checkedButton() is not self.mode_group.button(0):
-            self.mode_group.button(0).setChecked(True)
-            self._on_mode_changed(0)
-        self._log(f"{source_label}: starting sidereal tracking there")
+        mode_index = {"Sun": 1, "Moon": 2}.get(target_name, 0)  # SIDEREAL=0, SOLAR=1, LUNAR=2
+        mode_name = self.mode_group.button(mode_index).text()
+        if self.mode_group.checkedButton() is not self.mode_group.button(mode_index):
+            self.mode_group.button(mode_index).setChecked(True)
+            self._on_mode_changed(mode_index)
+        self._log(f"{source_label}: starting {mode_name.lower()} tracking there")
         self._toggle_tracking()
         if target_name == "ISS" and self.tracking:
             if not self.viz.iss_enabled:
