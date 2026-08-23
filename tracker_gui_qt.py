@@ -113,17 +113,15 @@ _PALETTE_HUES = {
 }
 PALETTE = {name: _oklch_to_hex(_PALETTE_L, _PALETTE_C, hue) for name, hue in _PALETTE_HUES.items()}
 
-# Two deliberately lower-chroma reds, both still generated via OKLCH (same hue as PALETTE["red"])
-# rather than hand-picked hex, for the two stop-related controls specifically:
-#   - STOP_RED: the ISO 13850 emergency-stop actuator (see its own comment - normally this
-#     convention wants a fully saturated safety red; toned down from that here, still well above
-#     PALETTE's own chroma so it stays clearly the more urgent of the two).
-#   - TRACKING_STOP_RED: the Start/Stop Tracking toggle's "Stop" state - even less saturated,
-#     at PALETTE's own lightness, so it reads as related to but calmer than the actuator.
+# One shared, deliberately lower-chroma red (same hue as PALETTE["red"], still generated via
+# OKLCH, not a hand-picked hex) for BOTH stop-related controls - the ISO 13850 emergency-stop
+# actuator and the Start/Stop Tracking toggle's "Stop" state - so the two read as clearly related
+# rather than two different reds. Toned down from a fully-saturated safety red, but still well
+# above PALETTE's own chroma.
 STOP_RED = _oklch_to_hex(0.55, 0.16, _PALETTE_HUES["red"])
 STOP_RED_HOVER = _oklch_to_hex(0.60, 0.16, _PALETTE_HUES["red"])
 STOP_RED_PRESSED = _oklch_to_hex(0.45, 0.16, _PALETTE_HUES["red"])
-TRACKING_STOP_RED = _oklch_to_hex(_PALETTE_L, 0.07, _PALETTE_HUES["red"])
+TRACKING_STOP_RED = STOP_RED
 
 
 # ============================================================
@@ -1497,6 +1495,34 @@ class MainWindow(QMainWindow):
         left.addWidget(self.sky_search_results)
 
         left.addWidget(self.viz, stretch=1)
+
+        # Styled per ISO 13850 (emergency stop function) actuator convention - RED actuator on a
+        # YELLOW background, the one color pairing that standard exists specifically to make
+        # unambiguous - deliberately NOT drawn from PALETTE (see its module docstring). Actuation
+        # itself already matches the standard's intent too - one click, immediate (_stop ->
+        # _request_tracking_action), no confirmation dialog in the way, same as every other STOP
+        # path in this app (Delete key, panic byte). Placed directly under the sky viz and
+        # centered on it (not the sidebar) - the one control that should be reachable without
+        # hunting for it regardless of what else is going on in the UI, closest to where your
+        # eyes already are while watching the viz.
+        stop_btn = QPushButton("⏹  STOP")
+        stop_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {STOP_RED};
+                color: white;
+                border: 2px solid #FFD500;
+                border-radius: 5px;
+                font-weight: bold;
+                font-size: 11px;
+                padding: 3px 14px;
+            }}
+            QPushButton:hover {{ background-color: {STOP_RED_HOVER}; }}
+            QPushButton:pressed {{ background-color: {STOP_RED_PRESSED}; }}
+        """)
+        stop_btn.setToolTip("Immediately stops tracking/slewing - single action, no confirmation (ISO 13850 emergency stop convention).")
+        stop_btn.clicked.connect(self._stop)
+        left.addWidget(stop_btn, alignment=Qt.AlignHCenter)
+
         self.hover_label = QLabel("Cursor: -")
         self.hover_label.setStyleSheet("color: #9aa; font-family: Consolas;")
         left.addWidget(self.hover_label)
@@ -1592,33 +1618,6 @@ class MainWindow(QMainWindow):
         debug_l.addWidget(self.debug_toggle_btn)
         debug_l.addWidget(dump_btn)
         right.addWidget(debug_box)
-
-        # Styled per ISO 13850 (emergency stop function) actuator convention - RED actuator on a
-        # YELLOW background, the one color pairing that standard exists specifically to make
-        # unambiguous - deliberately NOT drawn from PALETTE (see its module docstring): even
-        # STOP_RED (a bit less saturated than a fully-saturated safety red, but still generated
-        # via OKLCH, not a hand-picked hex) stays well above PALETTE's own muted chroma, so it's
-        # still clearly the more urgent of the two stop-related controls. Actuation itself
-        # already matches the standard's intent too - one click, immediate (_stop ->
-        # _request_tracking_action), no confirmation dialog in the way, same as every other STOP
-        # path in this app (Delete key, panic byte).
-        stop_btn = QPushButton("⏹  STOP")
-        stop_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {STOP_RED};
-                color: white;
-                border: 2px solid #FFD500;
-                border-radius: 6px;
-                font-weight: bold;
-                font-size: 15px;
-                padding: 10px;
-            }}
-            QPushButton:hover {{ background-color: {STOP_RED_HOVER}; }}
-            QPushButton:pressed {{ background-color: {STOP_RED_PRESSED}; }}
-        """)
-        stop_btn.setToolTip("Immediately stops tracking/slewing - single action, no confirmation (ISO 13850 emergency stop convention).")
-        stop_btn.clicked.connect(self._stop)
-        right.addWidget(stop_btn)
 
         log_box = QGroupBox("Status / Messages")
         log_l = QVBoxLayout(log_box)
