@@ -286,7 +286,7 @@ class SkyViewWidget(QOpenGLWidget):
     Coordinate convention matches tracker_gui.py exactly: RA increases LEFTWARD on screen, DEC
     increases upward - see ra_to_x/dec_to_y below, ported 1:1 from EQMountApp's versions."""
 
-    targetPicked = Signal(float, float)   # emitted (ra_deg, dec_deg) on double-click
+    targetPicked = Signal(float, float, object)   # emitted (ra_deg, dec_deg, name_or_None) on double-click
     hoverInfoChanged = Signal(str)        # emitted with a "RA ... DEC ... | name (extra)" string
     viewModeChanged = Signal(str)         # emitted whenever view_mode changes FROM WITHIN this
                                            # widget (drag/middle-click) - see _set_view_mode -
@@ -1001,19 +1001,25 @@ class SkyViewWidget(QOpenGLWidget):
             self._pan_last = None
 
     def mouseDoubleClickEvent(self, event):
-        """Double-click: target whatever's hovered (precise catalog RA/DEC), or the raw cursor
-        sky position otherwise - same behavior as EQMountApp._on_viz_double_click."""
+        """Double-click: target whatever's hovered (precise catalog RA/DEC AND its name - see
+        _hovered, built by the same hit-test mouseMoveEvent uses for the hover ring), or the raw
+        cursor sky position (no name) otherwise - same behavior as EQMountApp._on_viz_double_click.
+        The name matters here (not just RA/DEC) so the target-name badge shows the right thing
+        for ANY double-clicked object, not just ones picked via the Find box - previously this
+        signal only carried ra/dec, so double-clicking a star/DSO/planet/Sun/Moon in the viz
+        itself never populated the name, regardless of what was actually clicked."""
         w, h = max(200, self.width()), max(150, self.height())
         margin = 12
         ra_min, ra_max, dec_min, dec_max = self.view_bounds()
         ra_span, dec_span = ra_max - ra_min, dec_max - dec_min
         if self._hovered is not None:
-            ra, dec = self._hovered["ra"], self._hovered["dec"]
+            ra, dec, name = self._hovered["ra"], self._hovered["dec"], self._hovered["name"]
         else:
             pos = event.position()
             ra = self.x_to_ra(pos.x(), w, margin, ra_min, ra_span) % 360.0
             dec = max(-90.0, min(90.0, self.y_to_dec(pos.y(), h, margin, dec_min, dec_span)))
-        self.targetPicked.emit(ra, dec)
+            name = None
+        self.targetPicked.emit(ra, dec, name)
 
     def leaveEvent(self, event):
         self._hovered = None
@@ -1235,7 +1241,8 @@ class MainWindow(QMainWindow):
 
         self.viz = SkyViewWidget()
         self.viz.get_time_fn = self._get_effective_utc_now
-        self.viz.targetPicked.connect(lambda ra, dec: self._select_sky_target(ra, dec, "Viz double-click"))
+        self.viz.targetPicked.connect(
+            lambda ra, dec, name: self._select_sky_target(ra, dec, "Viz double-click", target_name=name))
         self.viz.hoverInfoChanged.connect(self._on_hover_info)
         self.viz.viewModeChanged.connect(self._on_viz_view_mode_changed)
 
