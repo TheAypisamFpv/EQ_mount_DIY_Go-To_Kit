@@ -838,8 +838,8 @@ float OBS_LON_DEG = -97.1553f; // Positive east
 //            (wrong LAT/LON received, wrong time, or a genuine LST/RA formula error) from the
 //            mount's physical re-homing simply not being precisely due East (a procedure/hardware
 //            precision issue no firmware change can fix).
-//   1.8.44 - FOUND IT: the 1.8.43 diagnostic line (UTC:2026-7-17 20:30:0.38, LAT:49.530696,
-//            LON:0.989518, LST:206.739517) let this be root-caused for real - hand-computing the
+//   1.8.44 - FOUND IT: the 1.8.43 diagnostic line (UTC:2026-7-17 20:30:0.38, LAT:25.9978,
+//            LON:-97.1553, LST:206.739517) let this be root-caused for real - hand-computing the
 //            correct LST from those exact inputs gives 244.166419, not 206.739517: a genuine
 //            ~37.4 degree math bug, not a location/timing race after all (that 1.8.40 fix was
 //            still correct and needed, just not the whole story). Root cause: on the ATmega2560
@@ -976,7 +976,28 @@ float OBS_LON_DEG = -97.1553f; // Positive east
 //            change: a connected GUI always overwrites it before it matters, EEPROM still
 //            wins on boot when previously saved, and sun/moon topocentric corrections just
 //            use the new placeholder until then.
-#define FIRMWARE_VERSION "1.8.53"
+//   1.8.54 - Fixed status lines being silently LOST when printed while an incremental POS
+//            line was mid-flight. The periodic POS broadcast is spread across several loop()
+//            iterations (one field each, see updatePositionBroadcast()), so any other whole
+//            line printed in between landed INSIDE it on the wire: the reader/GUI saw one
+//            hybrid line like "POS,322.6218STATUS:TRACKING_STARTED,AXIS:DEC", parsed it as a
+//            malformed POS line, and the status disappeared. At 50Hz POS occupies most of
+//            the wire, so roughly half of all statuses were eaten - most visibly the final
+//            STATUS:TRACKING_STARTED of an alignment, which left the GUI stuck on its
+//            ALIGNING badge (and never reaching STABLE/SETTLING) while the mount was in fact
+//            tracking perfectly, which looked exactly like an alignment-sequence hang.
+//            Also ate DEBUG:CMD_ACTION echoes (random "START not yet confirmed" retries) and
+//            could garble DEBUG dumps. Fix: new completePendingPosLine() finishes any
+//            in-progress POS line from its already-latched posSend_* snapshot before a new
+//            whole line prints; called from sendStatus(), dumpDebugState(),
+//            parseAndExecuteCommand() (covers the CMD_ACTION echo and every handler print)
+//            and sendPositionUpdateNow() (which previously ABANDONED the pending line,
+//            leaving a truncated POS fragment). Worst case blocks loop() ~4ms to drain the
+//            TX buffer - harmless to stepping (timer-ISR-driven). No protocol change: line
+//            formats are identical, they just can no longer interleave. The GUI also
+//            recovers such hybrid lines defensively (GUI 1.0.16), so pre-1.8.54 boards keep
+//            working with a current GUI.
+#define FIRMWARE_VERSION "1.8.54"
 
 // Sidereal rate (deg/sec on sky for RA axis). Approx 15.041 arcsec/s.
 const float SIDEREAL_RATE_DEG_S = 0.004178f;
@@ -1032,6 +1053,7 @@ void loadLocationFromEEPROM();
 void queryLocation();
 void readSerialCommands();
 void sendStatus(const char* action, const char* axis, float error);
+void completePendingPosLine();
 void updatePositionBroadcast();
 void sendPositionUpdateNow();
 void printFixed4(float v);
@@ -2080,6 +2102,7 @@ void computeTargetFromMode(float &raOut, float &decOut) {
 // ============================================================
 
 void sendStatus(const char* action, const char* axis, float error = -1.0) {
+  completePendingPosLine();
   Serial.print("STATUS:");
   Serial.print(action);
   Serial.print(",AXIS:");
@@ -2230,6 +2253,57 @@ void updatePositionBroadcast() {
   }
 }
 
+// Completes an in-progress incremental POS line in one shot. The periodic POS broadcast is
+// spread across several loop() iterations (one field each, see updatePositionBroadcast()), so
+// any OTHER whole line printed while a POS line is mid-flight (a status, a debug echo, a dump)
+// lands INSIDE it on the wire: the reader sees one hybrid line like
+// "POS,322.6218STATUS:TRACKING_STARTED,AXIS:DEC" - the parser drops it as a malformed POS
+// line and the status silently disappears. That ate the final STATUS:TRACKING_STARTED of an
+// alignment roughly half the time (POS occupies most of the wire at 50Hz), leaving the GUI
+// stuck on its ALIGNING badge while tracking actually ran fine - see the 1.8.54 changelog.
+// Every whole-line print site outside setup() now calls this first: the pending POS line gets
+// finished from its already-latched posSend_* snapshot (so it stays internally consistent,
+// exactly the reason that snapshot exists), then the new line prints after it, intact.
+// Worst case this blocks loop() for the time to drain ~100 bytes of TX buffer (~4ms at
+// 250000 baud) - harmless: step pulses come from the timer ISRs, immune to loop() timing.
+void completePendingPosLine() {
+  if (posSendState == POS_SEND_IDLE) return;
+  switch (posSendState) {
+    // Deliberate fall-through: every remaining field prints in order, exactly as the
+    // per-state cases in updatePositionBroadcast() would have, just all at once.
+    case POS_SEND_RADEC:
+      Serial.print(',');
+      printFixed4(posSend_skyDEC);
+    case POS_SEND_TARGET_RA:
+      Serial.print(',');
+      printFixed4(posSend_targetRA);
+    case POS_SEND_TARGET_DEC:
+      Serial.print(',');
+      printFixed4(posSend_targetDEC);
+    case POS_SEND_MOUNT_RA:
+      Serial.print(',');
+      printFixed4(posSend_mountRA);
+    case POS_SEND_MOUNT_DEC:
+      Serial.print(',');
+      printFixed4(posSend_mountDEC);
+    case POS_SEND_MODE: {
+      Serial.print(',');
+      switch (currentMode) {
+        case MODE_SIDEREAL: Serial.print('S'); break;
+        case MODE_SOLAR:    Serial.print('O'); break;
+        case MODE_LUNAR:    Serial.print('L'); break;
+      }
+      Serial.print(',');
+      Serial.print(trackingActive ? '1' : '0');
+      Serial.print(',');
+      Serial.println(telescopeFlipped ? '1' : '0');
+    } break;
+    default:
+      break;
+  }
+  posSendState = POS_SEND_IDLE;
+}
+
 // Synchronous, immediate, full POS send - same field layout/order as updatePositionBroadcast()
 // but not spread across loop() iterations. Only for rare one-off events (boot, SET_TIME,
 // SET_LOCATION, offset-applied, etc.) that need the GUI to see fresh state right away and aren't
@@ -2238,7 +2312,10 @@ void updatePositionBroadcast() {
 // updatePositionBroadcast()). Also resets any in-progress incremental send back to idle, since
 // this supersedes it with a complete, up-to-date message anyway.
 void sendPositionUpdateNow() {
-  posSendState = POS_SEND_IDLE;
+  // Finish any in-progress incremental POS line first (1.8.54) rather than just abandoning
+  // it mid-line - an abandoned line left a truncated "POS,a,b,c" fragment on the wire that
+  // the GUI had to silently drop.
+  completePendingPosLine();
   unsigned long now = millis();
   float mountRA = axisRA.getCurrentAngle();
   float mountDEC = axisDEC.getCurrentAngle();
@@ -2294,6 +2371,7 @@ float estimateMovementTime(float deltaDeg, float speedDegS, float accelDegS2 = 1
 // GUI already logs any line starting with "DEBUG:"
 // ============================================================
 void dumpDebugState(const char* trigger) {
+  completePendingPosLine();
   unsigned long now = millis();
   float mRA = axisRA.getCurrentAngle();
   float mDEC = axisDEC.getCurrentAngle();
@@ -2378,6 +2456,7 @@ void dumpDebugState(const char* trigger) {
 }
 
 void parseAndExecuteCommand(char* cmd) {
+  completePendingPosLine();
   // Expected formats:
   // CMD,MODE,SIDEREAL
   // CMD,MODE,SOLAR
