@@ -140,7 +140,13 @@ from typing import Optional
 #            viz/tracking-math constants, SerialHandler) is split out under the file's former
 #            name, trackerShared.py, so the new trackerGui.py doesn't import from itself.
 #            requirements.txt drops customtkinter/Pillow (no longer used by anything).
-GUI_VERSION = "1.0.14"
+#   1.0.15 - DEFAULT_LAT/DEFAULT_LON (the fallback used when gui_config.json is missing/unreadable
+#            or the location fields fail to parse) changed from Royal Observatory Greenwich
+#            (51.4769, -0.0005) to SpaceX Starbase, Texas (25.9978, -97.1553) per request - every
+#            coordinate in the repo now points at Starbase so no real observer location is
+#            implied by defaults, config, logs or tests. Only affects the no-config/no-parse
+#            fallback path; a loaded gui_config.json always wins.
+GUI_VERSION = "1.0.15"
 
 BAUD_RATE = 250000
 # GUI poll rate for the serial queue. Fast enough to comfortably keep up with the Arduino's 50Hz
@@ -292,8 +298,8 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_conf
 # landmark, not anyone's private location. Set your actual coordinates via the GPS/Lat-Lon
 # fields in the GUI; they're saved locally to gui_config.json (which is gitignored), never
 # committed here.
-DEFAULT_LAT = 51.4769
-DEFAULT_LON = -0.0005
+DEFAULT_LAT = 25.9978
+DEFAULT_LON = -97.1553
 
 # Visualization
 TELESCOPE_FOCAL_LENGTH_MM = 750
