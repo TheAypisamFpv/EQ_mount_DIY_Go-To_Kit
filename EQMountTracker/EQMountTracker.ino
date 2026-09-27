@@ -189,13 +189,13 @@ const float SAFE_TARGET_DEC_DEG    = 0.0f;
 const float LEAD_COEFFICIENT       = 2.0f;   // Extra margin (seconds worth) for lead time calc to ensure we arrive early enough
 
 // Default observer location (used by SolTrack for topocentric corrections where relevant).
-// Placeholder only - Royal Observatory Greenwich (public astronomical landmark, home of the
-// Prime Meridian), deliberately NOT a real/private address. Overwritten by CMD,SET_LOCATION
+// Placeholder only - SpaceX Starbase, Boca Chica, Texas (public rocket launch site),
+// deliberately NOT a real/private address. Overwritten by CMD,SET_LOCATION
 // from the GUI (which then persists it to EEPROM via CMD,SAVE_LOCATION_EEPROM) - update via
 // that, not by editing this default.
 // (Ground safeguard removed; these are still used for sun/moon calculations.)
-float OBS_LAT_DEG = 51.4769f;   // Positive north
-float OBS_LON_DEG = -0.0005f;   // Positive east
+float OBS_LAT_DEG = 25.9978f;  // Positive north
+float OBS_LON_DEG = -97.1553f; // Positive east
 
 // EEPROM storage for location persistence across power cycles
 #define EEPROM_LAT_ADDR 0
@@ -968,7 +968,15 @@ float OBS_LON_DEG = -0.0005f;   // Positive east
 //            disabled - GOTO/START_TRACKING/continuous tracking are never refused or stopped for
 //            meridian risk while off. For advanced users with confirmed mechanical clearance past
 //            the meridian; leave enabled otherwise.
-#define FIRMWARE_VERSION "1.8.52"
+//   1.8.53 - Default observer location (OBS_LAT_DEG/OBS_LON_DEG, the placeholder used only
+//            until CMD,SET_LOCATION arrives, e.g. standalone/EEPROM-empty boot) changed from
+//            Royal Observatory Greenwich (51.4769, -0.0005) to SpaceX Starbase, Texas
+//            (25.9978, -97.1553) per request - every coordinate in this repo now points at
+//            Starbase so no real observer location is implied anywhere. Pure placeholder
+//            change: a connected GUI always overwrites it before it matters, EEPROM still
+//            wins on boot when previously saved, and sun/moon topocentric corrections just
+//            use the new placeholder until then.
+#define FIRMWARE_VERSION "1.8.53"
 
 // Sidereal rate (deg/sec on sky for RA axis). Approx 15.041 arcsec/s.
 const float SIDEREAL_RATE_DEG_S = 0.004178f;
