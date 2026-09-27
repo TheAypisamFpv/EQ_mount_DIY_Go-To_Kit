@@ -159,7 +159,17 @@ from typing import Optional
 #            line, drop the truncated POS prefix (it was malformed anyway). Companion to the
 #            firmware-side fix (FIRMWARE_VERSION 1.8.54, completePendingPosLine), which
 #            makes interleaving impossible; this keeps old boards working with a new GUI.
-GUI_VERSION = "1.0.16"
+#   1.0.17 - The 60s Arduino clock-resync timer now skips its tick while an alignment slew
+#            is in flight (self.tracking and _align_phase == ALIGNING). CMD,SET_TIME makes the
+#            firmware emit a burst (status + immediate full POS), and that burst landing
+#            exactly as the alignment completes can overrun the 16U2 USB-serial buffer and
+#            drop the final STATUS:TRACKING_STARTED's bytes - unrecoverable by any parser
+#            (the 1.0.16 recovery fixes interleaved lines, not missing bytes). Observed on
+#            hardware as every alignment started ~60s after connect losing exactly that line
+#            (badge stuck on ALIGNING while tracking ran fine); a stop/restart recovered it.
+#            Cost of the skip: at most 60s of Arduino clock drift, corrected by the next
+#            tick. Kept regardless of firmware version since the loss is at the USB-CDC level.
+GUI_VERSION = "1.0.17"
 
 BAUD_RATE = 250000
 # GUI poll rate for the serial queue. Fast enough to comfortably keep up with the Arduino's 50Hz

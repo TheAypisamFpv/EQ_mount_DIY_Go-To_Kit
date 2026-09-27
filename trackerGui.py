@@ -1331,7 +1331,7 @@ class MainWindow(QMainWindow):
         self.poll_timer.start(POLL_INTERVAL_MS)
 
         self.resync_timer = QTimer(self)
-        self.resync_timer.timeout.connect(lambda: self.serial.send_time_if_connected())
+        self.resync_timer.timeout.connect(self._on_resync_timer)
         self.resync_timer.start(60000)
 
         self.solar_timer = QTimer(self)
@@ -2708,6 +2708,26 @@ class MainWindow(QMainWindow):
         self._force_stop_tracking()
         self.serial.send_home_axes()
         self._log("Rewind Axes sent: RA/DEC -> mount angle 0°, no tracking.")
+
+    def _on_resync_timer(self):
+        """Periodic Arduino clock resync (every 60s) - SKIPPED while an alignment
+        slew is in flight. CMD,SET_TIME makes the firmware emit a burst (a status line
+        plus an immediate full POS), and when that burst lands exactly as the alignment
+        completes it can overrun the 16U2 USB-serial buffer and drop the final
+        STATUS:TRACKING_STARTED's bytes - a loss no parser can recover (the 1.0.16
+        hybrid-line recovery fixes interleaving, not missing bytes). Observed on
+        hardware as every alignment started ~60s after connect losing exactly that
+        line, leaving the stability badge stuck on ALIGNING while tracking ran fine;
+        a stop/restart re-established it, but only after the mount had tracked blind
+        for a while. Skipping the resync in that one window costs at most 60s of
+        Arduino clock drift (its crystal error over a minute is negligible) and the
+        next tick resyncs normally. Firmware 1.8.54 made POS lines atomic, but this
+        byte loss is at the USB-CDC level, so the skip stays regardless of firmware
+        version.
+        """
+        if self.tracking and self._align_phase == "ALIGNING":
+            return
+        self.serial.send_time_if_connected()
 
     def _manual_resync(self):
         if self.serial.send_time_if_connected():
