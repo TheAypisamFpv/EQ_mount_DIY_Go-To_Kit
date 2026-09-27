@@ -3108,6 +3108,29 @@ class MainWindow(QMainWindow):
         if not line:
             return
 
+        # Firmware <= 1.8.53 can print a whole status/debug line while an incremental POS
+        # line is mid-flight (one POS field per loop() iteration), landing it INSIDE the POS
+        # line on the wire: this reader then sees one hybrid line like
+        # "POS,322.6218STATUS:TRACKING_STARTED,AXIS:DEC". POS fields are pure
+        # digits/signs/commas, so an embedded "STATUS:"/"DEBUG:" can only be such a
+        # swallowed line - recover it and process it normally, since at 50Hz POS occupies
+        # most of the wire and roughly half of all statuses were otherwise silently eaten
+        # (most visibly the final TRACKING_STARTED of an alignment, which left the stability
+        # badge stuck on ALIGNING while the mount actually tracked fine). The truncated POS
+        # prefix is dropped - it was malformed and would have been ignored anyway; the
+        # orphaned POS remainder arrives as its own next line, matches no parser branch, and
+        # is ignored exactly as before. Firmware 1.8.54+ makes interleaving impossible
+        # (completePendingPosLine); this recovery keeps pre-1.8.54 boards working too.
+        if line.startswith("POS,"):
+            idx = -1
+            for marker in ("STATUS:", "DEBUG:"):
+                i = line.find(marker, 4)
+                if i != -1 and (idx == -1 or i < idx):
+                    idx = i
+            if idx != -1:
+                self._parse_arduino_line(line[idx:])
+                return
+
         if line.startswith("DEBUG:"):
             self._log(line)
             # Earliest possible proof the Arduino received a START - see

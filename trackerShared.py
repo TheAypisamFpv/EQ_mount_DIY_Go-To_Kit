@@ -146,7 +146,20 @@ from typing import Optional
 #            coordinate in the repo now points at Starbase so no real observer location is
 #            implied by defaults, config, logs or tests. Only affects the no-config/no-parse
 #            fallback path; a loaded gui_config.json always wins.
-GUI_VERSION = "1.0.15"
+#   1.0.16 - _parse_arduino_line now defensively recovers status/debug lines that firmware
+#            <= 1.8.53 printed while an incremental POS line was mid-flight: the reader saw
+#            one hybrid line like "POS,322.6218STATUS:TRACKING_STARTED,AXIS:DEC", parsed it
+#            as a malformed POS line, and the status silently disappeared. At 50Hz POS
+#            occupies most of the wire, so roughly half of all statuses were eaten - most
+#            visibly the final TRACKING_STARTED of an alignment, which left the stability
+#            badge stuck on ALIGNING (never SETTLING/STABLE) while the mount actually tracked
+#            perfectly; also caused random "START not yet confirmed" retries (swallowed
+#            DEBUG:CMD_ACTION echoes). An embedded STATUS:/DEBUG: marker cannot occur in a
+#            legitimate POS field, so the recovery is unambiguous: process the embedded
+#            line, drop the truncated POS prefix (it was malformed anyway). Companion to the
+#            firmware-side fix (FIRMWARE_VERSION 1.8.54, completePendingPosLine), which
+#            makes interleaving impossible; this keeps old boards working with a new GUI.
+GUI_VERSION = "1.0.16"
 
 BAUD_RATE = 250000
 # GUI poll rate for the serial queue. Fast enough to comfortably keep up with the Arduino's 50Hz
