@@ -39,7 +39,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QComboBox, QLabel, QLineEdit, QTextEdit, QRadioButton, QButtonGroup,
-    QGroupBox, QCheckBox, QListWidget, QMessageBox, QFrame,
+    QGroupBox, QCheckBox, QListWidget, QMessageBox, QFrame, QMenu,
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
@@ -56,9 +56,9 @@ from trackerShared import (
     POS_UPDATE_RATE_MS, POSITION_BROADCAST_HZ, DEFAULT_LAT, DEFAULT_LON,
     SIDEREAL_RATE_DEG_S, MERIDIAN_LIMIT_WARNING_S, MERIDIAN_LIMIT_URGENT_S,
     CONFIG_PATH, ISS_TRACKING_UPDATE_MS, ISS_DISPLAY_UPDATE_MS, SOLAR_SYSTEM_UPDATE_MS, _muted_hex_color,
-    GUI_VERSION,
+    GUI_VERSION, SPACEX_POLL_ACTIVE_S, SPACEX_POLL_IDLE_S,
 )
-from sky_data import sky_catalog, iss_tracker, solar_system
+from sky_data import sky_catalog, iss_tracker, solar_system, spacex_tracker
 
 
 def _read_ino_firmware_version():
@@ -340,6 +340,10 @@ class SkyViewWidget(QOpenGLWidget):
         self.min_dso_size_filter_enabled = False
         self.min_dso_size_px = 100.0
         self.iss_enabled = False  # gates the ISS marker; background fetch runs regardless (cheap)
+        # SpaceX vehicles picked in the Vehicles menu (labels like "Dragon crew13") - positions are
+        # computed for every live vehicle regardless (Find/targeting), only these get a marker.
+        self.spacex_shown = set()
+        self.spacex_positions = {}  # label -> (ra, dec, above_horizon, hover_extra)
 
         # Real-time bodies - populated by MainWindow's background update timers
         self.iss_ra = self.iss_dec = None
@@ -783,6 +787,26 @@ class SkyViewWidget(QOpenGLWidget):
                                         "extra": "above horizon" if self.iss_above else "below horizon",
                                         "labeled": True})
 
+        for vehicle_label, (vehicle_ra, vehicle_dec, vehicle_above, vehicle_extra) in self.spacex_positions.items():
+            if vehicle_label not in self.spacex_shown:
+                continue
+            if not (ra_min <= vehicle_ra <= ra_max and dec_min <= vehicle_dec <= dec_max):
+                continue
+            marker_x = self.ra_to_x(vehicle_ra, w, margin, ra_min, ra_span)
+            marker_y = self.dec_to_y(vehicle_dec, h, margin, dec_min, dec_span)
+            vehicle_color = QColor(PALETTE["cyan"] if vehicle_above else _muted_hex_color(PALETTE["cyan"]))
+            marker_half = 5
+            p.setPen(QPen(vehicle_color, 1.5))
+            p.setBrush(Qt.NoBrush)
+            # Diamond instead of the ISS's circle, so a docked Dragon (same spot) stays readable.
+            p.drawPolygon(QPolygonF([QPointF(marker_x, marker_y - marker_half), QPointF(marker_x + marker_half, marker_y),
+                                     QPointF(marker_x, marker_y + marker_half), QPointF(marker_x - marker_half, marker_y)]))
+            # Label below the marker (the ISS's sits above), so a docked pair doesn't overprint.
+            _draw_centered_text(p, marker_x, marker_y + marker_half + 9, vehicle_label, self._font_small_bold, vehicle_color)
+            self._visible_hits.append({"x": marker_x, "y": marker_y, "ra": vehicle_ra, "dec": vehicle_dec,
+                                        "radius": 12.0, "name": vehicle_label,
+                                        "extra": vehicle_extra, "labeled": True})
+
         if self.sun_ra is not None and ra_min <= self.sun_ra <= ra_max and dec_min <= self.sun_dec <= dec_max:
             sx = self.ra_to_x(self.sun_ra, w, margin, ra_min, ra_span)
             sy = self.dec_to_y(self.sun_dec, h, margin, dec_min, dec_span)
@@ -1208,6 +1232,142 @@ class _IssTrackingThread(QThread):
         self._wake.set()
 
 
+# After a failed ISS TLE refresh, wait this long before the SpaceX fetch thread asks CelesTrak again.
+TLE_REFRESH_RETRY_S = 3600.0
+
+
+class _SpacexTrackingThread(QThread):
+    """Live SpaceX Dragon/Starship positions - same persistent-loop pattern as _IssTrackingThread
+    (see its docstring), with one split: the feed only changes about every 30s, so the network
+    fetch runs on a short-lived side thread whenever a poll is due, and this loop only does the
+    cheap local part (propagate the latest estimate to "now", convert to RA/DEC). A slow or hung
+    HTTP request therefore never stalls the ISS_TRACKING_UPDATE_MS SET_TARGET stream.
+
+    Polls even while no SpaceX vehicle is shown (SPACEX_POLL_IDLE_S) so the Vehicles menu knows
+    what is in flight and the two-sample estimate is already warm when one gets picked. Feed and
+    compute failures are logged once per failure streak, not every cycle (field use is often
+    offline)."""
+    updated = Signal(object)       # ({label: (ra, dec, above, sample_age_s)}, is_full_set)
+    availability = Signal(object)  # [(label, kind, docked_to_iss, has_estimate)] - see SpacexFleet.available
+    log_message = Signal(str)
+
+    def __init__(self, get_lat_lon_fn, get_time_fn, state_fn, parent=None):
+        super().__init__(parent)
+        self.get_lat_lon_fn = get_lat_lon_fn
+        self.get_time_fn = get_time_fn
+        self.state_fn = state_fn  # () -> (tracked_label or None, any_shown: bool, interval_ms: int)
+        self.fleet = spacex_tracker.SpacexFleet()
+        self._feed_clients = {
+            spacex_tracker.KIND_DRAGON: spacex_tracker.FeedClient(spacex_tracker.DRAGON_FEED_URL),
+            spacex_tracker.KIND_STARSHIP: spacex_tracker.FeedClient(spacex_tracker.STARSHIP_FEED_URL),
+        }
+        self._feed_failing = {kind: False for kind in self._feed_clients}
+        self._tle_retry_after = 0.0  # see _fetch_feeds - CelesTrak backoff after a failed refresh
+        self._fetch_in_flight = False
+        self._last_fetch_start = 0.0
+        self._last_full_compute = 0.0
+        self._last_availability = None
+        self._compute_errors = {}  # label -> last logged error text
+        self._stop_requested = False
+        self._wake = threading.Event()
+
+    def run(self):
+        while not self._stop_requested:
+            tracked_label, any_shown, interval_ms = self.state_fn()
+            now = time.time()
+            poll_interval_s = SPACEX_POLL_ACTIVE_S if (any_shown or tracked_label) else SPACEX_POLL_IDLE_S
+            if not self._fetch_in_flight and now - self._last_fetch_start >= poll_interval_s:
+                self._fetch_in_flight = True
+                self._last_fetch_start = now
+                threading.Thread(target=self._fetch_feeds, daemon=True).start()
+
+            available = self.fleet.available()
+            if available != self._last_availability:
+                self._last_availability = available
+                self.availability.emit(available)
+
+            # Every live vehicle once per ISS_DISPLAY_UPDATE_MS (markers, Find, hover); in between,
+            # only the actively tracked one, at the fast cadence.
+            is_full_set = now - self._last_full_compute >= ISS_DISPLAY_UPDATE_MS / 1000.0
+            if is_full_set:
+                self._last_full_compute = now
+                labels = [row[0] for row in available if row[3]]
+            else:
+                labels = [tracked_label] if tracked_label else []
+            if is_full_set or labels:
+                self.updated.emit((self._compute_positions(labels), is_full_set))
+
+            interval_s = (interval_ms if tracked_label else ISS_DISPLAY_UPDATE_MS) / 1000.0
+            wait_s = max(0.001, interval_s - (time.time() % interval_s))
+            self._wake.wait(timeout=wait_s)
+            self._wake.clear()
+
+    def _compute_positions(self, labels):
+        """A label whose estimate is missing or fails is simply left out - the GUI treats a
+        tracked label missing from an update as "lost" (see MainWindow._on_spacex_updated)."""
+        positions = {}
+        if not labels:
+            return positions
+        lat, lon = self.get_lat_lon_fn()
+        at_time = self.get_time_fn()
+        at_unix_time = at_time.timestamp()
+        for label in labels:
+            try:
+                estimate = self.fleet.estimate(label, at_unix_time)
+                if estimate is None:
+                    continue
+                r_ecef, sample_age_s = estimate
+                ra, dec, _alt, _az, above = spacex_tracker.get_radec_from_ecef(r_ecef, lat, lon, at_time)
+                positions[label] = (ra, dec, above, sample_age_s)
+                self._compute_errors.pop(label, None)
+            except Exception as error:
+                if self._compute_errors.get(label) != str(error):
+                    self._compute_errors[label] = str(error)
+                    self.log_message.emit(f"{label} position update failed: {error}")
+        return positions
+
+    def _fetch_feeds(self):
+        def iss_state_at(unix_time):
+            return iss_tracker.get_ecef_state(datetime.fromtimestamp(unix_time, timezone.utc))
+        try:
+            for kind, client in self._feed_clients.items():
+                try:
+                    document = client.fetch()
+                    if document is not None:  # None = 304, body unchanged
+                        if kind == spacex_tracker.KIND_DRAGON and time.time() >= self._tle_retry_after:
+                            try:
+                                iss_tracker.ensure_tle_current()  # for anchor_dragon_sample_time
+                            except Exception:
+                                # Anchoring falls back to the feed's own gps_time (a cached TLE,
+                                # even a stale one, still anchors). Don't hit CelesTrak again on
+                                # every 10-30s poll while it is down or rate limiting.
+                                self._tle_retry_after = time.time() + TLE_REFRESH_RETRY_S
+                            samples = [spacex_tracker.anchor_dragon_sample_time(sample, iss_state_at)
+                                       for sample in spacex_tracker.parse_dragon_feed(document)]
+                        else:
+                            samples = spacex_tracker.parse_starship_feed(document)
+                        for label, reason in self.fleet.ingest_feed(kind, samples):
+                            self.log_message.emit(f"{label}: estimate restarted ({reason}) - "
+                                                  "position resumes after the next sample")
+                    if self._feed_failing[kind]:
+                        self._feed_failing[kind] = False
+                        self.log_message.emit(f"SpaceX {kind} feed reachable again.")
+                except Exception as error:
+                    if not self._feed_failing[kind]:
+                        self._feed_failing[kind] = True
+                        self.log_message.emit(f"SpaceX {kind} feed fetch failed: {error} "
+                                              "(keeping last samples, retrying)")
+        finally:
+            self._fetch_in_flight = False
+
+    def wake(self):
+        self._wake.set()
+
+    def stop(self):
+        self._stop_requested = True
+        self._wake.set()
+
+
 def _run_in_thread(worker):
     """Starts `worker.run()` on a daemon thread. The caller is responsible for keeping `worker`
     referenced (see MainWindow._workers) until it reports back - nothing here holds one, and a
@@ -1268,6 +1428,9 @@ class MainWindow(QMainWindow):
         self._last_pos_ui_update = 0.0
         self._workers = []  # keeps background QObjects referenced while their thread runs
         self._search_index = []  # built alongside the catalog - see _on_catalog_loaded
+        self._spacex_available = []         # latest SpacexFleet.available() rows
+        self._spacex_labels_seen = set()    # every SpaceX label seen this session (target identity)
+        self._spacex_target_lost = False    # see _on_spacex_updated
         self._log_history = []  # (msg, masked_msg) pairs - see _log/_rebuild_log_display
         self._sky_search_matches = []
         self.target_object_name = None  # see _select_sky_target
@@ -1346,6 +1509,13 @@ class MainWindow(QMainWindow):
         self.iss_thread.failed.connect(lambda err: self._log(f"ISS update failed: {err}"))
         self.iss_thread.start()
 
+        self.spacex_thread =_SpacexTrackingThread(self._get_lat_lon, self._get_effective_utc_now,
+                                                   self._spacex_thread_state)
+        self.spacex_thread.updated.connect(self._on_spacex_updated)
+        self.spacex_thread.availability.connect(self._on_spacex_availability)
+        self.spacex_thread.log_message.connect(self._log)
+        self.spacex_thread.start()
+
         self.meridian_timer = QTimer(self)
         self.meridian_timer.timeout.connect(self._update_meridian_warning)
         self.meridian_timer.start(500)
@@ -1389,7 +1559,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.iss_thread.stop()
+        self.spacex_thread.stop()
         self.iss_thread.wait(2000)
+        self.spacex_thread.wait(2000)
         super().closeEvent(event)
 
     def _get_effective_utc_now(self) -> datetime:
@@ -1656,9 +1828,14 @@ class MainWindow(QMainWindow):
         self.view_mode_btn = QPushButton("View: Free")
         self.view_mode_btn.clicked.connect(self._cycle_view_mode)
         self._update_view_mode_btn_style()
-        self.iss_btn = QPushButton("ISS: OFF")
-        self.iss_btn.clicked.connect(self._toggle_iss)
-        self._style_toggle_btn(self.iss_btn, False)
+        # Vehicles dropdown (was a plain ISS on/off button): ISS plus every live SpaceX vehicle,
+        # each checkable - rebuilt every time it opens since the SpaceX set changes per mission.
+        # A QPushButton with a menu (not a QToolButton) so _style_toggle_btn's styling applies.
+        self.vehicles_btn = QPushButton()
+        self.vehicles_menu = QMenu(self.vehicles_btn)
+        self.vehicles_menu.aboutToShow.connect(self._rebuild_vehicles_menu)
+        self.vehicles_btn.setMenu(self.vehicles_menu)
+        self._update_vehicles_btn()
         self.const_btn = QPushButton("Constellations: ON")
         self.const_btn.clicked.connect(self._toggle_constellations)
         self._style_toggle_btn(self.const_btn, True)  # constellations_enabled defaults True
@@ -1680,7 +1857,7 @@ class MainWindow(QMainWindow):
         self.cam_rot_edit.setFixedWidth(50)
         self.cam_rot_edit.editingFinished.connect(self._on_cam_rot_commit)
         self.find_edit = QLineEdit()
-        self.find_edit.setPlaceholderText("Find: star/DSO/Sun/Moon/ISS/planet name...")
+        self.find_edit.setPlaceholderText("Find: star/DSO/Sun/Moon/ISS/Dragon/Starship/planet name...")
         self.find_edit.textChanged.connect(self._update_sky_search_results)
         self.find_edit.returnPressed.connect(self._select_first_sky_search_result)
         # Down from the search box -> jump into the results list, top item selected; Up from
@@ -1689,7 +1866,7 @@ class MainWindow(QMainWindow):
         # per-key signal the way Tk's bind() does.
         self.find_edit.installEventFilter(self)
         toolbar.addWidget(self.view_mode_btn)
-        toolbar.addWidget(self.iss_btn)
+        toolbar.addWidget(self.vehicles_btn)
         toolbar.addWidget(self.const_btn)
         toolbar.addWidget(self.min_size_btn)
         toolbar.addWidget(self.min_size_edit)
@@ -2071,6 +2248,7 @@ class MainWindow(QMainWindow):
         self._update_time_travel_label()
         self._trigger_solar_system_update()
         self._trigger_iss_update()
+        self.spacex_thread.wake()
         self.viz.update()
 
     def _reset_time_travel(self):
@@ -2081,6 +2259,7 @@ class MainWindow(QMainWindow):
         self._update_time_travel_label()
         self._trigger_solar_system_update()
         self._trigger_iss_update()
+        self.spacex_thread.wake()
         self.viz.update()
 
     def _update_time_travel_label(self):
@@ -2197,6 +2376,9 @@ class MainWindow(QMainWindow):
             return (self.viz.moon_ra, self.viz.moon_dec) if self.viz.moon_ra is not None else (None, None)
         if live_name == "ISS":
             return (self.viz.iss_ra, self.viz.iss_dec) if self.viz.iss_ra is not None else (None, None)
+        if live_name in self._spacex_labels_seen:
+            vehicle = self.viz.spacex_positions.get(live_name)
+            return (vehicle[0], vehicle[1]) if vehicle else (None, None)
         pos = self.viz.planet_positions.get(live_name)
         return (pos[0], pos[1]) if pos else (None, None)
 
@@ -2236,6 +2418,8 @@ class MainWindow(QMainWindow):
             self.target_ra, self.target_dec = self.viz.moon_ra, self.viz.moon_dec
         elif name in self.viz.planet_positions:
             self.target_ra, self.target_dec = self.viz.planet_positions[name][0], self.viz.planet_positions[name][1]
+        elif name in self.viz.spacex_positions:
+            self.target_ra, self.target_dec = self.viz.spacex_positions[name][0], self.viz.spacex_positions[name][1]
 
     def _target_is_live_body(self):
         """True while the selected target is a body whose sky position visibly changes over the
@@ -2247,7 +2431,8 @@ class MainWindow(QMainWindow):
         session, so the echo is perfectly fine (and, while actually tracking, arguably more
         accurate than the client-side value) for anything that isn't one of these."""
         name = self.target_object_name
-        return name == "ISS" or name == "Sun" or name == "Moon" or name in self.viz.planet_positions
+        return (name == "ISS" or name == "Sun" or name == "Moon" or name in self.viz.planet_positions
+                or name in self._spacex_labels_seen)
 
     def _iss_actively_tracked(self):
         """True while the ISS is the currently active tracked target - see
@@ -2294,6 +2479,65 @@ class MainWindow(QMainWindow):
         # continuous-correction machinery any other search-selected target uses.
         if self._iss_actively_tracked() and self.serial.ser and self.serial.ser.is_open:
             self.serial.send_command(f"CMD,SET_TARGET,RA:{ra:.6f},DEC:{dec:.6f},CONTINUATION:1")
+
+    def _spacex_actively_tracked(self):
+        """Same as _iss_actively_tracked, for whichever SpaceX vehicle is the selected target."""
+        mode = self.mode_group.checkedButton().text() if self.mode_group.checkedButton() else ""
+        return self.target_object_name in self._spacex_labels_seen and self.tracking and mode == "SIDEREAL"
+
+    def _spacex_thread_state(self):
+        """Called from _SpacexTrackingThread's loop (background thread) - see its docstring.
+        Returns (tracked_label or None, any vehicle shown, fast interval while tracked)."""
+        tracked_label = self.target_object_name if self._spacex_actively_tracked() else None
+        return tracked_label, bool(self.viz.spacex_shown), ISS_TRACKING_UPDATE_MS
+
+    def _on_spacex_availability(self, rows):
+        self._spacex_available = rows
+        self._spacex_labels_seen.update(row[0] for row in rows)
+        self._update_vehicles_btn()
+
+    def _on_spacex_updated(self, result):
+        positions, is_full_set = result
+        docked_labels = {row[0] for row in self._spacex_available if row[2]}
+        fresh = {}
+        for label, (ra, dec, above, sample_age_s) in positions.items():
+            extra = (("docked to ISS · " if label in docked_labels else "")
+                     + ("above horizon" if above else "below horizon")
+                     + f" · estimated from a {sample_age_s:.0f}s-old feed sample")
+            fresh[label] = (ra, dec, above, extra)
+        if is_full_set:
+            self.viz.spacex_positions = fresh  # drops vehicles that went stale or left the feed
+        else:
+            self.viz.spacex_positions.update(fresh)
+        self.viz.update()
+        self._refresh_live_target_position()  # same reasoning as _on_iss_updated
+
+        if not self._spacex_actively_tracked():
+            return
+        name = self.target_object_name
+        connected = self.serial.ser and self.serial.ser.is_open
+        if self._spacex_target_lost:
+            # Latched until the vehicle is selected again (_select_sky_target clears it). Resuming
+            # on our own would be an unattended slew: the first CONTINUATION after the >10s hold
+            # fails the firmware's MAX_PLAUSIBLE_TARGET_UPDATE_GAP_S check, so it becomes a fresh
+            # target wherever the vehicle is by then - possibly tens of degrees away.
+            return
+        if name in fresh:
+            if connected:
+                ra, dec = fresh[name][0], fresh[name][1]
+                self.serial.send_command(f"CMD,SET_TARGET,RA:{ra:.6f},DEC:{dec:.6f},CONTINUATION:1")
+        else:
+            # The estimate is gone (feed stale/unreachable, key left the feed, history restart,
+            # beyond MAX_EXTRAPOLATION_S). The firmware keeps extrapolating its last derived rate
+            # with no time limit, so without this the mount would keep slewing along an orbit
+            # nobody is updating. One plain SET_TARGET (no CONTINUATION) at the last position is a
+            # fresh fixed target: rate zeroed, the mount holds that sky point at sidereal rate.
+            self._spacex_target_lost = True
+            if connected:
+                self.serial.send_command(f"CMD,SET_TARGET,RA:{self.target_ra:.6f},DEC:{self.target_dec:.6f}")
+            self._log(f"{name}: position estimate lost - holding the last position at sidereal rate. "
+                      "To follow it again once it is back in the Vehicles menu: Stop, then select it "
+                      "again (Find or double-click) - this never resumes on its own.")
 
     # ---------------- serial connection ----------------
     def _refresh_ports(self):
@@ -2472,13 +2716,55 @@ class MainWindow(QMainWindow):
         else:
             self.view_mode_btn.setStyleSheet("")
 
-    def _toggle_iss(self):
-        self.viz.iss_enabled = not self.viz.iss_enabled
-        self.iss_btn.setText(f"ISS: {'ON' if self.viz.iss_enabled else 'OFF'}")
-        self._style_toggle_btn(self.iss_btn, self.viz.iss_enabled)
-        if self.viz.iss_enabled:
+    def _rebuild_vehicles_menu(self):
+        """Vehicles dropdown contents, rebuilt on every open: ISS always, then every SpaceX
+        vehicle with a fresh feed sample (any number of Dragons/Starships - keys come from the
+        feed, never hardcoded). A vehicle with only one sample so far is listed but can't be
+        placed yet (the estimate needs two)."""
+        self.vehicles_menu.clear()
+        iss_action = self.vehicles_menu.addAction("ISS")
+        iss_action.setCheckable(True)
+        iss_action.setChecked(self.viz.iss_enabled)
+        iss_action.toggled.connect(self._set_iss_enabled)
+        self.vehicles_menu.addSeparator()
+        if not self._spacex_available:
+            hint = self.vehicles_menu.addAction("No Dragon or Starship in flight right now")
+            hint.setEnabled(False)
+        for label, _kind, docked_to_iss, has_estimate in self._spacex_available:
+            text = label + (" (docked to ISS)" if docked_to_iss else "")
+            text += "" if has_estimate else " - waiting for 2nd sample"
+            action = self.vehicles_menu.addAction(text)
+            action.setCheckable(True)
+            action.setChecked(label in self.viz.spacex_shown)
+            action.toggled.connect(lambda checked, vehicle_label=label: self._set_spacex_shown(vehicle_label, checked))
+
+    def _set_iss_enabled(self, enabled):
+        self.viz.iss_enabled = enabled
+        if enabled:
             self.iss_thread.wake()  # don't wait out the idle poll interval before the first fetch
+        self._update_vehicles_btn()
         self.viz.update()
+
+    def _set_spacex_shown(self, label, shown):
+        if shown:
+            self.viz.spacex_shown.add(label)
+        else:
+            self.viz.spacex_shown.discard(label)
+        self.spacex_thread.wake()  # switches to the active poll cadence right away
+        self._update_vehicles_btn()
+        self.viz.update()
+
+    def _update_vehicles_btn(self):
+        available_labels = {row[0] for row in self._spacex_available}
+        shown = (["ISS"] if self.viz.iss_enabled else []) + sorted(self.viz.spacex_shown & available_labels)
+        if not shown:
+            text = "Vehicles: OFF"
+        elif len(shown) == 1:
+            text = f"Vehicles: {shown[0]}"
+        else:
+            text = f"Vehicles: {shown[0]} +{len(shown) - 1}"
+        self.vehicles_btn.setText(text)
+        self._style_toggle_btn(self.vehicles_btn, bool(shown))
 
     def _toggle_constellations(self):
         self.viz.constellations_enabled = not self.viz.constellations_enabled
@@ -2524,7 +2810,10 @@ class MainWindow(QMainWindow):
             self._sky_search_matches = []
             self.sky_search_results.hide()
             return
-        matches = [e for e in self._search_index if query in e["name"].lower()]
+        # Live SpaceX vehicles join the static index per query - their names change per mission.
+        spacex_entries = [{"name": row[0], "ra": None, "dec": None, "live": row[0]}
+                          for row in self._spacex_available]
+        matches = [entry for entry in self._search_index + spacex_entries if query in entry["name"].lower()]
         matches.sort(key=lambda e: (not e["name"].lower().startswith(query), len(e["name"])))
         self._sky_search_matches = matches[:30]
         if not self._sky_search_matches:
@@ -2551,7 +2840,10 @@ class MainWindow(QMainWindow):
             ra, dec = self._resolve_live_body(entry["live"])
             if ra is None:
                 if entry["live"] == "ISS":
-                    self._log("ISS position isn't available - enable its tracking toggle first.")
+                    self._log("ISS position isn't available - enable it in the Vehicles menu first.")
+                elif entry["live"] in self._spacex_labels_seen:
+                    self._log(f"{entry['live']} position isn't available yet - the estimate needs two "
+                              "feed samples (the Dragon feed updates every ~30s).")
                 else:
                     self._log(f"{entry['live']} position isn't available yet - still fetching, try again shortly.")
                 return
@@ -2968,6 +3260,7 @@ class MainWindow(QMainWindow):
         A double-click or search selection always fills the target fields; if tracking is
         already active that's all it does (must not interrupt a running session)."""
         self.target_object_name = target_name
+        self._spacex_target_lost = False
         self._update_target_name_label()
         ra_str, dec_str = f"{ra:.4f}", f"{dec:.4f}"
         self._target_name_box_ra_str, self._target_name_box_dec_str = ra_str, dec_str
@@ -2991,12 +3284,13 @@ class MainWindow(QMainWindow):
         self._toggle_tracking()
         if target_name == "ISS" and self.tracking:
             if not self.viz.iss_enabled:
-                self.viz.iss_enabled = True
-                self.iss_btn.setText("ISS: ON")
+                self._set_iss_enabled(True)
             # Kick off the fast ISS_TRACKING_UPDATE_MS refresh cadence immediately (see
             # _trigger_iss_update/_iss_actively_tracked) instead of waiting up to 5s for
             # whatever slow-interval tick happened to already be scheduled.
             self._trigger_iss_update()
+        if target_name in self._spacex_labels_seen and self.tracking:
+            self._set_spacex_shown(target_name, True)  # also wakes the thread into the fast cadence
 
     def _stop(self):
         """The standalone "STOP (panic)" button - not in EQMountApp's UI (there tracking

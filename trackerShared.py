@@ -169,7 +169,22 @@ from typing import Optional
 #            (badge stuck on ALIGNING while tracking ran fine); a stop/restart recovered it.
 #            Cost of the skip: at most 60s of Arduino clock drift, corrected by the next
 #            tick. Kept regardless of firmware version since the loss is at the USB-CDC level.
-GUI_VERSION = "1.0.17"
+#   1.0.18 - SpaceX Dragon/Starship tracking (sky_data/spacex_tracker.py), driven exactly like
+#            the ISS (marker, Find entry, SIDEREAL SET_TARGET + CONTINUATION:1 at
+#            ISS_TRACKING_UPDATE_MS). The public feeds publish one sample per vehicle about every
+#            30s, so the position is estimated: velocity solved from the last two samples, then
+#            coasted forward under gravity (+J2) in ECEF to "now"; Dragon sample times are
+#            re-anchored against the ISS TLE first (the feed's shared gps_time is seconds off per
+#            row). New sample handoffs are blended over 5s so the firmware sees no target step.
+#            If the tracked vehicle's estimate disappears (stale feed, key gone, history reset)
+#            one plain SET_TARGET (no CONTINUATION) is sent at the last position, zeroing the
+#            firmware's derived rate - it otherwise extrapolates that rate indefinitely - and the
+#            GUI stays on that fixed point until the operator re-selects the vehicle (an automatic
+#            resume would be an unattended slew to wherever the vehicle is by then). Feeds are
+#            polled every 30s even when no SpaceX vehicle is shown (10s when one is). The ISS
+#            toolbar button became a "Vehicles" dropdown: ISS plus every live Dragon/Starship
+#            (any number of each, keys are never hardcoded). No firmware or protocol change.
+GUI_VERSION = "1.0.18"
 
 BAUD_RATE = 250000
 # GUI poll rate for the serial queue. Fast enough to comfortably keep up with the Arduino's 50Hz
@@ -215,6 +230,13 @@ ISS_TRACKING_UPDATE_MS = 50
 # but NOT the actively tracked target) - see _iss_update_tick. 1Hz is plenty for a display-only
 # refresh; ISS_TRACKING_UPDATE_MS above is used instead once the ISS becomes the tracked target.
 ISS_DISPLAY_UPDATE_MS = 1000
+
+# SpaceX vehicle-tracker feed poll intervals (see _SpacexTrackingThread). The Dragon file is
+# rewritten about every 30s and the CDN caches for 60s, so 10s while a SpaceX vehicle is shown or
+# tracked picks up each new sample within ~10s of publication. Idle polling keeps the Vehicles menu
+# current and the two-sample estimate warm; ETag makes an unchanged poll a bodiless 304.
+SPACEX_POLL_ACTIVE_S = 10.0
+SPACEX_POLL_IDLE_S = 30.0
 
 # How often Sun/Moon/planet positions are refreshed - see _solar_system_update_tick
 # (trackerGui.py) / solar_system_timer (tracker_gui_qt.py). Previously 2000ms (plenty for how

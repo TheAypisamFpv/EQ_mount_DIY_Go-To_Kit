@@ -48,6 +48,16 @@ def _load_satellite():
     return EarthSatellite(lines[1], lines[2], lines[0], ts), ts
 
 
+def get_ecef_state(at_time):
+    """ISS position (m) and velocity (m/s) in the Earth-fixed ITRS frame at at_time (timezone-
+    aware datetime) - used by spacex_tracker to recover each Dragon feed row's true sample time
+    from the ISS prediction that row carries. Same TLE/ImportError caveats as get_current_radec."""
+    from skyfield.framelib import itrs  # optional dependency, imported lazily
+    satellite, ts = _load_satellite()
+    position, velocity = satellite.at(ts.from_datetime(at_time)).frame_xyz_and_velocity(itrs)
+    return tuple(position.m), tuple(velocity.m_per_s)
+
+
 def get_current_radec(lat_deg, lon_deg, elevation_m=0.0, at_time=None):
     """Topocentric ISS position, as seen from (lat_deg, lon_deg), at at_time (a timezone-aware
     datetime.datetime) or right now if at_time is None - see trackerGui.py's single
