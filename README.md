@@ -7,14 +7,15 @@ a **Python/Qt desktop GUI** with a live OpenGL sky map.
 ![The GUI](assets/Images/gui/disconnected.png)
 
 The GUI computes where everything in the sky is (871,137-star catalog, all Messier + thousands
-more DSOs, constellations, Milky Way, Sun/Moon/planets via the JPL DE421 ephemeris, and the ISS
-via live TLE propagation), lets you pick a target by name or coordinates, and commands the
+more DSOs, constellations, Milky Way, Sun/Moon/planets via the JPL DE421 ephemeris, the ISS
+via live TLE propagation, and SpaceX Dragon / Starship from SpaceX's live vehicle-tracker feeds),
+lets you pick a target by name or coordinates, and commands the
 firmware over USB serial to slew there and then track it - sidereal, solar or lunar rate. The
 firmware does all the motion control on-board: interrupt-driven step generation, acceleration
 ramps, gear-ratio/backlash compensation, mount-relative calibration, EEPROM persistence of your
 location, and a set of hardware-independent safety features.
 
-- GUI version: `1.0.17` (Python, PySide6/Qt)
+- GUI version: `1.0.19` (Python, PySide6/Qt)
 - Firmware version: `1.8.54` (Arduino Mega 2560)
 - All coordinates in this repo (defaults, config, logs, tests) point at
   **SpaceX Starbase, Boca Chica, Texas (25.9978, -97.1553)** - set your own in the GUI.
@@ -100,6 +101,8 @@ On first launch the app also downloads (once, cached in `sky_data/`):
 
 - the **DE421** JPL ephemeris (~17 MB) for Sun/Moon/planet positions,
 - the **ISS TLE** from CelesTrak (refreshed automatically every 12 h),
+- nothing for SpaceX vehicles - their two small feed files are polled live while the app runs
+  (see [the Vehicles menu](#iss-dragon-and-starship-the-vehicles-menu)),
 - the **sky catalog** is bundled, but `python sky_data/sky_catalog.py` rebuilds it from source
   data if `sky_data/sky_catalog.json` is ever missing or stale.
 
@@ -185,7 +188,8 @@ mount's calibration or tracking state.
 
 ![The sky map and its toolbar](assets/Images/panels/sky_map.png)
 
-*The sky map with its toolbar: view-mode / ISS / constellations / min-size toggles, camera
+*The sky map with its toolbar: view-mode / ISS (now the Vehicles menu) / constellations /
+min-size toggles, camera
 rotation, and the Find box. The blue rectangle is the camera FOV at the telescope's pointing;
 the shaded region is the meridian-limit zone; the curved dimming at the bottom is below your
 local horizon.*
@@ -201,7 +205,7 @@ The big OpenGL canvas is a live planetarium of the whole sky, centred on your te
   sizes, **constellation lines**, and an analytically-drawn **Milky Way** band.
 - Your **local horizon** (things below it are dimmed), the **meridian-limit danger zone**
   shading, **Sun/Moon/planets** with the Moon drawn at its real phase and lit side, and the
-  **ISS** (toggleable).
+  **ISS**, **Crew/Cargo Dragons** and **Starships** in flight (picked in the Vehicles menu).
 - The blue rectangle is your **camera's field of view**; the reticle is the current target.
   Scroll to zoom, drag to pan.
 
@@ -210,11 +214,11 @@ Toolbar:
 | Control | What it does |
 |---|---|
 | **View: Free / Follow Telescope / Follow Target** | Cycles what the map stays centred on. |
-| **ISS: OFF/ON** | Shows the ISS as a moving marker (fetched via live TLE). |
+| **Vehicles: …** ▾ | Dropdown with a checkbox per vehicle: the ISS (live TLE) plus every Dragon/Starship currently in flight - see [below](#iss-dragon-and-starship-the-vehicles-menu). Screenshots older than GUI 1.0.18 show the single **ISS: OFF/ON** button it replaced. |
 | **Constellations: ON** | Toggles constellation lines. |
 | **Min Size: OFF** + value | Only draw stars/DSOs larger than N% of their natural size - cleans up the map when zoomed out. |
 | **Cam Rot** ◄ / ► | Rotates the camera-FOV rectangle to match how your camera sits in the focuser. |
-| **Find: …** | Live search by star/DSO/Sun/Moon/ISS/planet name. |
+| **Find: …** | Live search by star/DSO/Sun/Moon/ISS/Dragon/Starship/planet name. |
 
 ![The Find box and its results list](assets/Images/panels/find_results.png)
 
@@ -227,6 +231,69 @@ list; Enter selects.*
 
 Pick a result and the map jumps to it and offers it as the tracking target. Hovering anywhere
 shows the object under the cursor (name, RA/DEC, magnitude) in the bottom-left readout.
+
+### ISS, Dragon and Starship (the Vehicles menu)
+
+![The Vehicles menu open](assets/Images/gui/vehicles_menu.png)
+
+*The **Vehicles** dropdown: the ISS plus every SpaceX vehicle in flight right now - here
+Dragon crew12 (free-flying) and Dragon crew13 (docked to the ISS). Starship appears the same way
+whenever a ship is actually flying; any number of Dragons and Starships are listed, nothing is
+hardcoded to a mission name.*
+
+![Dragon and ISS markers on the sky map](assets/Images/gui/spacex_vehicles.png)
+
+*The whole GUI with all three shown and Dragon crew12 picked as the target via Find (5x zoom,
+not connected). The ISS keeps its circle; SpaceX vehicles are cyan diamonds, labelled below the
+marker so a docked Dragon and the ISS don't overprint. Markers dim when the vehicle is below
+your horizon.*
+
+Each checked entry gets a live marker; Find also lists every live vehicle by name ("Dragon
+crew13", "Starship ship41", ...), and picking one targets and tracks it exactly like the ISS:
+SIDEREAL `SET_TARGET` updates at 20 Hz with `CONTINUATION:1`, the firmware extrapolating in
+between. Hovering a SpaceX marker shows how old the feed sample behind it is.
+
+Where the positions come from: SpaceX's public vehicle-tracker feeds (the two JSON files behind
+spacex.com/vehicle-tracker - unofficial, no key). They hold **one sample per vehicle, refreshed
+only about every 30 s**, so the GUI estimates where the vehicle is *now*:
+
+- the velocity at the latest sample is solved from the **previous and latest samples** (shoot a
+  velocity guess back to the previous sample under gravity and correct it until it lands),
+- then the vehicle is **coasted forward to the current time** (point-mass gravity + J2 in the
+  Earth-fixed frame) and converted to topocentric RA/DEC like the ISS,
+- Dragon sample times are first **re-anchored against the ISS TLE**: the feed stamps every row
+  with the file's generation time, but each row's position belongs to its own telemetry instant,
+  seconds off and jittering. Each row also carries the ISS position for that same instant, which
+  pins the real time down.
+- when a new sample replaces the estimate, the correction is blended in over 5 s so the mount
+  sees a smooth rate instead of a jump.
+
+Measured on real data (2026-10-08): predicting the next sample 30 s ahead missed by **0.5-2.5 m**
+(a straight-line extrapolation missed by 7.6 km), and the docked Dragon lands within
+**0.0015°** of the ISS's own TLE position on the sky.
+
+Limits worth knowing before you point a telescope at one:
+
+- A new vehicle needs **two feed samples** (up to ~1 min) before it can be placed - the menu
+  shows "waiting for 2nd sample" until then.
+- It is a **coasting** model: during a Starship engine burn or reentry the estimate lags the real
+  vehicle until the next sample corrects it.
+- The firmware rejects target rates above **3 °/s per axis**
+  (`MAX_PLAUSIBLE_TARGET_RATE_DEG_S`). A low Starship pass near the zenith, or anything near the
+  celestial pole (where RA rates explode), can exceed that, and that stretch is then not tracked
+  smoothly.
+- If the tracked vehicle's estimate is **lost** (feed stale or unreachable, the vehicle left the
+  feed, a mission-clock reset), the GUI sends one plain `SET_TARGET` at the last position - the
+  mount holds that point at sidereal rate - and **does not resume on its own**: resuming would be
+  an unattended slew to wherever the vehicle is by then. Stop, then pick it again.
+- Vehicles are shown only from samples less than 5 min old, and never extrapolated more than
+  5 min - so they disappear in a Time Travel preview, and a leftover post-flight Starship sample
+  (the feed keeps the last one for days) is never shown as live.
+- The feeds are polled every 30 s while the app runs (every 10 s once a SpaceX vehicle is shown
+  or tracked) so the menu stays current; an unchanged file costs a bodiless 304. Offline, the
+  failure is logged once, not every poll.
+
+### Zoom
 
 The zoom range runs from the whole sky down to 1000x (~0.4° across). While in View: Telescope
 or View: Target the zoom stays anchored on what you're following rather than the cursor, so
@@ -453,7 +520,8 @@ the Sun/Moon/planet/ISS positions - and the Arduino's own clock - jump to that m
 how you rehearse an event (eclipses, conjunctions, ISS passes) in the afternoon and have the
 mount already pointing at the right patch of sky. **Now (Real Time)** puts everything back.
 Note the fields are interpreted as **UTC** exactly as published astronomical event times are -
-no local-timezone conversion happens.
+no local-timezone conversion happens. Dragon/Starship markers vanish during a preview: their
+feeds only describe *now*.
 
 The crescent-Moon zoom shots in [the sky map section](#6-the-sky-map) were made exactly this
 way: the Moon was below the horizon at capture time, so the preview jumped to a date when it
@@ -500,6 +568,8 @@ the sky map next to the cursor/mode/live-error readouts.*
 | Slews are slow/vibrating | `MAX_SLEW_SPEED_DEG_S` and `MICROSTEPS` in the `.ino` must match your real hardware - see [Tuning constants](#20-tuning-constants). |
 | Pointing is off by a constant amount | Sync on a known star; check the offsets panel; if DEC moves exactly 2× the commanded angle, your DEC gear ratio constant is wrong (it happened here: 65:1 vs 130:1). |
 | Sun/Moon/ISS missing | First run needs internet for DE421/TLE; afterwards they're cached (`sky_data/de421.bsp`, `iss_tle.txt`). |
+| No Dragon/Starship in the Vehicles menu | Nothing is flying, or no internet (the log says "SpaceX … feed fetch failed" once). A just-appeared vehicle reads "waiting for 2nd sample" for up to a minute. |
+| "position estimate lost" while tracking a SpaceX vehicle | The mount is holding the last point at sidereal rate. Stop, then pick the vehicle again once it is back in the Vehicles menu - it never resumes on its own. |
 | Sky map empty at startup | Wait for "Sky catalog loaded" in the log; if the catalog is missing run `python sky_data/sky_catalog.py` once. |
 
 The **Status / Messages** log (with the Arduino Debug panel above it) is where all of the above
@@ -532,7 +602,7 @@ state transition is logged here; the log is also masked by Streamer Mode.*
 │     - protocol + math      |   sky_data/sky_catalog.py   (AT-HYG + OpenNGC)      │
 │       constants            |   sky_data/solar_system.py  (skyfield + DE421)      │
 │     - SerialHandler        |   sky_data/iss_tracker.py   (CelesTrak TLE + SGP4)  │
-│       (own thread)         |                                                     │
+│       (own thread)         |   sky_data/spacex_tracker.py (SpaceX live feeds)    │
 │        |   ^               |                                                     │
 │        |   |  RX lines -> queue -> GUI parser                                    │
 │        |  CMD,* writes                                                           │
@@ -578,16 +648,18 @@ Design principles that show up everywhere:
 
 | Module | Role |
 |---|---|
-| `trackerGui.py` | The whole Qt app: `SkyViewWidget` (a `QOpenGLWidget` planetarium rendering ~875k objects at interactive rates), `MainWindow`, background workers (catalog loader, solar-system computer, ISS thread). |
+| `trackerGui.py` | The whole Qt app: `SkyViewWidget` (a `QOpenGLWidget` planetarium rendering ~875k objects at interactive rates), `MainWindow`, background workers (catalog loader, solar-system computer, ISS thread, SpaceX thread). |
 | `trackerShared.py` | Toolkit-agnostic backend: protocol constants, viz/tracking-math constants, and `SerialHandler` - a background thread that owns the `pyserial` port, a write queue, and a reader loop that hands parsed lines to the GUI thread. `GUI_VERSION` lives here. |
 | `sky_data/sky_catalog.py` | Builds `sky_catalog.json` from public datasets: **AT-HYG v3.3 reduced_m11** (871,139 stars, mag ≤ 11 + all stars within 100 ly; CC BY-SA 4.0), **OpenNGC** (3,732 visual DSOs: all Messier + NGC/IC types with mag ≤ 13; CC-BY-SA-4.0), and **Stellarium's "modern" constellation lines** (converted from Hipparcos-number polylines). The Milky Way is not data - it's drawn analytically from the IAU 1958 galactic coordinate system. |
 | `sky_data/solar_system.py` | Sun/Moon/planet positions, angular sizes, Moon phase and lit-side orientation via **skyfield + JPL DE421**. Lazily imported; takes an `at_time` so Time Travel covers it. |
 | `sky_data/iss_tracker.py` | ISS RA/DEC via **CelesTrak GP/TLE** (refreshed every 12 h, cached in `iss_tle.txt`) + skyfield's SGP4 propagation - topocentric, not the sub-satellite point. |
+| `sky_data/spacex_tracker.py` | Dragon/Starship from SpaceX's public vehicle-tracker JSON feeds (gzip + ETag): parsing (idle/stale/garbage rows skipped, any number of vehicles), Dragon time anchoring against the ISS TLE, the two-sample velocity solve, RK4 coasting in ECEF (gravity + J2 + Coriolis + centrifugal), handoff blending, and ECEF -> topocentric RA/DEC. |
 
 GUI-side details worth knowing:
 
-- The sky viz refresh cadences are deliberate: Sun/Moon/planets at 1 Hz, ISS at 1 Hz when only
-  displayed (20 Hz when it is the tracked target), position/FOV follow tied to the 50 Hz POS
+- The sky viz refresh cadences are deliberate: Sun/Moon/planets at 1 Hz, ISS and SpaceX
+  vehicles at 1 Hz when only displayed (20 Hz when one is the tracked target; the SpaceX feed
+  fetch runs on its own thread so a slow request never stalls that), position/FOV follow tied to the 50 Hz POS
   stream, with rescheduling done to wall-clock boundaries so ticks land on a stable phase.
 - Tracking stability is computed from the live error history: **Stable** means error below half
   a camera pixel *and* flat/shrinking over the window; the history is reset at the true
@@ -608,6 +680,7 @@ observer = Starbase (25.9978, -97.1553)      [gui_config.json]
 stars/DSOs: catalog RA/DEC (J2000) vs LST -> hour angle -> horizon mask
 Sun/Moon/planets: skyfield(DE421) topocentric -> RA/DEC, size, phase
 ISS: TLE -> SGP4 -> topocentric RA/DEC
+Dragon/Starship: feed ECEF samples (~30 s apart) -> velocity from the last two -> coast to now -> topocentric RA/DEC
 GUI -> CMD,SET_TIME / CMD,SET_LOCATION -> firmware computes LST itself
 ```
 
@@ -655,7 +728,7 @@ step counts maintained by the ISR itself. Axis IDs map to the two hardware timer
   5 °/s - NEMA17s have a mechanical resonance band around 60–240 RPM and the gearing put the
   old speed right inside it).
 - Tracking rates: sidereal 0.004178 °/s, solar and lunar variants; rate derivation for live
-  bodies (ISS) happens in the firmware, extrapolating between SET_TARGET updates, so smoothness
+  bodies (ISS, Dragon, Starship) happens in the firmware, extrapolating between SET_TARGET updates, so smoothness
   doesn't depend on the GUI's send rate.
 - Alignment state machine: slew → settle → error report → track, with lead-time compensation;
   START/STOP actions are confirmed by the firmware (the GUI retries until it sees the
@@ -681,7 +754,7 @@ the buffer so stale partial lines can't eat one):
 | `CMD,START_TRACKING[,SKIP_DEC_RESET][,RISK_OK:1]` | Slew to target and track. |
 | `CMD,STOP` | Stop everything (also a dedicated single-byte panic sentinel, checked before line parsing). |
 | `CMD,GOTO,RA:…,DEC:…[,RISK_OK:1]` | Slew to a position without tracking. |
-| `CMD,SET_TARGET,RA:…,DEC:…` | Set the tracked target (used continuously for ISS). |
+| `CMD,SET_TARGET,RA:…,DEC:…[,CONTINUATION:1]` | Set the tracked target. Sent continuously for the ISS/Dragon/Starship with `CONTINUATION:1` (same object refreshed, so the firmware derives a rate); without it, a fresh fixed target (rate reset to 0). |
 | `CMD,SYNC,RA:…,DEC:…` / `CMD,SYNC_OFFSET,RA:…,DEC:…` | Calibration sync / nudge offsets. |
 | `CMD,SET_TIME,Y:…,M:…,D:…,h:…,min:…,s:…` | Set the board clock. |
 | `CMD,SET_LOCATION,LAT:…,LON:…` | Set observer location. |
@@ -741,7 +814,7 @@ All in the `CONFIGURATION` block at the top of `EQMountTracker.ino`:
 |---|---|
 | `trackerGui.py` / `trackerShared.py` | GUI / shared backend. |
 | `EQMountTracker/` | Arduino sketch (`EQMountTracker.ino`, `Axis.*`, `StepGen.*`). |
-| `sky_data/` | Astronomy modules + built catalog (`sky_catalog.json`), cached ephemeris (`de421.bsp`), ISS TLE cache (`iss_tle.txt`). |
+| `sky_data/` | Astronomy modules (catalog, solar system, ISS, SpaceX) + built catalog (`sky_catalog.json`), cached ephemeris (`de421.bsp`), ISS TLE cache (`iss_tle.txt`). |
 | `gui_config.json` | The one saved setting: your `"lat, lon"` string (ships as Starbase, `25.9978, -97.1553`). |
 | `launch_gui.bat` | Detached launcher (uses `.venv\Scripts\pythonw.exe`). |
 | `requirements.txt` | `pyserial>=3.5`, `skyfield>=1.49`, `PySide6>=6.5.0`. |
@@ -757,7 +830,9 @@ consistency checks, protocol/EEROM-flow simulations, GPS parsing and config-savi
 tracking math verification (the DEC-reset-skip rules), reconnection/timeout handling, and
 verification scripts for the offset fixes. They are plain scripts (`python test\test_….py`)
 rather than a pytest suite; several exercise the protocol with a simulated Arduino, so they run
-without hardware. Note they date from various points in the GUI's Tkinter→Qt history - the
+without hardware. `test\test_spacex_tracker.py` checks the Dragon/Starship estimator against
+real recorded samples and synthetic orbits (run it with `.venv\Scripts\python.exe`). Note they
+date from various points in the GUI's Tkinter→Qt history - the
 canonical "does it work" test is the real mount.
 
 ## 23. Versioning conventions
@@ -766,7 +841,7 @@ Two independent versions, both bumped on every functional change with a one-line
 entry in the comment block directly above (the full history of *why* lives in those entries -
 they're worth reading):
 
-- `GUI_VERSION` in `trackerShared.py` - currently **1.0.17**
+- `GUI_VERSION` in `trackerShared.py` - currently **1.0.19**
 - `FIRMWARE_VERSION` in `EQMountTracker.ino` - currently **1.8.54**
 
 The GUI compares the board's reported firmware version against the `.ino` in your checkout and
