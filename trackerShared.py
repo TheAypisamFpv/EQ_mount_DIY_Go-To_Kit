@@ -184,7 +184,12 @@ from typing import Optional
 #            polled every 30s even when no SpaceX vehicle is shown (10s when one is). The ISS
 #            toolbar button became a "Vehicles" dropdown: ISS plus every live Dragon/Starship
 #            (any number of each, keys are never hardcoded). No firmware or protocol change.
-GUI_VERSION = "1.0.18"
+#   1.0.19 - Sun/Moon/planet ephemeris load is now locked (sky_data/solar_system.py). Two
+#            background workers starting together could see the ephemeris loaded but the
+#            timescale still None and log "'NoneType' object has no attribute 'from_datetime'"
+#            for the first few seconds after launch (more often since 1.0.18 added the SpaceX
+#            thread to startup). Positions were never wrong, only late.
+GUI_VERSION = "1.0.19"
 
 BAUD_RATE = 250000
 # GUI poll rate for the serial queue. Fast enough to comfortably keep up with the Arduino's 50Hz

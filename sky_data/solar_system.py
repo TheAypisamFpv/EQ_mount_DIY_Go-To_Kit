@@ -7,6 +7,7 @@ skyfield is imported lazily so the rest of the app still works without it instal
 """
 
 import os
+import threading
 
 # Real body radii (km) - used to convert distance into apparent angular diameter.
 _MOON_RADIUS_KM = 1737.4
@@ -19,15 +20,21 @@ _DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 
 _eph = None
 _ts = None
+# Background workers call _load_ephemeris concurrently at startup. Without the lock, a second
+# caller could see _eph already set while _ts was still None (timescale() loads after the
+# ephemeris) and fail with "'NoneType' object has no attribute 'from_datetime'".
+_load_lock = threading.Lock()
 
 
 def _load_ephemeris():
     global _eph, _ts
-    if _eph is None:
-        from skyfield.api import Loader  # optional dependency, imported lazily
-        loader = Loader(_DATA_DIR)
-        _eph = loader('de421.bsp')  # auto-downloaded + cached here on first call
-        _ts = loader.timescale()
+    with _load_lock:
+        if _eph is None:
+            from skyfield.api import Loader  # optional dependency, imported lazily
+            loader = Loader(_DATA_DIR)
+            timescale = loader.timescale()
+            _eph = loader('de421.bsp')  # auto-downloaded + cached here on first call
+            _ts = timescale
     return _eph, _ts
 
 
